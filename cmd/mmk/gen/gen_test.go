@@ -165,9 +165,9 @@ func TestUserDefBodyOverridesBuiltin(t *testing.T) {
 	docker build --no-cache -t "$target" .
 }
 image myimg : Dockerfile`)
-	// built-in must not appear; user defbody must.
-	if strings.Contains(out, "built-in default body") {
-		t.Error("built-in default should be suppressed when user defbody is present")
+	// built-in image default must not appear; user defbody must.
+	if strings.Contains(out, "built-in default body: image") {
+		t.Error("built-in image default should be suppressed when user defbody image is present")
 	}
 	assertContains(t, out, "defbody image")
 	assertContains(t, out, "--no-cache")

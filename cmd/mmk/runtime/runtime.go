@@ -349,8 +349,16 @@ func (b *Build) findRule(name string) (*parse.TargetRule, error) {
 		return rule, nil
 	}
 	// No explicit or pattern rule: infer a file target so that source files
-	// don't need to be declared. Run() will fail if the file doesn't exist.
-	inferred := &parse.TargetRule{Type: "file", Target: name}
+	// don't need to be declared. Generate a bash function that delegates to
+	// __mmk_default_file, which fails with a clear message if the file is absent.
+	inferred := &parse.TargetRule{
+		Type:   "file",
+		Target: name,
+		Body:   "\n\t" + gen.DefaultFunc("file") + "\n",
+	}
+	if err := gen.GenerateRule(b.genFile, inferred); err != nil {
+		return nil, fmt.Errorf("infer file rule for %q: %w", name, err)
+	}
 	b.concretes[name] = inferred
 	return inferred, nil
 }
@@ -495,19 +503,7 @@ func (n *TargetNode) Date() time.Time {
 	switch n.rule.Type {
 	case "":
 		return time.Now()
-	case "file":
-		info, err := os.Stat(n.target)
-		if err != nil {
-			return time.Time{}
-		}
-		return info.ModTime()
-	case "image":
-		t, err := dockerImageDate(n.target)
-		if err != nil {
-			return time.Time{}
-		}
-		return t
-	default: // user-defined type via deftype
+	default: // all typed targets run their deftype bash function
 		t, err := n.userTypeDate()
 		if err != nil {
 			return time.Time{}
@@ -546,15 +542,6 @@ func (n *TargetNode) NeedsRun() bool {
 		}
 	}
 	return false
-}
-
-// dockerImageDate returns the creation time of a local docker image.
-func dockerImageDate(name string) (time.Time, error) {
-	out, err := exec.Command("docker", "inspect", "--format", "{{.Created}}", name).Output()
-	if err != nil {
-		return time.Time{}, err
-	}
-	return time.Parse(time.RFC3339Nano, strings.TrimSpace(string(out)))
 }
 
 // userTypeDate runs the deftype bash function for this node's type and parses
@@ -613,13 +600,6 @@ func (n *TargetNode) Run() error {
 	}
 	if n.rule.Runner != "" {
 		return n.runOn()
-	}
-	// A file target with no body can't be built — fail if the file is absent.
-	if n.rule.Type == "file" && n.rule.Body == "" {
-		if _, err := os.Stat(n.target); err != nil {
-			return fmt.Errorf("file %q does not exist and has no rule to create it", n.target)
-		}
-		return nil
 	}
 	return n.runBash(gen.TargetFunc(n.target), true)
 }

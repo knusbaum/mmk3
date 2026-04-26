@@ -47,17 +47,23 @@ func VerbTargetFunc(verb, target string) string { return "__mmk_verb_" + verb + 
 // DefaultVerbFunc returns the bash function name for a type's default verb body.
 func DefaultVerbFunc(typeName, verb string) string { return "__mmk_default_" + verb + "_" + typeName }
 
-// builtinDefaultBodies contains the built-in default body for each built-in type.
+// builtinDefTypes contains the built-in deftype body (bash printing a timestamp)
+// for each built-in type. A user deftype with the same name overrides these.
+// Note: stat -c %Y is GNU coreutils (Linux); macOS users should override with stat -f %m.
+var builtinDefTypes = map[string]string{
+	"file":  "\n\tstat -c %Y \"$target\" 2>/dev/null || return 1\n",
+	"image": "\n\tdocker inspect --format '{{.Created}}' \"$target\" 2>/dev/null || return 1\n",
+}
+
+// builtinDefBodies contains the built-in default body for each built-in type.
 // A user defbody for the same type name overrides these.
-//
-// For image targets: build using the first dep as the Dockerfile.
-// ${deps%% *} strips everything from the first space onwards, yielding dep[0].
-var builtinDefaultBodies = map[string]string{
+var builtinDefBodies = map[string]string{
+	"file":  "\n\t[[ -e \"$target\" ]] && return 0\n\tprintf 'mmk: %s does not exist and has no rule to create it\\n' \"$target\" >&2; return 1\n",
 	"image": "\n\tdocker build -t \"$target\" -f \"${deps%% *}\" .\n",
 }
 
-// builtinDefaultOrder lists the built-in types in a deterministic emit order.
-var builtinDefaultOrder = []string{"image"}
+// builtinOrder lists built-in types in a deterministic emit order.
+var builtinOrder = []string{"file", "image"}
 
 // Generate writes bash function definitions for all directives in f to w.
 func Generate(w io.Writer, f *parse.File) error {
@@ -65,20 +71,37 @@ func Generate(w io.Writer, f *parse.File) error {
 		return err
 	}
 
-	// Determine which types have user-defined defbody (to suppress built-in defaults).
+	// Collect user-defined deftypes and defbodies so built-ins can be suppressed.
+	userDefType := make(map[string]bool)
 	userDefBody := make(map[string]bool)
 	for _, d := range f.Directives {
-		if db, ok := d.(*parse.DefBody); ok {
-			userDefBody[db.Type] = true
+		switch d := d.(type) {
+		case *parse.DefType:
+			userDefType[d.Name] = true
+		case *parse.DefBody:
+			if d.Verb == "" {
+				userDefBody[d.Type] = true
+			}
+		}
+	}
+
+	// Emit built-in deftype functions for types not overridden by the user.
+	for _, typeName := range builtinOrder {
+		if userDefType[typeName] {
+			continue
+		}
+		body := builtinDefTypes[typeName]
+		if _, err := fmt.Fprintf(w, "\n# built-in deftype: %s\n%s() {%s}\n", typeName, TypeFunc(typeName), body); err != nil {
+			return err
 		}
 	}
 
 	// Emit built-in default body functions for types not overridden by the user.
-	for _, typeName := range builtinDefaultOrder {
+	for _, typeName := range builtinOrder {
 		if userDefBody[typeName] {
 			continue
 		}
-		body := builtinDefaultBodies[typeName]
+		body := builtinDefBodies[typeName]
 		if _, err := fmt.Fprintf(w, "\n# built-in default body: %s\n%s() {%s}\n", typeName, DefaultFunc(typeName), body); err != nil {
 			return err
 		}
@@ -86,12 +109,14 @@ func Generate(w io.Writer, f *parse.File) error {
 
 	// Track all types that have a default body (built-in or user-defined).
 	hasDefault := make(map[string]bool)
-	for typeName := range builtinDefaultBodies {
+	for typeName := range builtinDefBodies {
 		hasDefault[typeName] = true
 	}
 	for _, d := range f.Directives {
 		if db, ok := d.(*parse.DefBody); ok {
-			hasDefault[db.Type] = true
+			if db.Verb == "" {
+				hasDefault[db.Type] = true
+			}
 		}
 	}
 
