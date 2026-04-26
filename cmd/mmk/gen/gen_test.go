@@ -239,6 +239,31 @@ func TestValidateNoDuplicates(t *testing.T) {
 	}
 }
 
+func TestBuiltinFileCleanVerbBody(t *testing.T) {
+	out := generate(t, `file main.o : main.c { cc -c main.c -o main.o }`)
+	assertContains(t, out, DefaultVerbFunc("file", "clean")+"()")
+	assertContains(t, out, "rm -f")
+	bashValid(t, out)
+}
+
+func TestUserDefbodyFileCleanOverridesBuiltin(t *testing.T) {
+	out := generate(t, `defbody file clean { : }
+file main.o : main.c { cc -c main.c -o main.o }`)
+	if strings.Contains(out, "built-in defbody file clean") {
+		t.Error("built-in file clean should be suppressed when user defbody file clean is present")
+	}
+	bashValid(t, out)
+}
+
+func TestSourceTypeHasNoCleanVerbBody(t *testing.T) {
+	// source type should not have a clean verb body emitted.
+	out := generate(t, `all : foo`)
+	if strings.Contains(out, DefaultVerbFunc("source", "clean")) {
+		t.Error("source type should not have a built-in clean verb body")
+	}
+	bashValid(t, out)
+}
+
 // --- helpers ---
 
 func assertContains(t *testing.T, s, substr string) {

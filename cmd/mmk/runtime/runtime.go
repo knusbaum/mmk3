@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/user"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -18,13 +19,6 @@ import (
 	"github.com/knusbaum/mmk3/cmd/mmk/parse"
 	"github.com/knusbaum/mmk3/dag"
 )
-
-// builtinTypes are type names implemented natively in Go.
-// All other non-empty type names require a deftype definition.
-var builtinTypes = map[string]bool{
-	"file":  true,
-	"image": true,
-}
 
 // runnerTypes are the type names that can appear after `on`. The dispatch in
 // (*TargetNode).runOn picks the strategy based on the runner target's type.
@@ -102,8 +96,8 @@ func validateDirectives(f *parse.File) error {
 		}
 	}
 	for key := range defbodies {
-		if !builtinTypes[key.typ] && !deftypes[key.typ] {
-			return fmt.Errorf("defbody %q: unknown type (built-in types: file, image; define others with deftype)", key.typ)
+		if gen.BuiltinDefTypes[key.typ] == "" && !deftypes[key.typ] {
+			return fmt.Errorf("defbody %q: unknown type (define with deftype)", key.typ)
 		}
 	}
 	for _, d := range f.Directives {
@@ -115,8 +109,8 @@ func validateDirectives(f *parse.File) error {
 		if r.Pattern != "" {
 			name = "'" + r.Pattern + "'"
 		}
-		if r.Type != "" && !builtinTypes[r.Type] && !deftypes[r.Type] {
-			return fmt.Errorf("target %q uses unknown type %q (built-in types: file, image; define others with deftype)", name, r.Type)
+		if r.Type != "" && gen.BuiltinDefTypes[r.Type] == "" && !deftypes[r.Type] {
+			return fmt.Errorf("target %q uses unknown type %q (define with deftype)", name, r.Type)
 		}
 		if r.Runner != "" {
 			runner, ok := concretes[r.Runner]
@@ -153,6 +147,13 @@ func NewBuild(src []byte) (*Build, error) {
 		containerNodes: make(map[string]*TargetNode),
 		defVerbBodies:  make(map[defVerbBodyKey]bool),
 		containers:     make(map[string]string),
+	}
+
+	// Pre-populate with built-in verb bodies; user defbody entries below may override.
+	for typeName, verbs := range gen.BuiltinVerbBodies {
+		for verb := range verbs {
+			b.defVerbBodies[defVerbBodyKey{typeName, verb}] = true
+		}
 	}
 
 	for _, d := range f.Directives {
@@ -303,11 +304,48 @@ func (b *Build) ResolveVerb(target, verb string) (*TargetNode, error) {
 		rule = r
 	}
 	if rule == nil {
-		// Require a default rule to exist so that dep inheritance can propagate.
+		// Check for a matching verb pattern rule.
+		for _, pe := range b.patterns {
+			if pe.rule.Verb != verb {
+				continue
+			}
+			m := pe.re.FindStringSubmatch(target)
+			if m == nil {
+				continue
+			}
+			captures := m[1:]
+			instantiated := &parse.TargetRule{
+				Type:      pe.rule.Type,
+				Target:    target,
+				Verb:      verb,
+				Runner:    pe.rule.Runner,
+				HasDepSep: pe.rule.HasDepSep,
+				Body:      substituteCaptures(pe.rule.Body, captures),
+			}
+			for _, dep := range pe.rule.Deps {
+				instantiated.Deps = append(instantiated.Deps, parse.Dep{
+					Target: substituteCaptures(dep.Target, captures),
+					Verb:   dep.Verb,
+				})
+			}
+			if err := gen.GenerateVerbRule(b.genFile, instantiated); err != nil {
+				return nil, fmt.Errorf("instantiate verb pattern [%s %s]: %w", verb, target, err)
+			}
+			b.verbConcretes[key] = instantiated
+			rule = instantiated
+			break
+		}
+	}
+	if rule == nil {
+		// Ensure a default rule exists so dep inheritance can propagate.
+		// Resolve populates concretes for inferred source targets.
+		if _, ok := b.concretes[target]; !ok {
+			b.Resolve(target) //nolint — side effect: populates concretes
+		}
 		if _, ok := b.concretes[target]; !ok {
 			found := false
 			for _, pe := range b.patterns {
-				if pe.re.MatchString(target) {
+				if pe.rule.Verb == "" && pe.re.MatchString(target) {
 					found = true
 					break
 				}
@@ -351,13 +389,14 @@ func (b *Build) findRule(name string) (*parse.TargetRule, error) {
 		b.concretes[name] = rule
 		return rule, nil
 	}
-	// No explicit or pattern rule: infer a file target so that source files
-	// don't need to be declared. Generate a bash function that delegates to
-	// __mmk_default_file, which fails with a clear message if the file is absent.
+	// No explicit or pattern rule: infer a source target so that real input files
+	// don't need to be declared. source targets have no clean verb body, so they
+	// are never deleted by `mmk clean`. Generate a bash function that delegates to
+	// __mmk_default_source, which fails with a clear message if the file is absent.
 	inferred := &parse.TargetRule{
-		Type:   "file",
+		Type:   "source",
 		Target: name,
-		Body:   "\n\t" + gen.DefaultFunc("file") + "\n",
+		Body:   "\n\t" + gen.DefaultFunc("source") + "\n",
 	}
 	if err := gen.GenerateRule(b.genFile, inferred); err != nil {
 		return nil, fmt.Errorf("infer file rule for %q: %w", name, err)
@@ -421,18 +460,24 @@ func (n *TargetNode) Dependencies() []*TargetNode {
 	}
 
 	for _, dep := range n.rule.Deps {
-		var depNode *TargetNode
-		var err error
-		if dep.Verb != "" {
-			depNode, err = n.build.ResolveVerb(dep.Target, dep.Verb)
-		} else {
-			depNode, err = n.build.Resolve(dep.Target)
-		}
+		targets, err := n.build.expandDep(dep.Target)
 		if err != nil {
 			n.resolveErr = err
 			return n.deps
 		}
-		n.deps = append(n.deps, depNode)
+		for _, target := range targets {
+			var depNode *TargetNode
+			if dep.Verb != "" {
+				depNode, err = n.build.ResolveVerb(target, dep.Verb)
+			} else {
+				depNode, err = n.build.Resolve(target)
+			}
+			if err != nil {
+				n.resolveErr = err
+				return n.deps
+			}
+			n.deps = append(n.deps, depNode)
+		}
 	}
 	if n.rule.Runner != "" {
 		runnerNode, err := n.build.Resolve(n.rule.Runner)
@@ -449,20 +494,34 @@ func (n *TargetNode) Dependencies() []*TargetNode {
 // deps, those are used. Otherwise deps are inherited from the default rule with
 // the same verb applied to each.
 func (n *TargetNode) verbDependencies() []*TargetNode {
-	if n.rule != nil && len(n.rule.Deps) > 0 {
+	if n.rule != nil && n.rule.HasDepSep {
 		for _, dep := range n.rule.Deps {
-			var depNode *TargetNode
-			var err error
-			if dep.Verb != "" {
-				depNode, err = n.build.ResolveVerb(dep.Target, dep.Verb)
-			} else {
-				depNode, err = n.build.Resolve(dep.Target)
-			}
+			targets, err := n.build.expandDep(dep.Target)
 			if err != nil {
 				n.resolveErr = err
 				return n.deps
 			}
-			n.deps = append(n.deps, depNode)
+			for _, target := range targets {
+				var depNode *TargetNode
+				if dep.Verb != "" {
+					depNode, err = n.build.ResolveVerb(target, dep.Verb)
+				} else {
+					depNode, err = n.build.Resolve(target)
+				}
+				if err != nil {
+					n.resolveErr = err
+					return n.deps
+				}
+				n.deps = append(n.deps, depNode)
+			}
+		}
+		if n.rule.Runner != "" {
+			runnerNode, err := n.build.Resolve(n.rule.Runner)
+			if err != nil {
+				n.resolveErr = err
+				return n.deps
+			}
+			n.deps = append(n.deps, runnerNode, n.build.containerNode(runnerNode))
 		}
 		return n.deps
 	}
@@ -478,12 +537,36 @@ func (n *TargetNode) verbDependencies() []*TargetNode {
 		return n.deps
 	}
 	for _, dep := range defaultRule.Deps {
-		depNode, err := n.build.ResolveVerb(dep.Target, n.verb)
+		targets, err := n.build.expandDep(dep.Target)
 		if err != nil {
 			n.resolveErr = err
 			return n.deps
 		}
-		n.deps = append(n.deps, depNode)
+		for _, target := range targets {
+			depNode, err := n.build.ResolveVerb(target, n.verb)
+			if err != nil {
+				n.resolveErr = err
+				return n.deps
+			}
+			n.deps = append(n.deps, depNode)
+		}
+	}
+	// If the verb rule itself has a runner, add runner + container for execution.
+	// Otherwise propagate the verb to the default rule's runner (e.g. clean).
+	if n.rule != nil && n.rule.Runner != "" {
+		runnerNode, err := n.build.Resolve(n.rule.Runner)
+		if err != nil {
+			n.resolveErr = err
+			return n.deps
+		}
+		n.deps = append(n.deps, runnerNode, n.build.containerNode(runnerNode))
+	} else if defaultRule.Runner != "" {
+		runnerNode, err := n.build.ResolveVerb(defaultRule.Runner, n.verb)
+		if err != nil {
+			n.resolveErr = err
+			return n.deps
+		}
+		n.deps = append(n.deps, runnerNode)
 	}
 	return n.deps
 }
@@ -588,9 +671,32 @@ func isAllDigits(s string) bool {
 	return true
 }
 
+// bodyFuncName returns the bash function name to call for this node's body
+// and whether there is a body to run. It handles both verb and non-verb nodes:
+//   - Non-verb: always gen.TargetFunc (the generated script embeds the defbody fallback).
+//   - Verb with explicit body: gen.VerbTargetFunc.
+//   - Verb with matching defbody: gen.DefaultVerbFunc.
+//   - Verb with no body: ("", false) — no-op.
+func (n *TargetNode) bodyFuncName() (string, bool) {
+	if n.verb == "" {
+		return gen.TargetFunc(n.target), true
+	}
+	if n.rule != nil && n.rule.Body != "" {
+		return gen.VerbTargetFunc(n.verb, n.target), true
+	}
+	defaultRule := n.build.concretes[n.target]
+	if defaultRule != nil && defaultRule.Type != "" {
+		key := defVerbBodyKey{defaultRule.Type, n.verb}
+		if n.build.defVerbBodies[key] {
+			return gen.DefaultVerbFunc(defaultRule.Type, n.verb), true
+		}
+	}
+	return "", false
+}
+
 // Run executes the target's body. For kindContainer it starts the container
-// for its image. For kindRule with `on R` it dispatches to runOn. Otherwise
-// it runs the body in a local bash subprocess.
+// for its image. If the rule has an `on` runner, the body is exec'd into
+// the running container. Otherwise it runs the body in a local bash subprocess.
 func (n *TargetNode) Run() error {
 	if n.resolveErr != nil {
 		return n.resolveErr
@@ -598,54 +704,41 @@ func (n *TargetNode) Run() error {
 	if n.kind == kindContainer {
 		return n.startContainer()
 	}
-	if n.verb != "" {
-		return n.runVerb()
+	funcName, ok := n.bodyFuncName()
+	if !ok {
+		return nil
 	}
-	if n.rule.Runner != "" {
-		return n.runOn()
+	runner := ""
+	if n.rule != nil {
+		runner = n.rule.Runner
 	}
-	return n.runBash(gen.TargetFunc(n.target), true)
+	if runner != "" {
+		return n.runOn(funcName)
+	}
+	return n.runBash(funcName, true)
 }
 
-// runVerb executes a verb node's action. Priority:
-//  1. Explicit verb rule with a body → call the generated VerbTargetFunc.
-//  2. No explicit body, but defbody for (type, verb) → call DefaultVerbFunc.
-//  3. Otherwise → no-op.
-func (n *TargetNode) runVerb() error {
-	if n.rule != nil && n.rule.Body != "" {
-		return n.runBash(gen.VerbTargetFunc(n.verb, n.target), true)
-	}
-	defaultRule := n.build.concretes[n.target]
-	if defaultRule != nil && defaultRule.Type != "" {
-		key := defVerbBodyKey{defaultRule.Type, n.verb}
-		if n.build.defVerbBodies[key] {
-			return n.runBash(gen.DefaultVerbFunc(defaultRule.Type, n.verb), true)
-		}
-	}
-	return nil
-}
-
-// runOn executes the body inside the environment provided by the runner
+// runOn executes funcName inside the environment provided by the runner
 // target. The strategy is selected by the runner target's type — currently
 // only "image" is supported. Add a case here to wire up new runner kinds.
-func (n *TargetNode) runOn() error {
+func (n *TargetNode) runOn(funcName string) error {
 	runnerNode, err := n.build.Resolve(n.rule.Runner)
 	if err != nil {
 		return err
 	}
 	switch runnerNode.rule.Type {
 	case "image":
-		return n.runInDockerContainer(runnerNode.target)
+		return n.runInDockerContainer(runnerNode.target, funcName)
 	default:
 		return fmt.Errorf("type %q is not a valid runner", runnerNode.rule.Type)
 	}
 }
 
-// runInDockerContainer executes the target body via `docker exec` against the
+// runInDockerContainer executes funcName via `docker exec` against the
 // long-running container that the corresponding container node started for
 // this build. The genfile is sourced from inside the container at the path
 // the container node bind-mounted it to.
-func (n *TargetNode) runInDockerContainer(image string) error {
+func (n *TargetNode) runInDockerContainer(image, funcName string) error {
 	n.build.containersMu.Lock()
 	containerID, ok := n.build.containers[image]
 	n.build.containersMu.Unlock()
@@ -656,14 +749,18 @@ func (n *TargetNode) runInDockerContainer(image string) error {
 	if err != nil {
 		return err
 	}
-	inner := `. ` + containerGenfilePath + `; target="$MMK_TARGET"; deps="$MMK_DEPS"; ` + gen.TargetFunc(n.target)
-	c := exec.Command("docker", "exec",
-		"--user", uid+":"+gid,
-		"-e", "MMK_TARGET="+n.target,
-		"-e", "MMK_DEPS="+strings.Join(n.explicitDepNames(), " "),
-		containerID,
-		"bash", "-c", inner,
-	)
+	inner := `. ` + containerGenfilePath + `; target="$MMK_TARGET"; deps="$MMK_DEPS"; ` + funcName
+	args := []string{"exec", "-i",
+		"--user", uid + ":" + gid,
+		"-e", "MMK_TARGET=" + n.target,
+		"-e", "MMK_DEPS=" + strings.Join(n.explicitDepNames(), " "),
+	}
+	if isTTY() {
+		args = append(args, "-t")
+	}
+	args = append(args, containerID, "bash", "-c", inner)
+	c := exec.Command("docker", args...)
+	c.Stdin = os.Stdin
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
 	return c.Run()
@@ -739,11 +836,36 @@ func (n *TargetNode) explicitDepNames() []string {
 	if n.rule == nil {
 		return nil
 	}
-	names := make([]string, len(n.rule.Deps))
-	for i, dep := range n.rule.Deps {
-		names[i] = dep.Target
+	var names []string
+	for _, dep := range n.rule.Deps {
+		expanded, err := n.build.expandDep(dep.Target)
+		if err != nil {
+			names = append(names, dep.Target)
+			continue
+		}
+		names = append(names, expanded...)
 	}
 	return names
+}
+
+// expandDep returns the target names a dep resolves to. If dep starts with '$',
+// it is expanded by sourcing the genfile and letting bash word-split the value.
+// Otherwise it is returned as-is in a single-element slice.
+func (b *Build) expandDep(dep string) ([]string, error) {
+	if !strings.HasPrefix(dep, "$") {
+		return []string{dep}, nil
+	}
+	cmd := exec.Command("bash", "-c", `. "$MMK_GENFILE"; echo `+dep)
+	cmd.Env = append(os.Environ(), "MMK_GENFILE="+b.genPath)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("expand dep %q: %w", dep, err)
+	}
+	names := strings.Fields(string(out))
+	if len(names) == 0 {
+		return nil, fmt.Errorf("expand dep %q: empty expansion", dep)
+	}
+	return names, nil
 }
 
 // runBash sources generated.sh and runs cmd in a bash subprocess.
@@ -758,6 +880,7 @@ func (n *TargetNode) runBash(cmd string, output bool) error {
 		"MMK_DEPS="+strings.Join(n.explicitDepNames(), " "),
 	)
 	if output {
+		c.Stdin = os.Stdin
 		c.Stdout = os.Stdout
 		c.Stderr = os.Stderr
 	}
@@ -776,4 +899,56 @@ func (n *TargetNode) runBashOutput(cmd string) (string, error) {
 	)
 	out, err := c.Output()
 	return string(out), err
+}
+
+// Targets returns the names of all explicitly declared concrete (non-pattern)
+// targets, sorted alphabetically.
+func (b *Build) Targets() []string {
+	names := make([]string, 0, len(b.concretes))
+	for name := range b.concretes {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// Patterns returns the regex strings of all pattern rules (non-verb), sorted.
+func (b *Build) Patterns() []string {
+	var patterns []string
+	for _, pe := range b.patterns {
+		if pe.rule.Verb == "" {
+			patterns = append(patterns, pe.rule.Pattern)
+		}
+	}
+	sort.Strings(patterns)
+	return patterns
+}
+
+// Verbs returns all known verb names, sorted. This includes verbs from
+// explicit verb rules, verb pattern rules, and defbody verb entries
+// (including the built-in ones like "clean" on file targets).
+func (b *Build) Verbs() []string {
+	seen := make(map[string]bool)
+	for key := range b.verbConcretes {
+		seen[key.verb] = true
+	}
+	for _, pe := range b.patterns {
+		if pe.rule.Verb != "" {
+			seen[pe.rule.Verb] = true
+		}
+	}
+	for key := range b.defVerbBodies {
+		seen[key.verb] = true
+	}
+	verbs := make([]string, 0, len(seen))
+	for v := range seen {
+		verbs = append(verbs, v)
+	}
+	sort.Strings(verbs)
+	return verbs
+}
+
+func isTTY() bool {
+	fi, err := os.Stdin.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
 }

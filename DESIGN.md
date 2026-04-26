@@ -133,14 +133,30 @@ runtime bridge are all consumers of `dag/`, not part of it.
 - Familiar to shell users — looks like bash with annotations.
 - Preprocessable into plain bash so each task body is invoked as a regular
   bash function in its own process.
-- User-extensible via `deftype` (NeedsRun strategies) and `defrunner`
-  (execution environments).
+- User-extensible via `deftype` (NeedsRun strategies) and `defbody`
+  (default build and verb behaviors).
 
 ### Grammar
 
 ```
-<type>? <target> (on <runner>)? (: <deps...>)? {
+<type>? <target> ('on' <image-target>)? (':' <deps...>)? {
     <body>
+}
+
+[<verb> <target>] ('on' <image-target>)? (':' <deps...>)? {
+    <body>
+}
+
+deftype <name> {
+    <bash — prints timestamp to stdout; non-zero exit = artifact absent>
+}
+
+defbody <type> {
+    <bash — default build body for targets of this type>
+}
+
+defbody <type> <verb> {
+    <bash — default body for 'verb' on targets of this type>
 }
 ```
 
@@ -155,59 +171,183 @@ clean {
 # No type, with deps — always runs after deps.
 all : myprogram
 
-# File type, with deps — NeedsRun() defined by `file` type.
+# File type, with deps — NeedsRun() defined by 'file' type.
 file main.o : main.c lib.h {
     cc -c main.c -o main.o
 }
 
-# File type, with runner — built inside ubuntu container.
-file main.o on ubuntu : main.c lib.h {
+# Pattern rule — '$1' is the capture group from the regex.
+file '(.*)\.o' : $1.c {
+    cc -c $1.c -o $target
+}
+
+# Verb rule — 'clean main.o' deletes the file.
+[clean main.o] {
+    rm -f main.o
+}
+
+# File type inside a container from an image target.
+image myimage:latest : Dockerfile
+file main.o on myimage:latest : main.c lib.h {
     cc -c main.c -o main.o
 }
 ```
 
-### Type and runner definitions
+### Verbs
+
+A *verb* qualifies a target name and gives it an alternate behavior. The
+default verb is the empty string (the standard build). Named verbs are
+invoked with `mmk <verb> <target>` on the CLI, or referenced in dep lists
+as `[verb deptarget]`.
 
 ```bash
-# A type defines NeedsRun() for targets that opt into it.
-# Body has $target and $deps available.
-# Exit 0 = up-to-date (skip), non-zero = needs build.
-deftype file {
-    [[ -f "$target" ]] || return 1
-    for dep in $deps; do
-        [[ "$dep" -nt "$target" ]] && return 1
-    done
-    return 0
+[clean all] : [clean main.o] [clean lib.o] {
+    rm -f output
 }
-
-deftype docker {
-    image_time=$(docker inspect -f '{{.Created}}' "$target" 2>/dev/null) || return 1
-    image_epoch=$(date -d "$image_time" +%s)
-    for dep in $deps; do
-        dep_epoch=$(stat -c %Y "$dep" 2>/dev/null) || return 1
-        (( dep_epoch > image_epoch )) && return 1
-    done
-    return 0
-}
-
-# A runner defines the execution wrapper.
-# `$@` expands to the actual invocation (bash + sourced generated.sh + function call).
-defrunner ubuntu {
-    docker run --rm -v "$PWD:/work" -w /work ubuntu:latest "$@"
-}
-
-defrunner remote {
-    ssh build-host "$@"
+[clean main.o] {
+    rm -f main.o
 }
 ```
 
+`mmk clean all` runs the clean tree rooted at `[clean all]`.
+
+Verb rules on a target inherit the target's dep list by default. Use
+`[clean foo] : {` (colon with empty list) to opt out of inheritance and
+have an explicit empty dep list. Use `[clean foo] : dep1 dep2 {` to
+override with a different list.
+
+### Type and body definitions
+
+```bash
+# A deftype body prints the artifact's timestamp to stdout (epoch seconds
+# or RFC3339). Non-zero exit means the artifact doesn't exist yet.
+# $target and $deps are available.
+deftype file {
+    stat -c %Y "$target" 2>/dev/null || return 1
+}
+
+deftype myimage {
+    docker inspect --format '{{.Created}}' "$target" 2>/dev/null || return 1
+}
+
+# A defbody provides the default Run body for targets of a given type.
+# Used when a typed target has no explicit body.
+defbody file {
+    [[ -e "$target" ]] && return 0
+    printf 'mmk: %s does not exist and has no rule to create it\n' "$target" >&2; return 1
+}
+
+# A defbody with a verb provides the default body for 'verb' on all
+# targets of the given type.
+defbody file clean {
+    rm -f "$target"
+}
+```
+
+### Runners
+
+Runner support is type-driven rather than user-defined. The `on <target>`
+clause names an existing concrete target; the runner strategy is determined
+by that target's type. Currently the only supported runner type is `image`.
+
+```bash
+image myimage:latest : Dockerfile
+
+# This target's body runs inside a container of myimage:latest.
+file prog on myimage:latest : main.c {
+    gcc -o prog main.c
+}
+```
+
+When `on` is used, mmk:
+1. Adds the named image target and a synthetic container-startup node as
+   implicit deps (so the image is built and the container is running before
+   the target executes).
+2. Exec's the body into the running container via `docker exec`.
+3. Cleans up the container when the build finishes.
+
+There is no `defrunner` keyword; runner behavior is not user-extensible in
+the current version. New runner strategies require adding a case in the
+runtime's `runOn` dispatch.
+
+### Built-in types
+
+Three types ship with mmk and need not be declared in the mmkfile:
+
+| Type     | NeedsRun strategy                    | Default build body                         |
+|----------|--------------------------------------|--------------------------------------------|
+| `file`   | `stat -c %Y "$target"` (mtime)       | error if absent (no rule to create it)     |
+| `source` | `stat -c %Y "$target"` (mtime)       | error if absent (no rule to create it)     |
+| `image`  | `docker inspect --format {{.Created}}` | `docker build -t "$target" -f "${deps%% *}" .` |
+
+**`source` vs `file`**: Both use mtime-based freshness. The difference is
+that `file` gets a built-in `clean` verb (the default `defbody file clean`
+runs `rm -f "$target"`). `source` does not — cleaning source files would
+destroy them. Any dependency not explicitly declared as `file` is inferred
+as `source` by the runtime.
+
+Override any built-in with your own `deftype` / `defbody`:
+
+```bash
+# Override stat for macOS
+deftype file {
+    stat -f %m "$target" 2>/dev/null || return 1
+}
+```
+
+Run `mmk -builtins` to print all built-in definitions as mmk syntax.
+
 ### Defaults
 
-- **No type specified** → always-run. `NeedsRun()` returns `true`. No magic
-  default; users opt in to freshness checks explicitly. (`file` is a
-  user-definable type, not a built-in — though we'll likely ship a stdlib
-  of common types.)
+- **No type specified** → always-run. `NeedsRun()` returns `true`. No
+  freshness check; the body runs unconditionally (after deps succeed).
 - **No runner specified** → run locally in bash, no wrapper.
+- **No body, typed target** → `defbody` for that type is used as the body.
+  For `file` and `source`, the default body errors if the file is absent.
+- **No body, untyped target** → no-op body (`:`) — useful for dep-only
+  aggregators.
+
+### Variable expansion in dep lists
+
+Dep lists may contain bare shell variable references (`$VARIABLE` or
+`${VARIABLE}`). These are expanded by sourcing the generated script in a
+bash subprocess and echoing the token. Word-splitting applies, so a
+variable holding a space-separated list of names expands to multiple deps.
+
+This is the same mechanism as passthrough bash — variable assignments in
+the mmkfile are emitted verbatim into the generated script, and dep
+expansion sources that script to evaluate them.
+
+```bash
+C_OBJ=$(ls *.c | sed 's/\.c$/.o/')
+
+file myprogram : $C_OBJ {
+    cc -o myprogram $C_OBJ
+}
+```
+
+Only simple `$VARIABLE` tokens at the start of a dep are expanded. Literal
+dep names that do not start with `$` are used as-is.
+
+### Passthrough bash
+
+Any line that is not an mmk directive is passed through verbatim to the
+generated script. This includes variable assignments, function definitions,
+and any other valid bash.
+
+```bash
+CC=gcc
+CFLAGS='-O2 -Wall'
+LDFLAGS="$CFLAGS -lm"
+
+file prog.o : prog.c {
+    $CC $CFLAGS -c prog.c -o prog.o
+}
+```
+
+Multi-line bash strings (using single or double quotes spanning multiple
+lines) are also passed through correctly. The parser detects open-quoted
+strings and treats subsequent lines as continuation until the quote closes.
 
 ### Body environment
 
@@ -216,7 +356,10 @@ Every target body has these env vars set when invoked:
 - `$target` — the target name as written in the source (unmangled).
 - `$deps` — space-separated string of dependency names.
 
-Same for `deftype` bodies.
+Same for `deftype` and `defbody` bodies.
+
+Pattern bodies additionally receive `$1`, `$2`, ... for regex capture
+groups, available both in the body and in the dep list.
 
 ### Function name validation
 
@@ -235,20 +378,29 @@ they appear only in `generated.sh`.
 1. **Parse** the annotated source file → AST of:
    - Target blocks (type, name, runner, deps, body)
    - `deftype` blocks (name, body)
-   - `defrunner` blocks (name, body)
+   - `defbody` blocks (type, optional verb, body)
    - Passthrough lines (verbatim bash — variable assignments, loops, etc.)
 2. **Validate**:
-   - Referenced types and runners exist.
+   - Referenced types exist.
+   - `on` targets exist and are of type `image`.
    - No cycles in the dep graph (also caught at exec time, but earlier is
      better).
    - Target names don't collide.
 3. **Generate** a temp `generated.sh` containing:
-   - Each `deftype` body as a bash function.
-   - Each `defrunner` body as a bash function.
+   - Built-in deftype / defbody / verb-body functions (suppressed if
+     overridden by the user).
+   - Each user `deftype` body as a bash function.
+   - Each user `defbody` body as a bash function.
    - Each concrete target body as a bash function.
    - Passthrough lines verbatim.
    - Pattern-instantiated targets are appended on demand during DAG
      construction.
+
+   The generated script is written to disk **before** DAG resolution begins.
+   This is required for variable expansion in dep lists: dep resolution is
+   lazy (happens during DAG walk), and sourcing `generated.sh` at that point
+   gives access to all passthrough variable assignments.
+
 4. **Build the DAG** of `dag.Node` instances (one per target). Each node
    closes over: target name, deps, type name (or empty), runner name (or
    empty), and the path to `generated.sh`.
@@ -281,6 +433,30 @@ MMK_GENFILE=<path> MMK_TARGET=<name> MMK_DEPS="<dep1 dep2 ...>" bash -c '
 If a runner `R` is set, `__mmk_runner_<R>` is prepended to the call so the
 runner body receives the target function as `$@`.
 
+### Variable expansion at dep resolution time
+
+When a dep string starts with `$`, the runtime expands it by running:
+
+```
+bash -c '. "$MMK_GENFILE"; echo $VARIABLE'
+```
+
+Word-splitting on the output gives the concrete dep names. This sources the
+already-generated script, so all passthrough variable definitions are
+available.
+
+### Inferred deps
+
+If a dep name is not declared in the mmkfile and no pattern rule matches it,
+the runtime infers a `source` node for it. Inferred `source` nodes:
+
+- Use `deftype source` (mtime-based freshness).
+- Use `defbody source` (error if absent).
+- Have **no** clean verb — source files are not deleted by `mmk clean`.
+
+This means users never need to explicitly declare source files; they only
+declare build artifacts.
+
 ### Failure semantics
 
 - A node whose `Run()` fails marks itself failed; downstream nodes see the
@@ -289,7 +465,7 @@ runner body receives the target function as `$@`.
   "needs build" — the build proceeds rather than failing on a freshness
   check error.
 - Fail-fast on the first failure; in-flight nodes complete but no new ones
-  start. (Future option: `--keep-going`.)
+  start.
 
 ### Cycle detection
 
@@ -300,51 +476,32 @@ Done during graph construction. Reports the cycle path.
 ## Part 4: CLI
 
 ```
-mmk [-j <n>] [target]
+mmk [-j <n>] [-v] [-dump] [-builtins] [[verb] target]
 ```
 
 - `-j <n>` — parallelism (default: 0 = unlimited).
+- `-v` — verbose: log each target as it runs or is skipped.
+- `-dump` — print the generated shell script and exit (does not run).
+- `-builtins` — print built-in type/body definitions as mmk syntax and exit
+  (works without an mmkfile).
 - Target defaults to `all` if not specified.
+- A single non-option argument is treated as a target if it matches a known
+  target, otherwise as a verb (running `<verb> all`).
+- Two non-option arguments are `verb` and `target`.
 - Mmkfile is named `Mmkfile` or `mmkfile` in the current directory.
 
 ---
 
-## Part 5: Out of Scope for v1 (Future Work)
+## Part 5: Out of Scope
 
-These are deliberately deferred so v1 stays small:
+These are deliberately deferred:
 
-- **Variable expansion in dependency lists.** `bunchac : $OFILES { ... }`
-  requires running the file through bash to expand variables. v1: literal
-  strings only.
-- **Includes / multi-file mmkfiles.** Single-file v1.
-- **`failok` / per-rule error tolerance.** v1 is fail-fast.
+- **Includes / multi-file mmkfiles.** Single-file only.
 - **`-k` / keep-going mode.**
 - **Watch mode.** Re-run on file change.
-- **Content-based fingerprinting.** Bazel/Nix style content hashes as an
-  alternative to modtime (would be a `deftype` users could write).
-- **A standard library of built-in types and runners** (`file`, `phony`,
-  `docker`, `ubuntu`, etc.). Likely a stdlib `.sh` file the tool implicitly
-  prepends. v1: users define their own.
-
----
-
-## Part 6: Build Plan
-
-Suggested implementation order:
-
-1. **`dag/` package** — `Node[T]` interface, `Step[T]`, `Semaphore`,
-   `Execute()`. Port and clean up from mmk2's `graph.go`. Write tests with
-   trivial in-memory nodes (no DSL involvement).
-2. **Parser** — `cmd/mmk/parse/`. Read the DSL into an AST. Cover all
-   forms in the grammar (with/without type, runner, deps).
-3. **Generator** — `cmd/mmk/gen/`. AST → `generated.sh`. Includes name
-   validation.
-4. **Runtime bridge** — `cmd/mmk/runtime/`. A `Node` implementation
-   wrapping a parsed target, calling `NeedsRun()` / `Run()` via bash
-   invocations of the generated functions.
-5. **CLI** — `cmd/mmk/main.go`. Argument parsing, glue.
-6. **End-to-end test** — port `mmkfile3` from mmk2 to the new syntax and
-   make it work.
+- **Content-based fingerprinting.** Bazel/Nix style content hashes.
+- **Variable target names.** Pattern rules require a regex; computed target
+  names from shell variables are not supported.
 
 ---
 
@@ -354,11 +511,13 @@ Suggested implementation order:
 |----------------------|------------------------------|-------------------------------------|
 | Core executor        | `Node[T,U]` with `Modtime`   | `Node[T]` with `NeedsRun()`         |
 | Shared context       | `U` threaded through methods | Closures over node state            |
-| Multi-rule targets   | One `Target`, many rules     | One node per (target, rule)         |
+| Multi-rule targets   | One `Target`, many rules     | One node per (target, verb)         |
 | DSL                  | Custom mmkfile syntax        | Annotated bash                      |
 | Body execution       | Lines fed to bash one by one | Full bash function in own process   |
 | Freshness            | Built-in modtime / `created` | User-defined `deftype`              |
-| Execution env        | Always local bash            | User-defined `defrunner`            |
-| Variable expansion   | Custom var system            | (v2) bash-native                    |
+| Execution env        | Always local bash            | `on <image-target>` (Docker)        |
+| Variable expansion   | Custom var system            | Bash-native via generated script    |
 | Pattern targets      | Yes                          | Yes (single-quoted regex)           |
 | Passthrough bash     | No                           | Yes (variable defs, loops, etc.)    |
+| Verb system          | No                           | Yes (`[verb target]`, `defbody`)    |
+| Built-in types       | No                           | `source`, `file`, `image`           |

@@ -6,6 +6,7 @@ package gen
 import (
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 
 	"github.com/knusbaum/mmk3/cmd/mmk/parse"
@@ -47,23 +48,32 @@ func VerbTargetFunc(verb, target string) string { return "__mmk_verb_" + verb + 
 // DefaultVerbFunc returns the bash function name for a type's default verb body.
 func DefaultVerbFunc(typeName, verb string) string { return "__mmk_default_" + verb + "_" + typeName }
 
-// builtinDefTypes contains the built-in deftype body (bash printing a timestamp)
+// BuiltinDefTypes contains the built-in deftype body (bash printing a timestamp)
 // for each built-in type. A user deftype with the same name overrides these.
 // Note: stat -c %Y is GNU coreutils (Linux); macOS users should override with stat -f %m.
-var builtinDefTypes = map[string]string{
-	"file":  "\n\tstat -c %Y \"$target\" 2>/dev/null || return 1\n",
-	"image": "\n\tdocker inspect --format '{{.Created}}' \"$target\" 2>/dev/null || return 1\n",
+var BuiltinDefTypes = map[string]string{
+	"file":   "\n\tstat -c %Y \"$target\" 2>/dev/null || return 1\n",
+	"image":  "\n\tdocker inspect --format '{{.Created}}' \"$target\" 2>/dev/null || return 1\n",
+	"source": "\n\tstat -c %Y \"$target\" 2>/dev/null || return 1\n",
 }
 
 // builtinDefBodies contains the built-in default body for each built-in type.
 // A user defbody for the same type name overrides these.
 var builtinDefBodies = map[string]string{
-	"file":  "\n\t[[ -e \"$target\" ]] && return 0\n\tprintf 'mmk: %s does not exist and has no rule to create it\\n' \"$target\" >&2; return 1\n",
-	"image": "\n\tdocker build -t \"$target\" -f \"${deps%% *}\" .\n",
+	"file":   "\n\t[[ -e \"$target\" ]] && return 0\n\tprintf 'mmk: %s does not exist and has no rule to create it\\n' \"$target\" >&2; return 1\n",
+	"image":  "\n\tdocker build -t \"$target\" -f \"${deps%% *}\" .\n",
+	"source": "\n\t[[ -e \"$target\" ]] && return 0\n\tprintf 'mmk: %s does not exist and has no rule to create it\\n' \"$target\" >&2; return 1\n",
+}
+
+// BuiltinVerbBodies contains the built-in verb body for (type, verb) pairs.
+// A user defbody for the same type+verb overrides these.
+var BuiltinVerbBodies = map[string]map[string]string{
+	"file":  {"clean": "\n\trm -f \"$target\"\n"},
+	"image": {"clean": "\n\tdocker image inspect \"$target\" >/dev/null 2>&1 || return 0\n\tdocker image rm -f \"$target\"\n"},
 }
 
 // builtinOrder lists built-in types in a deterministic emit order.
-var builtinOrder = []string{"file", "image"}
+var builtinOrder = []string{"source", "file", "image"}
 
 // Generate writes bash function definitions for all directives in f to w.
 func Generate(w io.Writer, f *parse.File) error {
@@ -74,6 +84,7 @@ func Generate(w io.Writer, f *parse.File) error {
 	// Collect user-defined deftypes and defbodies so built-ins can be suppressed.
 	userDefType := make(map[string]bool)
 	userDefBody := make(map[string]bool)
+	userDefVerbBody := make(map[string]map[string]bool) // type → verb → true
 	for _, d := range f.Directives {
 		switch d := d.(type) {
 		case *parse.DefType:
@@ -81,6 +92,11 @@ func Generate(w io.Writer, f *parse.File) error {
 		case *parse.DefBody:
 			if d.Verb == "" {
 				userDefBody[d.Type] = true
+			} else {
+				if userDefVerbBody[d.Type] == nil {
+					userDefVerbBody[d.Type] = make(map[string]bool)
+				}
+				userDefVerbBody[d.Type][d.Verb] = true
 			}
 		}
 	}
@@ -90,7 +106,7 @@ func Generate(w io.Writer, f *parse.File) error {
 		if userDefType[typeName] {
 			continue
 		}
-		body := builtinDefTypes[typeName]
+		body := BuiltinDefTypes[typeName]
 		if _, err := fmt.Fprintf(w, "\n# built-in deftype: %s\n%s() {%s}\n", typeName, TypeFunc(typeName), body); err != nil {
 			return err
 		}
@@ -104,6 +120,20 @@ func Generate(w io.Writer, f *parse.File) error {
 		body := builtinDefBodies[typeName]
 		if _, err := fmt.Fprintf(w, "\n# built-in default body: %s\n%s() {%s}\n", typeName, DefaultFunc(typeName), body); err != nil {
 			return err
+		}
+	}
+
+	// Emit built-in verb body functions for (type, verb) pairs not overridden by the user.
+	for _, typeName := range builtinOrder {
+		verbBodies := BuiltinVerbBodies[typeName]
+		for _, verb := range sortedKeys(verbBodies) {
+			if userDefVerbBody[typeName][verb] {
+				continue
+			}
+			body := verbBodies[verb]
+			if _, err := fmt.Fprintf(w, "\n# built-in defbody %s %s\n%s() {%s}\n", typeName, verb, DefaultVerbFunc(typeName, verb), body); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -228,13 +258,29 @@ func GenerateRule(w io.Writer, rule *parse.TargetRule) error {
 	return err
 }
 
-// ValidateDuplicates returns an error if any (target, verb) pair appears more than once.
+// GenerateVerbRule writes a single concrete verb target function to w.
+// Used by the runtime when instantiating pattern-matched verb targets on demand.
+func GenerateVerbRule(w io.Writer, rule *parse.TargetRule) error {
+	if err := ValidateName(rule.Target); err != nil {
+		return fmt.Errorf("target: %w", err)
+	}
+	if err := ValidateName(rule.Verb); err != nil {
+		return fmt.Errorf("verb rule verb: %w", err)
+	}
+	body := normalizeBody(rule.Body)
+	comment := fmt.Sprintf("verb %s for target: %s", rule.Verb, rule.Target)
+	_, err := fmt.Fprintf(w, "\n# %s\n%s() {%s}\n", comment, VerbTargetFunc(rule.Verb, rule.Target), body)
+	return err
+}
+
+// ValidateDuplicates returns an error if any concrete (target, verb) pair appears more than once.
+// Pattern rules are skipped; duplicate patterns can only be detected at match time.
 func ValidateDuplicates(f *parse.File) error {
 	type tvKey struct{ target, verb string }
 	seen := make(map[tvKey]bool)
 	for _, d := range f.Directives {
 		r, ok := d.(*parse.TargetRule)
-		if !ok {
+		if !ok || r.Pattern != "" {
 			continue
 		}
 		key := tvKey{r.Target, r.Verb}
@@ -247,4 +293,38 @@ func ValidateDuplicates(f *parse.File) error {
 		seen[key] = true
 	}
 	return nil
+}
+
+// PrintBuiltins writes the built-in type definitions as mmk syntax to w.
+func PrintBuiltins(w io.Writer) error {
+	fmt.Fprintln(w, "# mmk built-in type definitions")
+	fmt.Fprintln(w, "# Override any of these in your Mmkfile with deftype / defbody.")
+	for _, typeName := range builtinOrder {
+		if body, ok := BuiltinDefTypes[typeName]; ok {
+			if _, err := fmt.Fprintf(w, "\ndeftype %s {%s}\n", typeName, body); err != nil {
+				return err
+			}
+		}
+		if body, ok := builtinDefBodies[typeName]; ok {
+			if _, err := fmt.Fprintf(w, "\ndefbody %s {%s}\n", typeName, body); err != nil {
+				return err
+			}
+		}
+		for _, verb := range sortedKeys(BuiltinVerbBodies[typeName]) {
+			body := BuiltinVerbBodies[typeName][verb]
+			if _, err := fmt.Fprintf(w, "\ndefbody %s %s {%s}\n", typeName, verb, body); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }

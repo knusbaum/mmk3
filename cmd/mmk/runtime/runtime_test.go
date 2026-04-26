@@ -69,14 +69,98 @@ func TestResolveSameNodeReturned(t *testing.T) {
 	}
 }
 
-func TestResolveUnknownInfersFileType(t *testing.T) {
+func TestResolveUnknownInfersSourceType(t *testing.T) {
 	b := newBuild(t, `all :`)
 	n, err := b.Resolve("somefile.c")
 	if err != nil {
-		t.Fatalf("Resolve: expected inferred file node, got error: %v", err)
+		t.Fatalf("Resolve: expected inferred source node, got error: %v", err)
 	}
-	if n.rule.Type != "file" {
-		t.Errorf("inferred type: got %q, want \"file\"", n.rule.Type)
+	if n.rule.Type != "source" {
+		t.Errorf("inferred type: got %q, want \"source\"", n.rule.Type)
+	}
+}
+
+// --- verb propagation to inferred source targets ---
+
+func TestVerbPropagationToInferredSource(t *testing.T) {
+	// [clean main.o] should propagate to [clean main.c], but main.c is an
+	// inferred source target not yet in concretes. ResolveVerb must not error.
+	b := newBuild(t, `
+file '(.*)\.o' : $1.c {
+    cc -c $1.c -o $target
+}
+all : main.o
+`)
+	n, err := b.ResolveVerb("main.o", "clean")
+	if err != nil {
+		t.Fatalf("ResolveVerb main.o clean: %v", err)
+	}
+	deps := n.Dependencies()
+	if len(deps) != 1 {
+		t.Fatalf("expected 1 dep ([clean main.c]), got %d: %v", len(deps), depTargets(deps))
+	}
+	if deps[0].target != "main.c" {
+		t.Errorf("dep target: got %q, want %q", deps[0].target, "main.c")
+	}
+}
+
+// --- variable expansion in deps ---
+
+func TestVarDepExpansion(t *testing.T) {
+	b := newBuild(t, `
+ITEMS="foo bar"
+foo :
+bar :
+all : $ITEMS
+`)
+	all, _ := b.Resolve("all")
+	deps := all.Dependencies()
+	if len(deps) != 2 {
+		t.Fatalf("expected 2 deps from $ITEMS expansion, got %d: %v", len(deps), depTargets(deps))
+	}
+	if deps[0].target != "foo" || deps[1].target != "bar" {
+		t.Errorf("deps: got %v, want [foo bar]", depTargets(deps))
+	}
+}
+
+func TestVarDepExpansionInVerbDeps(t *testing.T) {
+	b := newBuild(t, `
+ITEMS="foo bar"
+foo :
+bar :
+all : $ITEMS
+`)
+	// Verb deps inherited from default rule should also expand $ITEMS.
+	n, err := b.ResolveVerb("all", "clean")
+	if err != nil {
+		t.Fatalf("ResolveVerb: %v", err)
+	}
+	deps := n.Dependencies()
+	if len(deps) != 2 {
+		t.Fatalf("expected 2 verb deps from $ITEMS expansion, got %d: %v", len(deps), depTargets(deps))
+	}
+	if deps[0].target != "foo" || deps[1].target != "bar" {
+		t.Errorf("verb deps: got %v, want [foo bar]", depTargets(deps))
+	}
+}
+
+func TestVarDepExpansionInExplicitVerbDeps(t *testing.T) {
+	b := newBuild(t, `
+ITEMS="foo bar"
+foo :
+bar :
+[clean all] : $ITEMS
+`)
+	n, err := b.ResolveVerb("all", "clean")
+	if err != nil {
+		t.Fatalf("ResolveVerb: %v", err)
+	}
+	deps := n.Dependencies()
+	if len(deps) != 2 {
+		t.Fatalf("expected 2 explicit verb deps from $ITEMS expansion, got %d: %v", len(deps), depTargets(deps))
+	}
+	if deps[0].target != "foo" || deps[1].target != "bar" {
+		t.Errorf("verb deps: got %v, want [foo bar]", depTargets(deps))
 	}
 }
 
@@ -173,14 +257,14 @@ special.o :
 	}
 }
 
-func TestPatternNoMatchInfersFile(t *testing.T) {
+func TestPatternNoMatchInfersSource(t *testing.T) {
 	b := newBuild(t, `'(.*)\.o' : $1.c`)
 	n, err := b.Resolve("main.c")
 	if err != nil {
-		t.Fatalf("Resolve: expected inferred file node, got error: %v", err)
+		t.Fatalf("Resolve: expected inferred source node, got error: %v", err)
 	}
-	if n.rule.Type != "file" {
-		t.Errorf("expected inferred file type, got %q", n.rule.Type)
+	if n.rule.Type != "source" {
+		t.Errorf("expected inferred source type, got %q", n.rule.Type)
 	}
 }
 
@@ -669,6 +753,114 @@ foo :
 	}
 	if b.HasTarget("missing") {
 		t.Error("HasTarget(missing) should be false")
+	}
+}
+
+func TestVerbInheritancePropagatesRunner(t *testing.T) {
+	src := `
+image myimage : {
+	true
+}
+file target on myimage : dep
+dep :
+`
+	b := newBuild(t, src)
+	n, err := b.ResolveVerb("target", "clean")
+	if err != nil {
+		t.Fatalf("ResolveVerb: %v", err)
+	}
+	deps := n.Dependencies()
+	targets := depTargets(deps)
+	found := false
+	for _, name := range targets {
+		if name == "myimage" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("expected [clean myimage] in deps, got %v", targets)
+	}
+}
+
+func TestVerbPatternBodyRunsWhenDepHasRunner(t *testing.T) {
+	tmp := t.TempDir()
+	marker := filepath.Join(tmp, "ran")
+	src := fmt.Sprintf(`
+image myimage : {
+	true
+}
+file executable on myimage : main.o {
+	true
+}
+[check '(.*)\.o'] : {
+	touch %s
+}
+'(.*)\.o' :
+`, marker)
+	b := newBuild(t, src)
+	// Execute check all — verb nodes only, no docker needed.
+	// [check main.o] should touch the marker file.
+	b.Execute("executable", "check", 1) //nolint — may fail due to container; we only care about the marker
+	if _, err := os.Stat(marker); os.IsNotExist(err) {
+		t.Error("verb pattern body did not execute — marker file not created")
+	}
+}
+
+func TestVerbPatternRuleRunsBody(t *testing.T) {
+	src := `
+all : main.o
+'(.*)\.o' : $1.c
+[check '(.*)\.o'] : {
+	true
+}
+`
+	b := newBuild(t, src)
+	n, err := b.ResolveVerb("main.o", "check")
+	if err != nil {
+		t.Fatalf("ResolveVerb verb pattern: %v", err)
+	}
+	n.Dependencies()
+	if err := n.Run(); err != nil {
+		t.Errorf("Run verb pattern: %v", err)
+	}
+}
+
+func TestVerbPatternRuleWithOnHasRunnerAndDeps(t *testing.T) {
+	src := `
+image myimage : {
+	true
+}
+'(.*)\.o' : $1.c
+[check '(.*)\.o'] on myimage {
+	true
+}
+`
+	b := newBuild(t, src)
+	n, err := b.ResolveVerb("main.o", "check")
+	if err != nil {
+		t.Fatalf("ResolveVerb: %v", err)
+	}
+	if n.rule == nil {
+		t.Fatal("expected non-nil rule for verb pattern with on clause")
+	}
+	if n.rule.Runner != "myimage" {
+		t.Errorf("instantiated rule Runner: got %q, want %q", n.rule.Runner, "myimage")
+	}
+	deps := n.Dependencies()
+	var foundRunner, foundContainer bool
+	for _, dep := range deps {
+		if dep.target == "myimage" && dep.kind == kindRule {
+			foundRunner = true
+		}
+		if dep.kind == kindContainer && dep.containerFor != nil && dep.containerFor.target == "myimage" {
+			foundContainer = true
+		}
+	}
+	if !foundRunner {
+		t.Errorf("expected myimage runner in deps, got %v", depTargets(deps))
+	}
+	if !foundContainer {
+		t.Errorf("expected container node for myimage in deps, got %v", depTargets(deps))
 	}
 }
 

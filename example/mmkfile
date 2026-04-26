@@ -1,14 +1,36 @@
 all : executable
 
-file buildcontainer/Dockerfile :
 image buildimage:latest : buildcontainer/Dockerfile
-
-file othercontainer/Dockerfile :
 image runimage:latest : othercontainer/Dockerfile
 
+deftype remote_image {
+	docker inspect --format '{{.Created}}' "$target" 2>/dev/null || return 1
+}
 
-file main.c :
-file executable on buildimage:latest : main.c {
+defbody remote_image {
+	docker pull "$target"
+}
+
+defbody remote_image clean {
+	docker image inspect "$target" >/dev/null 2>&1 || return 0
+	docker image rm -f "$target"
+}
+
+remote_image ubuntu:latest :
+
+file '(.*)\.o' : $1.c {
+     cc -c $1.c -o $target
+}
+
+[check '(.*)\.o'] on ubuntu:latest {
+    echo Checking $target
+}
+
+#[clean all] on buildimage:latest {
+#    echo ok
+#}
+
+file executable on buildimage:latest : main.o {
     cc -o $target main.c
 }
 
@@ -16,7 +38,7 @@ run on runimage:latest : executable {
     ./executable
 }
 
-clean {
-    rm executable
-    docker image rm -f buildimage
+
+shell on runimage:latest : executable {
+    PS1='(run shell) $ ' bash -i
 }

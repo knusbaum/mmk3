@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/knusbaum/mmk3/cmd/mmk/gen"
 	"github.com/knusbaum/mmk3/cmd/mmk/runtime"
 )
 
@@ -12,11 +13,21 @@ func main() {
 	j := flag.Int("j", 0, "parallelism (0 = unlimited)")
 	v := flag.Bool("v", false, "verbose: log each target as it runs or is skipped")
 	dump := flag.Bool("dump", false, "print generated shell script and exit")
+	builtins := flag.Bool("builtins", false, "print built-in type definitions as mmk syntax and exit")
+	list := flag.Bool("list", false, "list available targets and verbs, then exit")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: mmk [-j N] [-v] [-dump] [[verb] target]\n")
+		fmt.Fprintf(os.Stderr, "usage: mmk [-j N] [-v] [-dump] [-builtins] [-list] [[verb] target]\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	if *builtins {
+		if err := gen.PrintBuiltins(os.Stdout); err != nil {
+			fmt.Fprintf(os.Stderr, "mmk: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	src, err := readMmkfile()
 	if err != nil {
@@ -31,6 +42,20 @@ func main() {
 	}
 	defer b.Close()
 	b.Verbose = *v
+
+	if *list {
+		for _, t := range b.Targets() {
+			fmt.Println(t)
+		}
+		verbs := b.Verbs()
+		if len(verbs) > 0 {
+			fmt.Println()
+			for _, verb := range verbs {
+				fmt.Printf("[%s]\n", verb)
+			}
+		}
+		return
+	}
 
 	if *dump {
 		data, err := os.ReadFile(b.GenPath())

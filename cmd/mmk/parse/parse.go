@@ -67,9 +67,10 @@ type TargetRule struct {
 	Target  string // concrete name; empty if Pattern is set
 	Pattern string // regex from '...'; empty if Target is set
 	Runner  string // empty if no runner
-	Verb    string // empty for default build rules
-	Deps    []Dep  // may be nil
-	Body    string // empty if no body (deps-only rule)
+	Verb       string // empty for default build rules
+	HasDepSep  bool   // true if ':' was present (even with empty dep list)
+	Deps       []Dep  // may be nil
+	Body       string // empty if no body (deps-only rule)
 }
 
 // DefBody defines the default Run body for targets of the given type.
@@ -486,12 +487,13 @@ func (p *parser) lineHasDirectiveMarker() bool {
 			// Comment runs to EOL; look ahead for body on next line.
 			return p.nextNonBlankIs('{')
 		case '"':
-			// Skip double-quoted string; unterminated → commit for a clear error.
+			// Skip double-quoted string. Unterminated means the string spans
+			// lines — that's bash, not an mmk directive, so treat as passthrough.
 			p.s.advance()
 			for {
 				c := p.s.peek()
 				if c == 0 || c == '\n' {
-					return true // unterminated: commit so parser produces the error
+					return false
 				}
 				if c == '\\' {
 					p.s.advance()
@@ -504,12 +506,13 @@ func (p *parser) lineHasDirectiveMarker() bool {
 				}
 			}
 		case '\'':
-			// Skip single-quoted string; unterminated → commit.
+			// Skip single-quoted string. Unterminated means the string spans
+			// lines — that's bash, not an mmk pattern, so treat as passthrough.
 			p.s.advance()
 			for {
 				c := p.s.peek()
 				if c == 0 || c == '\n' {
-					return true
+					return false
 				}
 				p.s.advance()
 				if c == '\'' {
@@ -662,6 +665,7 @@ func (p *parser) parseTargetRule() (*TargetRule, error) {
 	p.s.skipHorizontalSpace()
 	if p.s.peek() == ':' {
 		p.s.advance()
+		rule.HasDepSep = true
 		for {
 			p.s.skipHorizontalSpace()
 			b := p.s.peek()
@@ -751,6 +755,7 @@ func parseHeader(tokens []headerToken) (typ, target, pattern, runner, verb strin
 
 	switch len(nameTokens) {
 	case 1:
+		verb = nameTokens[0].verb // non-empty when token is a [verb target] bracket
 		setTarget(nameTokens[0])
 	case 2:
 		if nameTokens[0].isPattern {
