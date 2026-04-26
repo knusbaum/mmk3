@@ -67,7 +67,7 @@ var BuiltinDefTypes = map[string]string{
 // A user defbody for the same type name overrides these.
 var builtinDefBodies = map[string]string{
 	"file":   "\n\t[[ -e \"$target\" ]] && return 0\n\tprintf 'mmk: %s does not exist and has no rule to create it\\n' \"$target\" >&2; return 1\n",
-	"image":  "\n\tdocker build -t \"$target\" -f \"${deps%% *}\" .\n",
+	"image":  "\n\tif [[ -n \"$deps\" ]]; then\n\t\tdocker build -t \"$target\" -f \"${deps%% *}\" .\n\telse\n\t\tdocker pull \"$target\"\n\tfi\n",
 	"source": "\n\t[[ -e \"$target\" ]] && return 0\n\tprintf 'mmk: %s does not exist and has no rule to create it\\n' \"$target\" >&2; return 1\n",
 }
 
