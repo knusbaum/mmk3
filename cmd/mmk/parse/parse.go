@@ -52,22 +52,33 @@ type DefRunner struct {
 	Body string
 }
 
+// Dep is a single dependency in a target rule.
+// Verb is non-empty when the dep is a verb-qualified reference like [clean somedep].
+type Dep struct {
+	Target string
+	Verb   string
+}
+
 // TargetRule is a single build target.
 // Exactly one of Target or Pattern is set.
+// Verb is non-empty for verb rules declared with [verb target] syntax.
 type TargetRule struct {
-	Type    string   // empty if no type
-	Target  string   // concrete name; empty if Pattern is set
-	Pattern string   // regex from '...'; empty if Target is set
-	Runner  string   // empty if no runner
-	Deps    []string // may be nil
-	Body    string   // empty if no body (deps-only rule)
+	Type    string // empty if no type
+	Target  string // concrete name; empty if Pattern is set
+	Pattern string // regex from '...'; empty if Target is set
+	Runner  string // empty if no runner
+	Verb    string // empty for default build rules
+	Deps    []Dep  // may be nil
+	Body    string // empty if no body (deps-only rule)
 }
 
 // DefBody defines the default Run body for targets of the given type.
 // When a typed target has no explicit body, this body is used instead of a no-op.
+// Verb is non-empty for verb-specific default bodies (defbody type verb { ... }).
 // $target and $deps are available, same as in any target body.
 type DefBody struct {
 	Type string
+	Verb string
 	Body string
 }
 
@@ -130,7 +141,7 @@ func (s *scanner) skipToEndOfLine() {
 
 func isWordByte(b byte) bool {
 	switch b {
-	case 0, ' ', '\t', '\n', ':', '{', '}', '#', '"', '\'', '(', ')':
+	case 0, ' ', '\t', '\n', ':', '{', '}', '#', '"', '\'', '(', ')', '[', ']':
 		return false
 	}
 	return true
@@ -322,10 +333,43 @@ func (p *parser) parseName() (string, error) {
 // headerToken is a parsed token from a target rule header.
 type headerToken struct {
 	val       string
-	isPattern bool // true if read from a single-quoted '...' pattern
+	isPattern bool   // true if read from a single-quoted '...' pattern
+	verb      string // non-empty when read from a [verb target] bracketed pair
 }
 
-// parseHeaderToken reads a word, double-quoted string, or single-quoted pattern.
+// parseBracketed reads a '[verb target]' pair and returns (verb, target, isPattern, err).
+// The opening '[' must be the current peek byte.
+func (p *parser) parseBracketed() (verb, target string, isPattern bool, err error) {
+	openedAt := p.s.line
+	p.s.advance() // consume '['
+	p.s.skipHorizontalSpace()
+	verb = p.s.readWord()
+	if verb == "" {
+		err = fmt.Errorf("line %d: expected verb inside '[...]'", openedAt)
+		return
+	}
+	p.s.skipHorizontalSpace()
+	var tok headerToken
+	tok, err = p.parseHeaderToken()
+	if err != nil {
+		return
+	}
+	if tok.verb != "" {
+		err = fmt.Errorf("line %d: nested bracketed verb not allowed", p.s.line)
+		return
+	}
+	target = tok.val
+	isPattern = tok.isPattern
+	p.s.skipHorizontalSpace()
+	if p.s.peek() != ']' {
+		err = fmt.Errorf("line %d: expected ']' after verb target, got %q", p.s.line, p.s.peek())
+		return
+	}
+	p.s.advance() // consume ']'
+	return
+}
+
+// parseHeaderToken reads a word, double-quoted string, single-quoted pattern, or [verb target].
 func (p *parser) parseHeaderToken() (headerToken, error) {
 	p.s.skipHorizontalSpace()
 	switch p.s.peek() {
@@ -341,6 +385,12 @@ func (p *parser) parseHeaderToken() (headerToken, error) {
 			return headerToken{}, err
 		}
 		return headerToken{val: val}, nil
+	case '[':
+		verb, target, isPattern, err := p.parseBracketed()
+		if err != nil {
+			return headerToken{}, err
+		}
+		return headerToken{val: target, isPattern: isPattern, verb: verb}, nil
 	default:
 		b := p.s.peek()
 		if !isWordByte(b) && !(b == ':' && !p.s.colonIsSeparator()) {
@@ -376,7 +426,7 @@ func (p *parser) parseDirectiveOrPassthrough() (Directive, error) {
 	word := p.s.readWord()
 	p.s.pos, p.s.line = saved, savedLine
 
-	if word == "deftype" || word == "defrunner" {
+	if word == "deftype" || word == "defrunner" || word == "defbody" {
 		return p.parseDirective()
 	}
 
@@ -524,9 +574,7 @@ func (p *parser) parseDirective() (Directive, error) {
 			return &DefRunner{Name: name, Body: body}
 		})
 	case "defbody":
-		return p.parseDefBlock(word, func(name, body string) Directive {
-			return &DefBody{Type: name, Body: body}
-		})
+		return p.parseDefBody()
 	default:
 		return p.parseTargetRule()
 	}
@@ -551,6 +599,38 @@ func (p *parser) parseDefBlock(keyword string, make func(name, body string) Dire
 	return make(name, body), nil
 }
 
+// parseDefBody handles 'defbody type [verb]? { body }' directives.
+// An optional verb word may appear between the type name and the opening brace.
+func (p *parser) parseDefBody() (Directive, error) {
+	p.s.readWord() // consume "defbody"
+	typeName, err := p.parseName()
+	if err != nil {
+		return nil, fmt.Errorf("defbody: %w", err)
+	}
+	p.s.skipHorizontalSpace()
+	// Optional verb: a word (or quoted string) on the same line before '{' or newline.
+	var verb string
+	if b := p.s.peek(); b != 0 && b != '\n' && b != '{' && b != '#' {
+		if isWordByte(b) || b == '"' {
+			verb, err = p.parseName()
+			if err != nil {
+				return nil, fmt.Errorf("defbody verb: %w", err)
+			}
+		}
+	}
+	p.skipWhitespaceAndComments()
+	if p.s.peek() != '{' {
+		return nil, fmt.Errorf("line %d: expected '{' after defbody %s", p.s.line, typeName)
+	}
+	openedAt := p.s.line
+	p.s.advance()
+	body, err := p.s.readBody(openedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &DefBody{Type: typeName, Verb: verb, Body: body}, nil
+}
+
 func (p *parser) parseTargetRule() (*TargetRule, error) {
 	// Collect header tokens (words/strings/patterns) until the dep-separator ':',
 	// '{', '#', newline, or EOF. An embedded ':' within a name (e.g. "image:tag")
@@ -572,11 +652,11 @@ func (p *parser) parseTargetRule() (*TargetRule, error) {
 		header = append(header, tok)
 	}
 
-	typ, target, pattern, runner, err := parseHeader(header)
+	typ, target, pattern, runner, verb, err := parseHeader(header)
 	if err != nil {
 		return nil, fmt.Errorf("line %d: %w", p.s.line, err)
 	}
-	rule := &TargetRule{Type: typ, Target: target, Pattern: pattern, Runner: runner}
+	rule := &TargetRule{Type: typ, Target: target, Pattern: pattern, Runner: runner, Verb: verb}
 
 	// Optional deps after ':'.
 	p.s.skipHorizontalSpace()
@@ -588,11 +668,19 @@ func (p *parser) parseTargetRule() (*TargetRule, error) {
 			if b == '\n' || b == 0 || b == '{' || b == '#' {
 				break
 			}
-			dep, err := p.parseName()
-			if err != nil {
-				return nil, err
+			if b == '[' {
+				dverb, dtarget, _, err := p.parseBracketed()
+				if err != nil {
+					return nil, err
+				}
+				rule.Deps = append(rule.Deps, Dep{Target: dtarget, Verb: dverb})
+			} else {
+				name, err := p.parseName()
+				if err != nil {
+					return nil, err
+				}
+				rule.Deps = append(rule.Deps, Dep{Target: name})
 			}
-			rule.Deps = append(rule.Deps, dep)
 		}
 	}
 
@@ -618,25 +706,37 @@ func (p *parser) parseTargetRule() (*TargetRule, error) {
 }
 
 // parseHeader interprets the header token slice as: type? (target|pattern) ('on' runner)?
+// or a single [verb target] bracketed token for verb rules.
 // Exactly one of target or pattern will be non-empty in the return values.
-func parseHeader(tokens []headerToken) (typ, target, pattern, runner string, err error) {
+func parseHeader(tokens []headerToken) (typ, target, pattern, runner, verb string, err error) {
 	if len(tokens) == 0 {
-		return "", "", "", "", fmt.Errorf("expected target name")
+		return "", "", "", "", "", fmt.Errorf("expected target name")
+	}
+
+	// A single bracketed token is a verb rule: [verb target]
+	if len(tokens) == 1 && tokens[0].verb != "" {
+		if tokens[0].isPattern {
+			pattern = tokens[0].val
+		} else {
+			target = tokens[0].val
+		}
+		verb = tokens[0].verb
+		return
 	}
 
 	// Split on the unquoted keyword "on".
 	onIdx := slices.IndexFunc(tokens, func(t headerToken) bool {
-		return t.val == "on" && !t.isPattern
+		return t.val == "on" && !t.isPattern && t.verb == ""
 	})
 	nameTokens := tokens
 	if onIdx >= 0 {
 		nameTokens = tokens[:onIdx]
 		rest := tokens[onIdx+1:]
 		if len(rest) != 1 {
-			return "", "", "", "", fmt.Errorf("expected exactly one runner name after 'on'")
+			return "", "", "", "", "", fmt.Errorf("expected exactly one runner name after 'on'")
 		}
 		if rest[0].isPattern {
-			return "", "", "", "", fmt.Errorf("runner name cannot be a pattern")
+			return "", "", "", "", "", fmt.Errorf("runner name cannot be a pattern")
 		}
 		runner = rest[0].val
 	}

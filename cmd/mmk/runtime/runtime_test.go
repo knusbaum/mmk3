@@ -357,7 +357,7 @@ dep {
 }
 `
 	b := newBuild(t, src)
-	if err := b.Execute("all", 1); err != nil {
+	if err := b.Execute("all", "", 1); err != nil {
 		t.Errorf("Execute: %v", err)
 	}
 }
@@ -517,7 +517,170 @@ all : main.o
 }
 `
 	b := newBuild(t, src)
-	if err := b.Execute("all", 1); err != nil {
+	if err := b.Execute("all", "", 1); err != nil {
 		t.Errorf("Execute with pattern target: %v", err)
+	}
+}
+
+// --- verb rules ---
+
+func TestResolveVerbExplicit(t *testing.T) {
+	src := `
+all :
+[clean all] :
+`
+	b := newBuild(t, src)
+	n, err := b.ResolveVerb("all", "clean")
+	if err != nil {
+		t.Fatalf("ResolveVerb: %v", err)
+	}
+	if n.target != "all" || n.verb != "clean" {
+		t.Errorf("got target=%q verb=%q", n.target, n.verb)
+	}
+}
+
+func TestResolveVerbInherited(t *testing.T) {
+	b := newBuild(t, `all : dep
+dep :`)
+	n, err := b.ResolveVerb("all", "clean")
+	if err != nil {
+		t.Fatalf("ResolveVerb inherited: %v", err)
+	}
+	if n.rule != nil {
+		t.Error("inherited verb node should have nil rule")
+	}
+}
+
+func TestVerbDepInheritancePropagates(t *testing.T) {
+	src := `
+all : foo bar
+foo :
+bar :
+`
+	b := newBuild(t, src)
+	n, _ := b.ResolveVerb("all", "clean")
+	deps := n.Dependencies()
+	if len(deps) != 2 {
+		t.Fatalf("expected 2 inherited deps, got %d: %v", len(deps), depTargets(deps))
+	}
+	if deps[0].target != "foo" || deps[0].verb != "clean" {
+		t.Errorf("deps[0]: got target=%q verb=%q", deps[0].target, deps[0].verb)
+	}
+	if deps[1].target != "bar" || deps[1].verb != "clean" {
+		t.Errorf("deps[1]: got target=%q verb=%q", deps[1].target, deps[1].verb)
+	}
+}
+
+func TestVerbExplicitDepsOverrideInheritance(t *testing.T) {
+	src := `
+all : foo bar
+foo :
+bar :
+baz :
+[clean all] : baz
+`
+	b := newBuild(t, src)
+	n, _ := b.ResolveVerb("all", "clean")
+	deps := n.Dependencies()
+	if len(deps) != 1 || deps[0].target != "baz" {
+		t.Errorf("expected explicit dep [baz], got %v", depTargets(deps))
+	}
+}
+
+func TestVerbRunWithBody(t *testing.T) {
+	src := `
+all :
+[clean all] : {
+	true
+}
+`
+	b := newBuild(t, src)
+	n, _ := b.ResolveVerb("all", "clean")
+	if err := n.Run(); err != nil {
+		t.Errorf("Run verb with body: %v", err)
+	}
+}
+
+func TestVerbRunNoOp(t *testing.T) {
+	b := newBuild(t, `all :`)
+	n, _ := b.ResolveVerb("all", "clean")
+	if err := n.Run(); err != nil {
+		t.Errorf("Run verb no-op: %v", err)
+	}
+}
+
+func TestVerbRunWithDefBody(t *testing.T) {
+	src := `
+deftype mytype {
+	echo 0
+}
+defbody mytype clean {
+	true
+}
+mytype mytarget :
+`
+	b := newBuild(t, src)
+	n, _ := b.ResolveVerb("mytarget", "clean")
+	if err := n.Run(); err != nil {
+		t.Errorf("Run verb via defbody: %v", err)
+	}
+}
+
+func TestVerbNeedsRunAlwaysTrue(t *testing.T) {
+	b := newBuild(t, `all :`)
+	n, _ := b.ResolveVerb("all", "clean")
+	n.Dependencies()
+	if !n.NeedsRun() {
+		t.Error("verb node NeedsRun should always be true")
+	}
+}
+
+func TestExecuteVerb(t *testing.T) {
+	src := `
+all : dep
+dep :
+[clean all] : [clean dep] {
+	true
+}
+[clean dep] : {
+	true
+}
+`
+	b := newBuild(t, src)
+	if err := b.Execute("all", "clean", 1); err != nil {
+		t.Errorf("Execute verb: %v", err)
+	}
+}
+
+func TestHasTarget(t *testing.T) {
+	b := newBuild(t, `
+all : foo
+foo :
+`)
+	if !b.HasTarget("all") {
+		t.Error("HasTarget(all) should be true")
+	}
+	if !b.HasTarget("foo") {
+		t.Error("HasTarget(foo) should be true")
+	}
+	if b.HasTarget("missing") {
+		t.Error("HasTarget(missing) should be false")
+	}
+}
+
+func TestDefBodyVerbDuplicateError(t *testing.T) {
+	src := `
+deftype mytype {
+	echo 0
+}
+defbody mytype clean { true }
+defbody mytype clean { false }
+`
+	_, err := NewBuild([]byte(src))
+	if err == nil {
+		t.Fatal("expected error for duplicate verb defbody")
+	}
+	if !strings.Contains(err.Error(), "duplicate") {
+		t.Errorf("error should mention duplicate: %v", err)
 	}
 }

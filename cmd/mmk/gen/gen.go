@@ -41,6 +41,12 @@ func RunnerFunc(name string) string { return "__mmk_runner_" + name }
 // DefaultFunc returns the bash function name for a type's default body.
 func DefaultFunc(typeName string) string { return "__mmk_default_" + typeName }
 
+// VerbTargetFunc returns the bash function name for a verb rule on a target.
+func VerbTargetFunc(verb, target string) string { return "__mmk_verb_" + verb + "_target_" + target }
+
+// DefaultVerbFunc returns the bash function name for a type's default verb body.
+func DefaultVerbFunc(typeName, verb string) string { return "__mmk_default_" + verb + "_" + typeName }
+
 // builtinDefaultBodies contains the built-in default body for each built-in type.
 // A user defbody for the same type name overrides these.
 //
@@ -101,8 +107,17 @@ func Generate(w io.Writer, f *parse.File) error {
 				return fmt.Errorf("defbody: %w", err)
 			}
 			body := normalizeBody(d.Body)
-			if _, err := fmt.Fprintf(w, "\n# defbody %s\n%s() {%s}\n", d.Type, DefaultFunc(d.Type), body); err != nil {
-				return err
+			if d.Verb != "" {
+				if err := ValidateName(d.Verb); err != nil {
+					return fmt.Errorf("defbody verb: %w", err)
+				}
+				if _, err := fmt.Fprintf(w, "\n# defbody %s %s\n%s() {%s}\n", d.Type, d.Verb, DefaultVerbFunc(d.Type, d.Verb), body); err != nil {
+					return err
+				}
+			} else {
+				if _, err := fmt.Fprintf(w, "\n# defbody %s\n%s() {%s}\n", d.Type, DefaultFunc(d.Type), body); err != nil {
+					return err
+				}
 			}
 			continue
 		}
@@ -130,15 +145,24 @@ func Generate(w io.Writer, f *parse.File) error {
 			if err := ValidateName(d.Target); err != nil {
 				return fmt.Errorf("target: %w", err)
 			}
-			name = TargetFunc(d.Target)
-			body = d.Body
-			comment = "target: " + d.Target
-			if d.Type != "" {
-				comment += " (type: " + d.Type + ")"
-			}
-			// No explicit body: use the type's default if one exists.
-			if body == "" && d.Type != "" && hasDefault[d.Type] {
-				body = "\n\t" + DefaultFunc(d.Type) + "\n"
+			if d.Verb != "" {
+				if err := ValidateName(d.Verb); err != nil {
+					return fmt.Errorf("verb rule verb: %w", err)
+				}
+				name = VerbTargetFunc(d.Verb, d.Target)
+				body = d.Body
+				comment = "verb " + d.Verb + " for target: " + d.Target
+			} else {
+				name = TargetFunc(d.Target)
+				body = d.Body
+				comment = "target: " + d.Target
+				if d.Type != "" {
+					comment += " (type: " + d.Type + ")"
+				}
+				// No explicit body: use the type's default if one exists.
+				if body == "" && d.Type != "" && hasDefault[d.Type] {
+					body = "\n\t" + DefaultFunc(d.Type) + "\n"
+				}
 			}
 		}
 
@@ -179,18 +203,23 @@ func GenerateRule(w io.Writer, rule *parse.TargetRule) error {
 	return err
 }
 
-// ValidateDuplicates returns an error if any target name appears more than once.
+// ValidateDuplicates returns an error if any (target, verb) pair appears more than once.
 func ValidateDuplicates(f *parse.File) error {
-	seen := make(map[string]bool)
+	type tvKey struct{ target, verb string }
+	seen := make(map[tvKey]bool)
 	for _, d := range f.Directives {
 		r, ok := d.(*parse.TargetRule)
 		if !ok {
 			continue
 		}
-		if seen[r.Target] {
+		key := tvKey{r.Target, r.Verb}
+		if seen[key] {
+			if r.Verb != "" {
+				return fmt.Errorf("duplicate verb rule [%s %s]", r.Verb, r.Target)
+			}
 			return fmt.Errorf("duplicate target %q", r.Target)
 		}
-		seen[r.Target] = true
+		seen[key] = true
 	}
 	return nil
 }

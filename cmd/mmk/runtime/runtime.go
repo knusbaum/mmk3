@@ -33,6 +33,18 @@ var runnerTypes = map[string]bool{
 	"image": true,
 }
 
+// verbNodeKey is the map key for verb-qualified nodes and rules.
+type verbNodeKey struct {
+	target string
+	verb   string
+}
+
+// defVerbBodyKey is the map key for verb-specific defbody declarations.
+type defVerbBodyKey struct {
+	typeName string
+	verb     string
+}
+
 // Build holds the indexed rules and the generated bash script.
 // Create one with NewBuild; call Close when done to remove the temp script
 // and tear down any containers that were started for runner-based targets.
@@ -40,9 +52,12 @@ var runnerTypes = map[string]bool{
 type Build struct {
 	Verbose        bool
 	concretes      map[string]*parse.TargetRule
+	verbConcretes  map[verbNodeKey]*parse.TargetRule
 	patterns       []*patternEntry
 	nodes          map[string]*TargetNode
+	verbNodes      map[verbNodeKey]*TargetNode
 	containerNodes map[string]*TargetNode // image target name → synthetic container node
+	defVerbBodies  map[defVerbBodyKey]bool
 	genPath        string
 	genFile        *os.File
 
@@ -61,8 +76,9 @@ type patternEntry struct {
 //   - Each TargetRule's `on` clause names an existing concrete target whose
 //     type appears in runnerTypes.
 func validateDirectives(f *parse.File) error {
+	type defBodyKey struct{ typ, verb string }
 	deftypes := make(map[string]bool)
-	defbodies := make(map[string]bool)
+	defbodies := make(map[defBodyKey]bool)
 	concretes := make(map[string]*parse.TargetRule)
 	for _, d := range f.Directives {
 		switch d := d.(type) {
@@ -71,19 +87,23 @@ func validateDirectives(f *parse.File) error {
 		case *parse.DefType:
 			deftypes[d.Name] = true
 		case *parse.DefBody:
-			if defbodies[d.Type] {
+			key := defBodyKey{d.Type, d.Verb}
+			if defbodies[key] {
+				if d.Verb != "" {
+					return fmt.Errorf("duplicate defbody for type %q verb %q", d.Type, d.Verb)
+				}
 				return fmt.Errorf("duplicate defbody for type %q", d.Type)
 			}
-			defbodies[d.Type] = true
+			defbodies[key] = true
 		case *parse.TargetRule:
-			if d.Pattern == "" {
+			if d.Pattern == "" && d.Verb == "" {
 				concretes[d.Target] = d
 			}
 		}
 	}
-	for typeName := range defbodies {
-		if !builtinTypes[typeName] && !deftypes[typeName] {
-			return fmt.Errorf("defbody %q: unknown type (built-in types: file, image; define others with deftype)", typeName)
+	for key := range defbodies {
+		if !builtinTypes[key.typ] && !deftypes[key.typ] {
+			return fmt.Errorf("defbody %q: unknown type (built-in types: file, image; define others with deftype)", key.typ)
 		}
 	}
 	for _, d := range f.Directives {
@@ -127,24 +147,32 @@ func NewBuild(src []byte) (*Build, error) {
 
 	b := &Build{
 		concretes:      make(map[string]*parse.TargetRule),
+		verbConcretes:  make(map[verbNodeKey]*parse.TargetRule),
 		nodes:          make(map[string]*TargetNode),
+		verbNodes:      make(map[verbNodeKey]*TargetNode),
 		containerNodes: make(map[string]*TargetNode),
+		defVerbBodies:  make(map[defVerbBodyKey]bool),
 		containers:     make(map[string]string),
 	}
 
 	for _, d := range f.Directives {
-		r, ok := d.(*parse.TargetRule)
-		if !ok {
-			continue
-		}
-		if r.Pattern != "" {
-			re, err := regexp.Compile(`^(?:` + r.Pattern + `)$`)
-			if err != nil {
-				return nil, fmt.Errorf("pattern %q: %w", r.Pattern, err)
+		switch d := d.(type) {
+		case *parse.DefBody:
+			if d.Verb != "" {
+				b.defVerbBodies[defVerbBodyKey{d.Type, d.Verb}] = true
 			}
-			b.patterns = append(b.patterns, &patternEntry{rule: r, re: re})
-		} else {
-			b.concretes[r.Target] = r
+		case *parse.TargetRule:
+			if d.Pattern != "" {
+				re, err := regexp.Compile(`^(?:` + d.Pattern + `)$`)
+				if err != nil {
+					return nil, fmt.Errorf("pattern %q: %w", d.Pattern, err)
+				}
+				b.patterns = append(b.patterns, &patternEntry{rule: d, re: re})
+			} else if d.Verb != "" {
+				b.verbConcretes[verbNodeKey{d.Target, d.Verb}] = d
+			} else {
+				b.concretes[d.Target] = d
+			}
 		}
 	}
 
@@ -194,11 +222,30 @@ func (b *Build) containerNode(imageTarget *TargetNode) *TargetNode {
 	return n
 }
 
-// Execute builds the DAG rooted at target and runs it with the given parallelism.
-// parallelism <= 0 means unlimited.
+// HasTarget reports whether name is a known concrete or pattern-matched target.
+func (b *Build) HasTarget(name string) bool {
+	if _, ok := b.concretes[name]; ok {
+		return true
+	}
+	for _, pe := range b.patterns {
+		if pe.re.MatchString(name) {
+			return true
+		}
+	}
+	return false
+}
+
+// Execute builds the DAG rooted at target (optionally qualified by verb) and
+// runs it with the given parallelism. parallelism <= 0 means unlimited.
 // When b.Verbose is true, each target is logged as it runs or is skipped.
-func (b *Build) Execute(target string, parallelism int) error {
-	root, err := b.Resolve(target)
+func (b *Build) Execute(target, verb string, parallelism int) error {
+	var root *TargetNode
+	var err error
+	if verb == "" {
+		root, err = b.Resolve(target)
+	} else {
+		root, err = b.ResolveVerb(target, verb)
+	}
 	if err != nil {
 		return err
 	}
@@ -209,6 +256,8 @@ func (b *Build) Execute(target string, parallelism int) error {
 		OnRun: func(n *TargetNode) {
 			if n.kind == kindContainer {
 				fmt.Printf("starting container: %s\n", n.containerFor.target)
+			} else if n.verb != "" {
+				fmt.Printf("running: [%s %s]\n", n.verb, n.target)
 			} else {
 				fmt.Printf("running: %s\n", n.target)
 			}
@@ -238,6 +287,38 @@ func (b *Build) Resolve(name string) (*TargetNode, error) {
 	return n, nil
 }
 
+// ResolveVerb returns (creating if necessary) the verb-qualified TargetNode for
+// [verb target]. An explicit verb rule takes precedence; otherwise an inherited
+// node is created as long as the target has a default rule.
+func (b *Build) ResolveVerb(target, verb string) (*TargetNode, error) {
+	key := verbNodeKey{target, verb}
+	if n, ok := b.verbNodes[key]; ok {
+		return n, nil
+	}
+	var rule *parse.TargetRule
+	if r, ok := b.verbConcretes[key]; ok {
+		rule = r
+	}
+	if rule == nil {
+		// Require a default rule to exist so that dep inheritance can propagate.
+		if _, ok := b.concretes[target]; !ok {
+			found := false
+			for _, pe := range b.patterns {
+				if pe.re.MatchString(target) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				return nil, fmt.Errorf("no rule to build [%s %s]", verb, target)
+			}
+		}
+	}
+	n := &TargetNode{build: b, target: target, verb: verb, rule: rule}
+	b.verbNodes[key] = n
+	return n, nil
+}
+
 // findRule returns the rule for name, instantiating a pattern rule if needed.
 func (b *Build) findRule(name string) (*parse.TargetRule, error) {
 	if r, ok := b.concretes[name]; ok {
@@ -256,7 +337,10 @@ func (b *Build) findRule(name string) (*parse.TargetRule, error) {
 			Body:   substituteCaptures(pe.rule.Body, captures),
 		}
 		for _, dep := range pe.rule.Deps {
-			rule.Deps = append(rule.Deps, substituteCaptures(dep, captures))
+			rule.Deps = append(rule.Deps, parse.Dep{
+				Target: substituteCaptures(dep.Target, captures),
+				Verb:   dep.Verb,
+			})
 		}
 		if err := gen.GenerateRule(b.genFile, rule); err != nil {
 			return nil, fmt.Errorf("instantiate pattern for %q: %w", name, err)
@@ -289,10 +373,12 @@ const (
 // TargetNode is a dag.Node[*TargetNode]. Most TargetNodes are kindRule and
 // model a user-declared target. Synthetic nodes (e.g. container startup) use
 // other kinds and dispatch on `kind` inside the Date/NeedsRun/Run methods.
+// When verb is non-empty the node represents a verb rule (e.g. [clean executable]).
 type TargetNode struct {
 	build        *Build
 	target       string
-	rule         *parse.TargetRule // nil when kind != kindRule
+	verb         string            // non-empty for verb nodes
+	rule         *parse.TargetRule // nil when kind != kindRule, or for inherited verb nodes
 	kind         targetKind
 	containerFor *TargetNode // set when kind == kindContainer
 	deps         []*TargetNode
@@ -315,8 +401,18 @@ func (n *TargetNode) Dependencies() []*TargetNode {
 		return n.deps
 	}
 
-	for _, depName := range n.rule.Deps {
-		depNode, err := n.build.Resolve(depName)
+	if n.verb != "" {
+		return n.verbDependencies()
+	}
+
+	for _, dep := range n.rule.Deps {
+		var depNode *TargetNode
+		var err error
+		if dep.Verb != "" {
+			depNode, err = n.build.ResolveVerb(dep.Target, dep.Verb)
+		} else {
+			depNode, err = n.build.Resolve(dep.Target)
+		}
 		if err != nil {
 			n.resolveErr = err
 			return n.deps
@@ -330,6 +426,49 @@ func (n *TargetNode) Dependencies() []*TargetNode {
 			return n.deps
 		}
 		n.deps = append(n.deps, runnerNode, n.build.containerNode(runnerNode))
+	}
+	return n.deps
+}
+
+// verbDependencies resolves deps for a verb node. If the verb rule has explicit
+// deps, those are used. Otherwise deps are inherited from the default rule with
+// the same verb applied to each.
+func (n *TargetNode) verbDependencies() []*TargetNode {
+	if n.rule != nil && len(n.rule.Deps) > 0 {
+		for _, dep := range n.rule.Deps {
+			var depNode *TargetNode
+			var err error
+			if dep.Verb != "" {
+				depNode, err = n.build.ResolveVerb(dep.Target, dep.Verb)
+			} else {
+				depNode, err = n.build.Resolve(dep.Target)
+			}
+			if err != nil {
+				n.resolveErr = err
+				return n.deps
+			}
+			n.deps = append(n.deps, depNode)
+		}
+		return n.deps
+	}
+
+	// Inherit deps from the default rule, applying the same verb to each dep.
+	defaultRule := n.build.concretes[n.target]
+	if defaultRule == nil {
+		// Try to instantiate a pattern rule first.
+		n.build.Resolve(n.target) //nolint — side effect: populates concretes
+		defaultRule = n.build.concretes[n.target]
+	}
+	if defaultRule == nil {
+		return n.deps
+	}
+	for _, dep := range defaultRule.Deps {
+		depNode, err := n.build.ResolveVerb(dep.Target, n.verb)
+		if err != nil {
+			n.resolveErr = err
+			return n.deps
+		}
+		n.deps = append(n.deps, depNode)
 	}
 	return n.deps
 }
@@ -377,7 +516,11 @@ func (n *TargetNode) Date() time.Time {
 // Phony targets (no type) always need to run.
 // Typed targets compare their own Date() against each dependency's Date();
 // if the artifact doesn't exist (zero Date) or any dep is newer, they run.
+// Verb nodes always need to run (they are imperative actions, not artifacts).
 func (n *TargetNode) NeedsRun() bool {
+	if n.verb != "" {
+		return true
+	}
 	if n.kind == kindContainer {
 		// Containers are short-lived (per-build). If we have not started one
 		// yet for this image during this build, we need to.
@@ -461,10 +604,31 @@ func (n *TargetNode) Run() error {
 	if n.kind == kindContainer {
 		return n.startContainer()
 	}
+	if n.verb != "" {
+		return n.runVerb()
+	}
 	if n.rule.Runner != "" {
 		return n.runOn()
 	}
 	return n.runBash(gen.TargetFunc(n.target), true)
+}
+
+// runVerb executes a verb node's action. Priority:
+//  1. Explicit verb rule with a body → call the generated VerbTargetFunc.
+//  2. No explicit body, but defbody for (type, verb) → call DefaultVerbFunc.
+//  3. Otherwise → no-op.
+func (n *TargetNode) runVerb() error {
+	if n.rule != nil && n.rule.Body != "" {
+		return n.runBash(gen.VerbTargetFunc(n.verb, n.target), true)
+	}
+	defaultRule := n.build.concretes[n.target]
+	if defaultRule != nil && defaultRule.Type != "" {
+		key := defVerbBodyKey{defaultRule.Type, n.verb}
+		if n.build.defVerbBodies[key] {
+			return n.runBash(gen.DefaultVerbFunc(defaultRule.Type, n.verb), true)
+		}
+	}
+	return nil
 }
 
 // runOn executes the body inside the environment provided by the runner
@@ -574,14 +738,18 @@ func currentUIDGID() (string, string, error) {
 	return u.Uid, u.Gid, nil
 }
 
-// explicitDepNames returns just the names from rule.Deps — not the resolved
+// explicitDepNames returns just the target names from rule.Deps — not the
 // implicit deps (runner target, container node) that Dependencies() appends.
 // This is what `$deps` should expose to user bodies.
 func (n *TargetNode) explicitDepNames() []string {
 	if n.rule == nil {
 		return nil
 	}
-	return n.rule.Deps
+	names := make([]string, len(n.rule.Deps))
+	for i, dep := range n.rule.Deps {
+		names[i] = dep.Target
+	}
+	return names
 }
 
 // runBash sources generated.sh and runs cmd in a bash subprocess.

@@ -12,15 +12,10 @@ func main() {
 	j := flag.Int("j", 0, "parallelism (0 = unlimited)")
 	v := flag.Bool("v", false, "verbose: log each target as it runs or is skipped")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: mmk [-j N] [-v] [target]\n")
+		fmt.Fprintf(os.Stderr, "usage: mmk [-j N] [-v] [[verb] target]\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
-
-	target := "all"
-	if flag.NArg() > 0 {
-		target = flag.Arg(0)
-	}
 
 	src, err := readMmkfile()
 	if err != nil {
@@ -36,7 +31,27 @@ func main() {
 	defer b.Close()
 	b.Verbose = *v
 
-	if err := b.Execute(target, *j); err != nil {
+	verb := ""
+	target := "all"
+	switch flag.NArg() {
+	case 0:
+		// defaults
+	case 1:
+		arg := flag.Arg(0)
+		if b.HasTarget(arg) {
+			target = arg
+		} else {
+			verb = arg
+		}
+	case 2:
+		verb = flag.Arg(0)
+		target = flag.Arg(1)
+	default:
+		fmt.Fprintf(os.Stderr, "usage: mmk [-j N] [-v] [[verb] target]\n")
+		os.Exit(1)
+	}
+
+	if err := b.Execute(target, verb, *j); err != nil {
 		fmt.Fprintf(os.Stderr, "mmk: %v\n", err)
 		os.Exit(1)
 	}

@@ -460,6 +460,72 @@ file main.o : main.c {
 	asRule(t, f.Directives[1])
 }
 
+// --- verb rules ---
+
+func TestVerbRuleDeclaration(t *testing.T) {
+	f := mustParse(t, `[clean executable] :`)
+	r := asRule(t, f.Directives[0])
+	expect(t, "Verb", r.Verb, "clean")
+	expect(t, "Target", r.Target, "executable")
+	expectDeps(t, r.Deps)
+}
+
+func TestVerbRuleWithBody(t *testing.T) {
+	f := mustParse(t, `[clean executable] : [delete main.o] {
+	rm executable
+}`)
+	r := asRule(t, f.Directives[0])
+	expect(t, "Verb", r.Verb, "clean")
+	expect(t, "Target", r.Target, "executable")
+	if r.Body == "" {
+		t.Fatal("expected non-empty body")
+	}
+	if len(r.Deps) != 1 || r.Deps[0].Target != "main.o" || r.Deps[0].Verb != "delete" {
+		t.Errorf("deps: got %v, want [{main.o delete}]", r.Deps)
+	}
+}
+
+func TestVerbDepInDepList(t *testing.T) {
+	f := mustParse(t, `[install all] : [install foo] bar`)
+	r := asRule(t, f.Directives[0])
+	expect(t, "Verb", r.Verb, "install")
+	expect(t, "Target", r.Target, "all")
+	if len(r.Deps) != 2 {
+		t.Fatalf("expected 2 deps, got %d", len(r.Deps))
+	}
+	if r.Deps[0].Target != "foo" || r.Deps[0].Verb != "install" {
+		t.Errorf("deps[0]: got %+v, want {foo install}", r.Deps[0])
+	}
+	if r.Deps[1].Target != "bar" || r.Deps[1].Verb != "" {
+		t.Errorf("deps[1]: got %+v, want {bar }", r.Deps[1])
+	}
+}
+
+func TestDefBodyWithVerb(t *testing.T) {
+	f := mustParse(t, `defbody file clean {
+	rm "$target"
+}`)
+	requireRules(t, f, 1)
+	db, ok := f.Directives[0].(*DefBody)
+	if !ok {
+		t.Fatalf("expected *DefBody, got %T", f.Directives[0])
+	}
+	expect(t, "Type", db.Type, "file")
+	expect(t, "Verb", db.Verb, "clean")
+	if db.Body == "" {
+		t.Fatal("expected non-empty body")
+	}
+}
+
+func TestDefBodyNoVerbUnchanged(t *testing.T) {
+	f := mustParse(t, `defbody image {
+	docker build -t "$target" .
+}`)
+	db := f.Directives[0].(*DefBody)
+	expect(t, "Type", db.Type, "image")
+	expect(t, "Verb", db.Verb, "")
+}
+
 // --- error cases ---
 
 func TestErrorMissingTarget(t *testing.T) {
@@ -580,15 +646,15 @@ func expect(t *testing.T, field, got, want string) {
 	}
 }
 
-func expectDeps(t *testing.T, got []string, want ...string) {
+func expectDeps(t *testing.T, got []Dep, want ...string) {
 	t.Helper()
 	if len(got) != len(want) {
 		t.Errorf("deps: got %v, want %v", got, want)
 		return
 	}
 	for i := range want {
-		if got[i] != want[i] {
-			t.Errorf("deps[%d]: got %q, want %q", i, got[i], want[i])
+		if got[i].Target != want[i] {
+			t.Errorf("deps[%d].Target: got %q, want %q", i, got[i].Target, want[i])
 		}
 	}
 }
