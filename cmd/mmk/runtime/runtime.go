@@ -222,6 +222,9 @@ func (b *Build) containerNode(imageTarget *TargetNode) *TargetNode {
 	return n
 }
 
+// GenPath returns the path of the generated bash script.
+func (b *Build) GenPath() string { return b.genPath }
+
 // HasTarget reports whether name is a known concrete or pattern-matched target.
 func (b *Build) HasTarget(name string) bool {
 	if _, ok := b.concretes[name]; ok {

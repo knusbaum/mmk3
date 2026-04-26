@@ -11,8 +11,9 @@ import (
 func main() {
 	j := flag.Int("j", 0, "parallelism (0 = unlimited)")
 	v := flag.Bool("v", false, "verbose: log each target as it runs or is skipped")
+	dump := flag.Bool("dump", false, "print generated shell script and exit")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: mmk [-j N] [-v] [[verb] target]\n")
+		fmt.Fprintf(os.Stderr, "usage: mmk [-j N] [-v] [-dump] [[verb] target]\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -30,6 +31,16 @@ func main() {
 	}
 	defer b.Close()
 	b.Verbose = *v
+
+	if *dump {
+		data, err := os.ReadFile(b.GenPath())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "mmk: %v\n", err)
+			os.Exit(1)
+		}
+		os.Stdout.Write(data)
+		return
+	}
 
 	verb := ""
 	target := "all"
