@@ -1,0 +1,22 @@
+all : executable
+
+file buildcontainer/Dockerfile :
+image buildimage:latest : buildcontainer/Dockerfile
+
+file othercontainer/Dockerfile :
+image runimage:latest : othercontainer/Dockerfile
+
+
+file main.c :
+file executable on buildimage:latest : main.c {
+    cc -o $target main.c
+}
+
+run on runimage:latest : executable {
+    ./executable
+}
+
+clean {
+    rm executable
+    docker image rm -f buildimage
+}

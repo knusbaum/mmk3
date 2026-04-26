@@ -1,0 +1,10 @@
+all : run
+
+run : req1 req2 {
+    echo hello
+}
+
+'req([0-9]*)' : req$((target - 1)) {
+    echo ${target}
+}
+
