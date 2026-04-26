@@ -36,8 +36,14 @@ func TargetFunc(name string) string { return "__mmk_target_" + name }
 // TypeFunc returns the bash function name for a deftype.
 func TypeFunc(name string) string { return "__mmk_type_" + name }
 
-// RunnerFunc returns the bash function name for a defrunner.
-func RunnerFunc(name string) string { return "__mmk_runner_" + name }
+// RunnerSetupFunc returns the bash function name for the setup phase of a runner type.
+func RunnerSetupFunc(name string) string { return "__mmk_runner_setup_" + name }
+
+// RunnerRunFunc returns the bash function name for the run phase of a runner type.
+func RunnerRunFunc(name string) string { return "__mmk_runner_run_" + name }
+
+// RunnerCleanupFunc returns the bash function name for the cleanup phase of a runner type.
+func RunnerCleanupFunc(name string) string { return "__mmk_runner_cleanup_" + name }
 
 // DefaultFunc returns the bash function name for a type's default body.
 func DefaultFunc(typeName string) string { return "__mmk_default_" + typeName }
@@ -72,6 +78,61 @@ var BuiltinVerbBodies = map[string]map[string]string{
 	"image": {"clean": "\n\tdocker image inspect \"$target\" >/dev/null 2>&1 || return 0\n\tdocker image rm -f \"$target\"\n"},
 }
 
+// RunnerDefInfo describes which optional phases are defined for a built-in runner type.
+// The run phase is always present for any valid runner type.
+type RunnerDefInfo struct {
+	HasSetup   bool
+	HasCleanup bool
+}
+
+// BuiltinRunnerDefs maps type names that have built-in runner definitions to
+// info about which phases exist. The runtime uses this to know which types are
+// valid runners and whether to call setup/cleanup.
+var BuiltinRunnerDefs = map[string]RunnerDefInfo{
+	"image": {HasSetup: true, HasCleanup: true},
+}
+
+type runnerDefBodies struct {
+	Setup   string
+	Run     string
+	Cleanup string
+}
+
+// builtinRunnerDefs holds the bash bodies for each built-in runner type.
+// These are emitted as __mmk_runner_{setup,run,cleanup}_<type> functions unless
+// the user overrides them with their own defrunner directives.
+var builtinRunnerDefs = map[string]runnerDefBodies{
+	"image": {
+		Setup: `
+	name="mmk-$(printf '%s' "$target" | tr -cs 'a-zA-Z0-9' '-')-$$"
+	docker rm -f "$name" 2>/dev/null || true
+	id=$(docker run -d --rm \
+		--name "$name" \
+		-v "$(pwd):/work" \
+		-v "$MMK_GENFILE:/mmk-generated.sh:ro" \
+		-w /work \
+		"$target" \
+		sleep infinity)
+	printf '%s' "$id"
+`,
+		Run: `
+	[ -t 0 ] && tty_flag=-t || tty_flag=
+	docker exec -i $tty_flag \
+		--user "$(id -u):$(id -g)" \
+		-e "MMK_TARGET=$MMK_TARGET" \
+		-e "MMK_DEPS=$MMK_DEPS" \
+		"$MMK_RUNNER_STATE" \
+		bash -c ". /mmk-generated.sh; target=\"\$MMK_TARGET\"; deps=\"\$MMK_DEPS\"; $MMK_FUNC"
+`,
+		Cleanup: `
+	docker rm -f "$MMK_RUNNER_STATE" 2>/dev/null || true
+`,
+	},
+}
+
+// builtinRunnerOrder lists built-in runner types in a deterministic emit order.
+var builtinRunnerOrder = []string{"image"}
+
 // builtinOrder lists built-in types in a deterministic emit order.
 var builtinOrder = []string{"source", "file", "image"}
 
@@ -81,10 +142,12 @@ func Generate(w io.Writer, f *parse.File) error {
 		return err
 	}
 
-	// Collect user-defined deftypes and defbodies so built-ins can be suppressed.
+	// Collect user-defined deftypes, defbodies, and defrunner phases so built-ins
+	// can be suppressed when the user provides their own definition.
 	userDefType := make(map[string]bool)
 	userDefBody := make(map[string]bool)
 	userDefVerbBody := make(map[string]map[string]bool) // type → verb → true
+	userRunnerPhase := make(map[string]map[string]bool) // type → phase → true
 	for _, d := range f.Directives {
 		switch d := d.(type) {
 		case *parse.DefType:
@@ -98,6 +161,15 @@ func Generate(w io.Writer, f *parse.File) error {
 				}
 				userDefVerbBody[d.Type][d.Verb] = true
 			}
+		case *parse.DefRunner:
+			phase := d.Phase
+			if phase == "" {
+				phase = "run"
+			}
+			if userRunnerPhase[d.Name] == nil {
+				userRunnerPhase[d.Name] = make(map[string]bool)
+			}
+			userRunnerPhase[d.Name][phase] = true
 		}
 	}
 
@@ -132,6 +204,32 @@ func Generate(w io.Writer, f *parse.File) error {
 			}
 			body := verbBodies[verb]
 			if _, err := fmt.Fprintf(w, "\n# built-in defbody %s %s\n%s() {%s}\n", typeName, verb, DefaultVerbFunc(typeName, verb), body); err != nil {
+				return err
+			}
+		}
+	}
+
+	// Emit built-in runner functions (setup, run, cleanup) for types not overridden by the user.
+	for _, typeName := range builtinRunnerOrder {
+		def := builtinRunnerDefs[typeName]
+		phases := userRunnerPhase[typeName]
+		type phaseEmit struct {
+			phase   string
+			fn      string
+			body    string
+			comment string
+		}
+		candidates := []phaseEmit{
+			{"setup", RunnerSetupFunc(typeName), def.Setup, "built-in runner setup: " + typeName},
+			{"run", RunnerRunFunc(typeName), def.Run, "built-in runner run: " + typeName},
+			{"cleanup", RunnerCleanupFunc(typeName), def.Cleanup, "built-in runner cleanup: " + typeName},
+		}
+		for _, c := range candidates {
+			if c.body == "" || phases[c.phase] {
+				continue
+			}
+			body := normalizeBody(c.body)
+			if _, err := fmt.Fprintf(w, "\n# %s\n%s() {%s}\n", c.comment, c.fn, body); err != nil {
 				return err
 			}
 		}
@@ -190,9 +288,20 @@ func Generate(w io.Writer, f *parse.File) error {
 			if err := ValidateName(d.Name); err != nil {
 				return fmt.Errorf("defrunner: %w", err)
 			}
-			name = RunnerFunc(d.Name)
+			phase := d.Phase
+			if phase == "" {
+				phase = "run"
+			}
+			switch phase {
+			case "setup":
+				name = RunnerSetupFunc(d.Name)
+			case "run":
+				name = RunnerRunFunc(d.Name)
+			case "cleanup":
+				name = RunnerCleanupFunc(d.Name)
+			}
 			body = d.Body
-			comment = "defrunner " + d.Name
+			comment = "defrunner " + d.Name + " " + phase
 		case *parse.TargetRule:
 			if d.Pattern != "" {
 				continue // pattern rules are instantiated on demand by the runtime
@@ -295,10 +404,10 @@ func ValidateDuplicates(f *parse.File) error {
 	return nil
 }
 
-// PrintBuiltins writes the built-in type definitions as mmk syntax to w.
+// PrintBuiltins writes the built-in type and runner definitions as mmk syntax to w.
 func PrintBuiltins(w io.Writer) error {
 	fmt.Fprintln(w, "# mmk built-in type definitions")
-	fmt.Fprintln(w, "# Override any of these in your Mmkfile with deftype / defbody.")
+	fmt.Fprintln(w, "# Override any of these in your Mmkfile with deftype / defbody / defrunner.")
 	for _, typeName := range builtinOrder {
 		if body, ok := BuiltinDefTypes[typeName]; ok {
 			if _, err := fmt.Fprintf(w, "\ndeftype %s {%s}\n", typeName, body); err != nil {
@@ -313,6 +422,24 @@ func PrintBuiltins(w io.Writer) error {
 		for _, verb := range sortedKeys(BuiltinVerbBodies[typeName]) {
 			body := BuiltinVerbBodies[typeName][verb]
 			if _, err := fmt.Fprintf(w, "\ndefbody %s %s {%s}\n", typeName, verb, body); err != nil {
+				return err
+			}
+		}
+	}
+	for _, typeName := range builtinRunnerOrder {
+		def := builtinRunnerDefs[typeName]
+		if def.Setup != "" {
+			if _, err := fmt.Fprintf(w, "\ndefrunner %s setup {%s}\n", typeName, def.Setup); err != nil {
+				return err
+			}
+		}
+		if def.Run != "" {
+			if _, err := fmt.Fprintf(w, "\ndefrunner %s {%s}\n", typeName, def.Run); err != nil {
+				return err
+			}
+		}
+		if def.Cleanup != "" {
+			if _, err := fmt.Fprintf(w, "\ndefrunner %s cleanup {%s}\n", typeName, def.Cleanup); err != nil {
 				return err
 			}
 		}

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"os/user"
 	"regexp"
 	"sort"
 	"strconv"
@@ -20,11 +19,11 @@ import (
 	"github.com/knusbaum/mmk3/dag"
 )
 
-// runnerTypes are the type names that can appear after `on`. The dispatch in
-// (*TargetNode).runOn picks the strategy based on the runner target's type.
-// Add new entries here (and a case in runOn) to support more runner kinds.
-var runnerTypes = map[string]bool{
-	"image": true,
+// runnerDefInfo records which optional phases a runner type has defined.
+// The run phase is always assumed present for any type in Build.runnerDefs.
+type runnerDefInfo struct {
+	hasSetup   bool
+	hasCleanup bool
 }
 
 // verbNodeKey is the map key for verb-qualified nodes and rules.
@@ -41,22 +40,23 @@ type defVerbBodyKey struct {
 
 // Build holds the indexed rules and the generated bash script.
 // Create one with NewBuild; call Close when done to remove the temp script
-// and tear down any containers that were started for runner-based targets.
+// and run cleanup for any runners that were started during the build.
 // Set Verbose = true before calling Execute to log each target as it runs or is skipped.
 type Build struct {
-	Verbose        bool
-	concretes      map[string]*parse.TargetRule
-	verbConcretes  map[verbNodeKey]*parse.TargetRule
-	patterns       []*patternEntry
-	nodes          map[string]*TargetNode
-	verbNodes      map[verbNodeKey]*TargetNode
-	containerNodes map[string]*TargetNode // image target name → synthetic container node
-	defVerbBodies  map[defVerbBodyKey]bool
-	genPath        string
-	genFile        *os.File
+	Verbose       bool
+	concretes     map[string]*parse.TargetRule
+	verbConcretes map[verbNodeKey]*parse.TargetRule
+	patterns      []*patternEntry
+	nodes         map[string]*TargetNode
+	verbNodes     map[verbNodeKey]*TargetNode
+	runnerNodes   map[string]*TargetNode // runner target name → synthetic runner init node
+	runnerDefs    map[string]runnerDefInfo
+	defVerbBodies map[defVerbBodyKey]bool
+	genPath       string
+	genFile       *os.File
 
-	containersMu sync.Mutex
-	containers   map[string]string // image target name → running container ID
+	runnerStatesMu sync.Mutex
+	runnerStates   map[string]string // runner target name → state from setup stdout
 }
 
 type patternEntry struct {
@@ -65,19 +65,33 @@ type patternEntry struct {
 }
 
 // validateDirectives checks the AST against runtime constraints:
-//   - defrunner is no longer supported (runner behavior is type-driven, not user-defined).
 //   - Each TargetRule's type is either built-in or has a deftype.
+//   - Each defrunner with a setup or cleanup phase also has a run phase.
 //   - Each TargetRule's `on` clause names an existing concrete target whose
-//     type appears in runnerTypes.
+//     type has a defrunner run definition (built-in or user-defined).
 func validateDirectives(f *parse.File) error {
 	type defBodyKey struct{ typ, verb string }
 	deftypes := make(map[string]bool)
 	defbodies := make(map[defBodyKey]bool)
 	concretes := make(map[string]*parse.TargetRule)
+
+	// Collect user defrunner phases to validate completeness and build valid runner set.
+	type runnerPhases struct{ hasRun, hasSetup, hasCleanup bool }
+	userRunners := make(map[string]runnerPhases)
+
 	for _, d := range f.Directives {
 		switch d := d.(type) {
 		case *parse.DefRunner:
-			return fmt.Errorf("defrunner is no longer supported; the `on` clause names a target and the runner behavior is determined by that target's type")
+			info := userRunners[d.Name]
+			switch d.Phase {
+			case "":
+				info.hasRun = true
+			case "setup":
+				info.hasSetup = true
+			case "cleanup":
+				info.hasCleanup = true
+			}
+			userRunners[d.Name] = info
 		case *parse.DefType:
 			deftypes[d.Name] = true
 		case *parse.DefBody:
@@ -95,11 +109,31 @@ func validateDirectives(f *parse.File) error {
 			}
 		}
 	}
+
+	// A defrunner with setup/cleanup but no run body is always a mistake.
+	for typeName, info := range userRunners {
+		if !info.hasRun && (info.hasSetup || info.hasCleanup) {
+			return fmt.Errorf("defrunner %q has setup or cleanup but no run body (add: defrunner %s { ... })", typeName, typeName)
+		}
+	}
+
 	for key := range defbodies {
 		if gen.BuiltinDefTypes[key.typ] == "" && !deftypes[key.typ] {
 			return fmt.Errorf("defbody %q: unknown type (define with deftype)", key.typ)
 		}
 	}
+
+	// Valid runner types = built-in runner types + user types with a run body.
+	validRunnerTypes := make(map[string]bool)
+	for typeName := range gen.BuiltinRunnerDefs {
+		validRunnerTypes[typeName] = true
+	}
+	for typeName, info := range userRunners {
+		if info.hasRun {
+			validRunnerTypes[typeName] = true
+		}
+	}
+
 	for _, d := range f.Directives {
 		r, ok := d.(*parse.TargetRule)
 		if !ok {
@@ -117,7 +151,7 @@ func validateDirectives(f *parse.File) error {
 			if !ok {
 				return fmt.Errorf("target %q uses unknown runner target %q", name, r.Runner)
 			}
-			if !runnerTypes[runner.Type] {
+			if !validRunnerTypes[runner.Type] {
 				return fmt.Errorf("target %q uses runner %q of type %q, which cannot be used as a runner", name, r.Runner, runner.Type)
 			}
 		}
@@ -140,13 +174,32 @@ func NewBuild(src []byte) (*Build, error) {
 	}
 
 	b := &Build{
-		concretes:      make(map[string]*parse.TargetRule),
-		verbConcretes:  make(map[verbNodeKey]*parse.TargetRule),
-		nodes:          make(map[string]*TargetNode),
-		verbNodes:      make(map[verbNodeKey]*TargetNode),
-		containerNodes: make(map[string]*TargetNode),
-		defVerbBodies:  make(map[defVerbBodyKey]bool),
-		containers:     make(map[string]string),
+		concretes:     make(map[string]*parse.TargetRule),
+		verbConcretes: make(map[verbNodeKey]*parse.TargetRule),
+		nodes:         make(map[string]*TargetNode),
+		verbNodes:     make(map[verbNodeKey]*TargetNode),
+		runnerNodes:   make(map[string]*TargetNode),
+		runnerDefs:    make(map[string]runnerDefInfo),
+		defVerbBodies: make(map[defVerbBodyKey]bool),
+		runnerStates:  make(map[string]string),
+	}
+
+	// Populate runnerDefs from built-in definitions.
+	for typeName, info := range gen.BuiltinRunnerDefs {
+		b.runnerDefs[typeName] = runnerDefInfo{hasSetup: info.HasSetup, hasCleanup: info.HasCleanup}
+	}
+	// Layer user defrunner phases on top.
+	for _, d := range f.Directives {
+		if dr, ok := d.(*parse.DefRunner); ok {
+			info := b.runnerDefs[dr.Name]
+			switch dr.Phase {
+			case "setup":
+				info.hasSetup = true
+			case "cleanup":
+				info.hasCleanup = true
+			}
+			b.runnerDefs[dr.Name] = info
+		}
 	}
 
 	// Pre-populate with built-in verb bodies; user defbody entries below may override.
@@ -193,33 +246,50 @@ func NewBuild(src []byte) (*Build, error) {
 	return b, nil
 }
 
-// Close removes the temporary generated script and tears down any containers
-// that were started during the build.
+// Close runs cleanup for any runners that were started and removes the
+// temporary generated script.
 func (b *Build) Close() {
-	b.containersMu.Lock()
-	for _, id := range b.containers {
-		exec.Command("docker", "rm", "-f", id).Run()
+	b.runnerStatesMu.Lock()
+	states := b.runnerStates
+	b.runnerStates = nil
+	b.runnerStatesMu.Unlock()
+
+	for runnerTarget, state := range states {
+		rule := b.concretes[runnerTarget]
+		if rule == nil {
+			continue
+		}
+		info := b.runnerDefs[rule.Type]
+		if !info.hasCleanup {
+			continue
+		}
+		script := `. "$MMK_GENFILE"; ` + gen.RunnerCleanupFunc(rule.Type)
+		cmd := exec.Command("bash", "-c", script)
+		cmd.Env = append(os.Environ(),
+			"MMK_GENFILE="+b.genPath,
+			"target="+runnerTarget,
+			"MMK_RUNNER_STATE="+state,
+		)
+		cmd.Run() //nolint — best-effort cleanup
 	}
-	b.containers = nil
-	b.containersMu.Unlock()
 	b.genFile.Close()
 	os.Remove(b.genPath)
 }
 
-// containerNode returns (creating once) the synthetic node that starts the
-// container for the given image target. Multiple targets running `on
-// imageTarget` share a single container node so the container starts once.
-func (b *Build) containerNode(imageTarget *TargetNode) *TargetNode {
-	if n, ok := b.containerNodes[imageTarget.target]; ok {
+// runnerNode returns (creating once) the synthetic node that runs setup for
+// the given runner target. Multiple targets with `on runnerTarget` share a
+// single runner node so setup executes only once.
+func (b *Build) runnerNode(runnerTarget *TargetNode) *TargetNode {
+	if n, ok := b.runnerNodes[runnerTarget.target]; ok {
 		return n
 	}
 	n := &TargetNode{
-		build:        b,
-		target:       "__container__" + imageTarget.target,
-		kind:         kindContainer,
-		containerFor: imageTarget,
+		build:     b,
+		target:    "__runner__" + runnerTarget.target,
+		kind:      kindRunner,
+		runnerFor: runnerTarget,
 	}
-	b.containerNodes[imageTarget.target] = n
+	b.runnerNodes[runnerTarget.target] = n
 	return n
 }
 
@@ -258,8 +328,8 @@ func (b *Build) Execute(target, verb string, parallelism int) error {
 	}
 	hooks := dag.Hooks[*TargetNode]{
 		OnRun: func(n *TargetNode) {
-			if n.kind == kindContainer {
-				fmt.Printf("starting container: %s\n", n.containerFor.target)
+			if n.kind == kindRunner {
+				fmt.Printf("starting runner: %s\n", n.runnerFor.target)
 			} else if n.verb != "" {
 				fmt.Printf("running: [%s %s]\n", n.verb, n.target)
 			} else {
@@ -267,8 +337,8 @@ func (b *Build) Execute(target, verb string, parallelism int) error {
 			}
 		},
 		OnSkip: func(n *TargetNode) {
-			if n.kind == kindContainer {
-				return // container dedup is an internal detail, not user-visible
+			if n.kind == kindRunner {
+				return // runner setup dedup is an internal detail, not user-visible
 			}
 			fmt.Printf("skipping: %s (up to date)\n", n.target)
 		},
@@ -415,43 +485,42 @@ func substituteCaptures(s string, captures []string) string {
 }
 
 // targetKind distinguishes a normal user-declared target from internal
-// synthetic nodes the runtime adds to the DAG (currently just container
-// startup nodes for runner-based execution).
+// synthetic nodes the runtime adds to the DAG (runner setup nodes).
 type targetKind int
 
 const (
-	kindRule      targetKind = iota // backed by a parse.TargetRule
-	kindContainer                   // synthetic: starts a container for an image target
+	kindRule   targetKind = iota // backed by a parse.TargetRule
+	kindRunner                   // synthetic: runs the setup phase for a runner target
 )
 
 // TargetNode is a dag.Node[*TargetNode]. Most TargetNodes are kindRule and
-// model a user-declared target. Synthetic nodes (e.g. container startup) use
-// other kinds and dispatch on `kind` inside the Date/NeedsRun/Run methods.
+// model a user-declared target. Synthetic nodes (runner setup) use kindRunner
+// and dispatch on `kind` inside the Date/NeedsRun/Run methods.
 // When verb is non-empty the node represents a verb rule (e.g. [clean executable]).
 type TargetNode struct {
-	build        *Build
-	target       string
-	verb         string            // non-empty for verb nodes
-	rule         *parse.TargetRule // nil when kind != kindRule, or for inherited verb nodes
-	kind         targetKind
-	containerFor *TargetNode // set when kind == kindContainer
-	deps         []*TargetNode
-	depsBuilt    bool
-	resolveErr   error
+	build     *Build
+	target    string
+	verb      string            // non-empty for verb nodes
+	rule      *parse.TargetRule // nil when kind != kindRule, or for inherited verb nodes
+	kind      targetKind
+	runnerFor *TargetNode // set when kind == kindRunner
+	deps      []*TargetNode
+	depsBuilt bool
+	resolveErr error
 }
 
 // Dependencies resolves each named dep to a TargetNode, instantiating pattern
 // rules as needed. Targets with `on R` get two implicit deps appended: the
-// runner target R itself (for freshness) and the synthetic container node for
-// R (for setup ordering). Any resolution error is stored and returned by Run.
+// runner target R itself (for freshness) and the synthetic runner node for R
+// (for setup ordering). Any resolution error is stored and returned by Run.
 func (n *TargetNode) Dependencies() []*TargetNode {
 	if n.depsBuilt {
 		return n.deps
 	}
 	n.depsBuilt = true
 
-	if n.kind == kindContainer {
-		n.deps = []*TargetNode{n.containerFor}
+	if n.kind == kindRunner {
+		n.deps = []*TargetNode{n.runnerFor}
 		return n.deps
 	}
 
@@ -485,7 +554,7 @@ func (n *TargetNode) Dependencies() []*TargetNode {
 			n.resolveErr = err
 			return n.deps
 		}
-		n.deps = append(n.deps, runnerNode, n.build.containerNode(runnerNode))
+		n.deps = append(n.deps, runnerNode, n.build.runnerNode(runnerNode))
 	}
 	return n.deps
 }
@@ -521,7 +590,7 @@ func (n *TargetNode) verbDependencies() []*TargetNode {
 				n.resolveErr = err
 				return n.deps
 			}
-			n.deps = append(n.deps, runnerNode, n.build.containerNode(runnerNode))
+			n.deps = append(n.deps, runnerNode, n.build.runnerNode(runnerNode))
 		}
 		return n.deps
 	}
@@ -559,7 +628,7 @@ func (n *TargetNode) verbDependencies() []*TargetNode {
 			n.resolveErr = err
 			return n.deps
 		}
-		n.deps = append(n.deps, runnerNode, n.build.containerNode(runnerNode))
+		n.deps = append(n.deps, runnerNode, n.build.runnerNode(runnerNode))
 	} else if defaultRule.Runner != "" {
 		runnerNode, err := n.build.ResolveVerb(defaultRule.Runner, n.verb)
 		if err != nil {
@@ -580,10 +649,9 @@ func (n *TargetNode) verbDependencies() []*TargetNode {
 //   - user-defined (deftype): runs __mmk_type_<name>, parses stdout as a
 //     timestamp (epoch seconds or RFC3339); non-zero exit returns zero time.
 func (n *TargetNode) Date() time.Time {
-	if n.kind == kindContainer {
-		// Container nodes are pure setup. Returning the zero time means they
-		// never look "newer" than artifacts that depend on them, so a fresh
-		// container start does not force downstream rebuilds.
+	if n.kind == kindRunner {
+		// Runner nodes are pure setup. Returning zero time means they never
+		// look "newer" than artifacts that depend on them.
 		return time.Time{}
 	}
 	switch n.rule.Type {
@@ -607,12 +675,11 @@ func (n *TargetNode) NeedsRun() bool {
 	if n.verb != "" {
 		return true
 	}
-	if n.kind == kindContainer {
-		// Containers are short-lived (per-build). If we have not started one
-		// yet for this image during this build, we need to.
-		n.build.containersMu.Lock()
-		_, started := n.build.containers[n.containerFor.target]
-		n.build.containersMu.Unlock()
+	if n.kind == kindRunner {
+		// Runner nodes run setup at most once per build per runner target.
+		n.build.runnerStatesMu.Lock()
+		_, started := n.build.runnerStates[n.runnerFor.target]
+		n.build.runnerStatesMu.Unlock()
 		return !started
 	}
 	if n.rule.Type == "" {
@@ -694,15 +761,15 @@ func (n *TargetNode) bodyFuncName() (string, bool) {
 	return "", false
 }
 
-// Run executes the target's body. For kindContainer it starts the container
-// for its image. If the rule has an `on` runner, the body is exec'd into
-// the running container. Otherwise it runs the body in a local bash subprocess.
+// Run executes the target's body. For kindRunner it runs the setup phase of
+// the runner type. If the rule has an `on` runner, the body is dispatched
+// through the runner's run function. Otherwise it runs the body locally.
 func (n *TargetNode) Run() error {
 	if n.resolveErr != nil {
 		return n.resolveErr
 	}
-	if n.kind == kindContainer {
-		return n.startContainer()
+	if n.kind == kindRunner {
+		return n.runnerSetup()
 	}
 	funcName, ok := n.bodyFuncName()
 	if !ok {
@@ -713,120 +780,67 @@ func (n *TargetNode) Run() error {
 		runner = n.rule.Runner
 	}
 	if runner != "" {
-		return n.runOn(funcName)
+		return n.runWithRunner(funcName)
 	}
 	return n.runBash(funcName, true)
 }
 
-// runOn executes funcName inside the environment provided by the runner
-// target. The strategy is selected by the runner target's type — currently
-// only "image" is supported. Add a case here to wire up new runner kinds.
-func (n *TargetNode) runOn(funcName string) error {
+// runWithRunner executes funcName through the runner type's run bash function.
+// The runner target's state (from setup) and the task context are passed as
+// environment variables.
+func (n *TargetNode) runWithRunner(funcName string) error {
 	runnerNode, err := n.build.Resolve(n.rule.Runner)
 	if err != nil {
 		return err
 	}
-	switch runnerNode.rule.Type {
-	case "image":
-		return n.runInDockerContainer(runnerNode.target, funcName)
-	default:
-		return fmt.Errorf("type %q is not a valid runner", runnerNode.rule.Type)
-	}
+	runnerType := runnerNode.rule.Type
+
+	n.build.runnerStatesMu.Lock()
+	state := n.build.runnerStates[runnerNode.target]
+	n.build.runnerStatesMu.Unlock()
+
+	script := `. "$MMK_GENFILE"; ` + gen.RunnerRunFunc(runnerType)
+	cmd := exec.Command("bash", "-c", script)
+	cmd.Env = append(os.Environ(),
+		"MMK_GENFILE="+n.build.genPath,
+		"target="+runnerNode.target,
+		"deps="+strings.Join(runnerNode.explicitDepNames(), " "),
+		"MMK_RUNNER_STATE="+state,
+		"MMK_FUNC="+funcName,
+		"MMK_TARGET="+n.target,
+		"MMK_DEPS="+strings.Join(n.explicitDepNames(), " "),
+	)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
-// runInDockerContainer executes funcName via `docker exec` against the
-// long-running container that the corresponding container node started for
-// this build. The genfile is sourced from inside the container at the path
-// the container node bind-mounted it to.
-func (n *TargetNode) runInDockerContainer(image, funcName string) error {
-	n.build.containersMu.Lock()
-	containerID, ok := n.build.containers[image]
-	n.build.containersMu.Unlock()
-	if !ok {
-		return fmt.Errorf("container for image %q is not running", image)
-	}
-	uid, gid, err := currentUIDGID()
-	if err != nil {
-		return err
-	}
-	inner := `. ` + containerGenfilePath + `; target="$MMK_TARGET"; deps="$MMK_DEPS"; ` + funcName
-	args := []string{"exec", "-i",
-		"--user", uid + ":" + gid,
-		"-e", "MMK_TARGET=" + n.target,
-		"-e", "MMK_DEPS=" + strings.Join(n.explicitDepNames(), " "),
-	}
-	if isTTY() {
-		args = append(args, "-t")
-	}
-	args = append(args, containerID, "bash", "-c", inner)
-	c := exec.Command("docker", args...)
-	c.Stdin = os.Stdin
-	c.Stdout = os.Stdout
-	c.Stderr = os.Stderr
-	return c.Run()
-}
+// runnerSetup runs the setup phase (if any) for the runner type associated
+// with this kindRunner node. The setup function's stdout is captured and stored
+// as the runner state, which is passed to subsequent run and cleanup calls.
+func (n *TargetNode) runnerSetup() error {
+	runnerNode := n.runnerFor
+	runnerType := runnerNode.rule.Type
 
-// containerGenfilePath is where startContainer bind-mounts the host genfile
-// inside the container. Kept simple and fixed; users do not see this path.
-const containerGenfilePath = "/mmk-generated.sh"
-
-// startContainer launches the long-running container for this node's image
-// target and registers the container ID with the Build for cleanup. The
-// container does nothing on its own (`sleep infinity`); subsequent tasks
-// docker exec into it.
-func (n *TargetNode) startContainer() error {
-	image := n.containerFor.target
-	pwd, err := os.Getwd()
-	if err != nil {
-		return err
+	info := n.build.runnerDefs[runnerType]
+	if !info.hasSetup {
+		// No setup phase: record empty state so NeedsRun returns false next time.
+		n.build.runnerStatesMu.Lock()
+		n.build.runnerStates[runnerNode.target] = ""
+		n.build.runnerStatesMu.Unlock()
+		return nil
 	}
-	name := fmt.Sprintf("mmk-%s-%d", sanitizeContainerName(image), os.Getpid())
-	// Best-effort: clean up any leftover container with the same name.
-	exec.Command("docker", "rm", "-f", name).Run()
 
-	out, err := exec.Command("docker", "run", "-d", "--rm",
-		"--name", name,
-		"-v", pwd+":/work",
-		"-v", n.build.genPath+":"+containerGenfilePath+":ro",
-		"-w", "/work",
-		image,
-		"sleep", "infinity",
-	).Output()
+	out, err := runnerNode.runBashOutput(gen.RunnerSetupFunc(runnerType))
 	if err != nil {
-		return fmt.Errorf("start container for image %q: %w", image, err)
+		return fmt.Errorf("runner setup for %q: %w", runnerNode.target, err)
 	}
-	containerID := strings.TrimSpace(string(out))
-	n.build.containersMu.Lock()
-	n.build.containers[image] = containerID
-	n.build.containersMu.Unlock()
+
+	n.build.runnerStatesMu.Lock()
+	n.build.runnerStates[runnerNode.target] = strings.TrimSpace(out)
+	n.build.runnerStatesMu.Unlock()
 	return nil
-}
-
-// sanitizeContainerName makes an arbitrary string safe to use in a docker
-// container name (which must match [a-zA-Z0-9][a-zA-Z0-9_.-]+).
-func sanitizeContainerName(s string) string {
-	var sb strings.Builder
-	for i, r := range s {
-		safe := (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
-			(r >= '0' && r <= '9') || r == '_' || r == '.' || r == '-'
-		if i == 0 && !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9')) {
-			sb.WriteByte('x')
-		}
-		if safe {
-			sb.WriteRune(r)
-		} else {
-			sb.WriteByte('-')
-		}
-	}
-	return sb.String()
-}
-
-func currentUIDGID() (string, string, error) {
-	u, err := user.Current()
-	if err != nil {
-		return "", "", err
-	}
-	return u.Uid, u.Gid, nil
 }
 
 // explicitDepNames returns just the target names from rule.Deps — not the
@@ -948,7 +962,3 @@ func (b *Build) Verbs() []string {
 	return verbs
 }
 
-func isTTY() bool {
-	fi, err := os.Stdin.Stat()
-	return err == nil && fi.Mode()&os.ModeCharDevice != 0
-}

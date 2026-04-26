@@ -177,6 +177,28 @@ func TestDefRunner(t *testing.T) {
 		t.Fatalf("expected *DefRunner, got %T", f.Directives[0])
 	}
 	expect(t, "Name", dr.Name, "ubuntu")
+	expect(t, "Phase", dr.Phase, "")
+}
+
+func TestDefRunnerSetup(t *testing.T) {
+	f := mustParse(t, `defrunner ubuntu setup { echo setup }`)
+	requireRules(t, f, 1)
+	dr, ok := f.Directives[0].(*DefRunner)
+	if !ok {
+		t.Fatalf("expected *DefRunner, got %T", f.Directives[0])
+	}
+	expect(t, "Name", dr.Name, "ubuntu")
+	expect(t, "Phase", dr.Phase, "setup")
+}
+
+func TestDefRunnerCleanup(t *testing.T) {
+	f := mustParse(t, `defrunner ubuntu cleanup { echo cleanup }`)
+	dr := f.Directives[0].(*DefRunner)
+	expect(t, "Phase", dr.Phase, "cleanup")
+}
+
+func TestDefRunnerUnknownPhaseError(t *testing.T) {
+	expectError(t, `defrunner ubuntu badphase { echo hi }`, "unknown phase")
 }
 
 func TestQuotedTargetName(t *testing.T) {

@@ -89,8 +89,24 @@ func TestDefRunner(t *testing.T) {
 	out := generate(t, `defrunner ubuntu {
 	docker run --rm ubuntu:latest "$@"
 }`)
-	assertContains(t, out, "__mmk_runner_ubuntu()")
-	assertContains(t, out, "# defrunner ubuntu")
+	assertContains(t, out, "__mmk_runner_run_ubuntu()")
+	assertContains(t, out, "# defrunner ubuntu run")
+	bashValid(t, out)
+}
+
+func TestDefRunnerSetup(t *testing.T) {
+	out := generate(t, `defrunner ubuntu setup { echo setup }`)
+	assertContains(t, out, "__mmk_runner_setup_ubuntu()")
+	assertContains(t, out, "# defrunner ubuntu setup")
+	bashValid(t, out)
+}
+
+func TestBuiltinImageRunnerFunctions(t *testing.T) {
+	// Any mmkfile that uses image type should get the built-in image runner functions.
+	out := generate(t, `image buildimage:latest : Dockerfile`)
+	assertContains(t, out, "__mmk_runner_setup_image()")
+	assertContains(t, out, "__mmk_runner_run_image()")
+	assertContains(t, out, "__mmk_runner_cleanup_image()")
 	bashValid(t, out)
 }
 
@@ -115,7 +131,7 @@ all : main.o
 `
 	out := generate(t, src)
 	assertContains(t, out, "__mmk_type_file()")
-	assertContains(t, out, "__mmk_runner_ubuntu()")
+	assertContains(t, out, "__mmk_runner_run_ubuntu()")
 	assertContains(t, out, "__mmk_target_main.o()")
 	assertContains(t, out, "__mmk_target_all()")
 	bashValid(t, out)

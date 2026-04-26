@@ -16,6 +16,33 @@ defbody remote_image clean {
 	docker image rm -f "$target"
 }
 
+defrunner remote_image setup {
+	name="mmk-$(printf '%s' "$target" | tr -cs 'a-zA-Z0-9' '-')-$$"
+	docker rm -f "$name" 2>/dev/null || true
+	id=$(docker run -d --rm \
+		--name "$name" \
+		-v "$(pwd):/work" \
+		-v "$MMK_GENFILE:/mmk-generated.sh:ro" \
+		-w /work \
+		"$target" \
+		sleep infinity)
+	printf '%s' "$id"
+}
+
+defrunner remote_image {
+	[ -t 0 ] && tty_flag=-t || tty_flag=
+	docker exec -i $tty_flag \
+		--user "$(id -u):$(id -g)" \
+		-e "MMK_TARGET=$MMK_TARGET" \
+		-e "MMK_DEPS=$MMK_DEPS" \
+		"$MMK_RUNNER_STATE" \
+		bash -c ". /mmk-generated.sh; target=\"\$MMK_TARGET\"; deps=\"\$MMK_DEPS\"; $MMK_FUNC"
+}
+
+defrunner remote_image cleanup {
+	docker rm -f "$MMK_RUNNER_STATE" 2>/dev/null || true
+}
+
 remote_image ubuntu:latest :
 
 file '(.*)\.o' : $1.c {

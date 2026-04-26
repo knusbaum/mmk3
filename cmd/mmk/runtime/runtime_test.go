@@ -494,13 +494,21 @@ func TestDefBodyUnknownTypeError(t *testing.T) {
 	}
 }
 
-func TestErrorOnDefrunner(t *testing.T) {
-	_, err := NewBuild([]byte(`defrunner myrunner { "$@" }`))
-	if err == nil {
-		t.Fatal("expected error for defrunner")
+func TestDefrunnerIsAccepted(t *testing.T) {
+	// A defrunner with a run body should be valid on its own.
+	_, err := NewBuild([]byte(`defrunner myrunner { echo run }`))
+	if err != nil {
+		t.Fatalf("unexpected error for valid defrunner: %v", err)
 	}
-	if !strings.Contains(err.Error(), "defrunner") {
-		t.Errorf("error should mention defrunner: %v", err)
+}
+
+func TestDefrunnerSetupWithoutRunErrors(t *testing.T) {
+	_, err := NewBuild([]byte(`defrunner myrunner setup { echo setup }`))
+	if err == nil {
+		t.Fatal("expected error for defrunner with setup but no run body")
+	}
+	if !strings.Contains(err.Error(), "myrunner") {
+		t.Errorf("error should mention runner name: %v", err)
 	}
 }
 
@@ -548,12 +556,12 @@ explicit_dep :
 	if deps[1].target != "buildimage" {
 		t.Errorf("dep[1] target: got %q, want %q", deps[1].target, "buildimage")
 	}
-	if deps[2].kind != kindContainer || deps[2].containerFor != deps[1] {
-		t.Errorf("dep[2] should be container node for buildimage, got %+v", deps[2])
+	if deps[2].kind != kindRunner || deps[2].runnerFor != deps[1] {
+		t.Errorf("dep[2] should be runner node for buildimage, got %+v", deps[2])
 	}
 }
 
-func TestContainerNodeDedup(t *testing.T) {
+func TestRunnerNodeDedup(t *testing.T) {
 	src := `
 image buildimage : {
 	true
@@ -567,13 +575,13 @@ all : a b
 	bb, _ := b.Resolve("b")
 	aDeps := a.Dependencies()
 	bDeps := bb.Dependencies()
-	// last dep is the container node in both cases
+	// last dep is the runner node in both cases
 	if aDeps[len(aDeps)-1] != bDeps[len(bDeps)-1] {
-		t.Error("container node should be shared between a and b")
+		t.Error("runner node should be shared between a and b")
 	}
 }
 
-func TestContainerNodeOnlyDepIsImage(t *testing.T) {
+func TestRunnerNodeOnlyDepIsRunner(t *testing.T) {
 	src := `
 image buildimage : {
 	true
@@ -583,16 +591,16 @@ file a on buildimage :
 	b := newBuild(t, src)
 	a, _ := b.Resolve("a")
 	a.Dependencies()
-	cn := b.containerNodes["buildimage"]
-	if cn == nil {
-		t.Fatal("container node was not created")
+	rn := b.runnerNodes["buildimage"]
+	if rn == nil {
+		t.Fatal("runner node was not created")
 	}
-	cnDeps := cn.Dependencies()
-	if len(cnDeps) != 1 || cnDeps[0].target != "buildimage" {
-		t.Errorf("container node deps: got %v, want [buildimage]", depTargets(cnDeps))
+	rnDeps := rn.Dependencies()
+	if len(rnDeps) != 1 || rnDeps[0].target != "buildimage" {
+		t.Errorf("runner node deps: got %v, want [buildimage]", depTargets(rnDeps))
 	}
-	if !cn.Date().IsZero() {
-		t.Errorf("container node Date() should be zero, got %v", cn.Date())
+	if !rn.Date().IsZero() {
+		t.Errorf("runner node Date() should be zero, got %v", rn.Date())
 	}
 }
 
@@ -847,20 +855,20 @@ image myimage : {
 		t.Errorf("instantiated rule Runner: got %q, want %q", n.rule.Runner, "myimage")
 	}
 	deps := n.Dependencies()
-	var foundRunner, foundContainer bool
+	var foundRunner, foundRunnerNode bool
 	for _, dep := range deps {
 		if dep.target == "myimage" && dep.kind == kindRule {
 			foundRunner = true
 		}
-		if dep.kind == kindContainer && dep.containerFor != nil && dep.containerFor.target == "myimage" {
-			foundContainer = true
+		if dep.kind == kindRunner && dep.runnerFor != nil && dep.runnerFor.target == "myimage" {
+			foundRunnerNode = true
 		}
 	}
 	if !foundRunner {
 		t.Errorf("expected myimage runner in deps, got %v", depTargets(deps))
 	}
-	if !foundContainer {
-		t.Errorf("expected container node for myimage in deps, got %v", depTargets(deps))
+	if !foundRunnerNode {
+		t.Errorf("expected runner node for myimage in deps, got %v", depTargets(deps))
 	}
 }
 

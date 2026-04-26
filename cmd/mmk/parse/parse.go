@@ -5,7 +5,7 @@
 //	file       := (directive | newline | comment)*
 //	directive  := deftype | defrunner | target_rule
 //	deftype    := 'deftype' name body
-//	defrunner  := 'defrunner' name body
+//	defrunner  := 'defrunner' name ('setup' | 'cleanup')? body
 //	target_rule:= type? (target|pattern) ('on' runner)? (':' dep*)? body?
 //	body       := '{' ... '}' (balanced braces, arbitrary content)
 //	name       := word | string
@@ -45,11 +45,16 @@ type DefType struct {
 	Body string
 }
 
-// DefRunner defines the execution wrapper for targets with 'on <name>'.
-// Body is raw bash; $@ expands to the actual target invocation.
+// DefRunner defines one phase of a runner type's execution.
+// Phase is "", "setup", or "cleanup". Empty phase defines the mandatory run
+// body; "setup" runs once before any targets use this runner; "cleanup" runs
+// once after the mmk execution finishes. $target, $deps, and $MMK_GENFILE are
+// available in all phases; the run phase additionally receives $MMK_RUNNER_STATE,
+// $MMK_FUNC, $MMK_TARGET, and $MMK_DEPS.
 type DefRunner struct {
-	Name string
-	Body string
+	Name  string
+	Phase string // "", "setup", or "cleanup"
+	Body  string
 }
 
 // Dep is a single dependency in a target rule.
@@ -573,9 +578,7 @@ func (p *parser) parseDirective() (Directive, error) {
 			return &DefType{Name: name, Body: body}
 		})
 	case "defrunner":
-		return p.parseDefBlock(word, func(name, body string) Directive {
-			return &DefRunner{Name: name, Body: body}
-		})
+		return p.parseDefRunner()
 	case "defbody":
 		return p.parseDefBody()
 	default:
@@ -632,6 +635,41 @@ func (p *parser) parseDefBody() (Directive, error) {
 		return nil, err
 	}
 	return &DefBody{Type: typeName, Verb: verb, Body: body}, nil
+}
+
+// parseDefRunner handles 'defrunner name [setup|cleanup]? { body }' directives.
+// An optional phase word ("setup" or "cleanup") may appear on the same line as
+// the name, before the opening brace. Omitting the phase defines the run body.
+func (p *parser) parseDefRunner() (Directive, error) {
+	p.s.readWord() // consume "defrunner"
+	name, err := p.parseName()
+	if err != nil {
+		return nil, fmt.Errorf("defrunner: %w", err)
+	}
+	p.s.skipHorizontalSpace()
+	var phase string
+	if b := p.s.peek(); b != 0 && b != '\n' && b != '{' && b != '#' {
+		if isWordByte(b) || b == '"' {
+			phase, err = p.parseName()
+			if err != nil {
+				return nil, fmt.Errorf("defrunner phase: %w", err)
+			}
+		}
+	}
+	if phase != "" && phase != "setup" && phase != "cleanup" {
+		return nil, fmt.Errorf("line %d: defrunner %s: unknown phase %q (want \"setup\" or \"cleanup\")", p.s.line, name, phase)
+	}
+	p.skipWhitespaceAndComments()
+	if p.s.peek() != '{' {
+		return nil, fmt.Errorf("line %d: expected '{' after defrunner %s", p.s.line, name)
+	}
+	openedAt := p.s.line
+	p.s.advance()
+	body, err := p.s.readBody(openedAt)
+	if err != nil {
+		return nil, err
+	}
+	return &DefRunner{Name: name, Phase: phase, Body: body}, nil
 }
 
 func (p *parser) parseTargetRule() (*TargetRule, error) {
