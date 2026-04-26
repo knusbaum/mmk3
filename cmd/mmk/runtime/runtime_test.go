@@ -69,14 +69,17 @@ func TestResolveSameNodeReturned(t *testing.T) {
 	}
 }
 
-func TestResolveUnknownTarget(t *testing.T) {
+func TestResolveUnknownInfersFileType(t *testing.T) {
 	b := newBuild(t, `all :`)
-	_, err := b.Resolve("missing")
-	if err == nil {
-		t.Fatal("expected error for unknown target")
+	n, err := b.Resolve("somefile.c")
+	if err != nil {
+		t.Fatalf("Resolve: expected inferred file node, got error: %v", err)
 	}
-	if !strings.Contains(err.Error(), "missing") {
-		t.Errorf("error should mention the target name: %v", err)
+	if n.rule.Type != "file" {
+		t.Errorf("inferred type: got %q, want \"file\"", n.rule.Type)
+	}
+	if n.rule.Body != "" {
+		t.Error("inferred file should have no body")
 	}
 }
 
@@ -98,15 +101,19 @@ bar :
 	}
 }
 
-func TestDependenciesUnknownPropagatesOnRun(t *testing.T) {
-	b := newBuild(t, `all : missing`)
+func TestMissingFileDepFailsOnRun(t *testing.T) {
+	b := newBuild(t, `all : nosuchfile.c`)
 	all, _ := b.Resolve("all")
-	all.Dependencies()
-	if all.resolveErr == nil {
-		t.Fatal("expected resolveErr to be set after failed dep resolution")
+	deps := all.Dependencies()
+	if len(deps) != 1 {
+		t.Fatalf("expected 1 inferred dep, got %d", len(deps))
 	}
-	if err := all.Run(); err == nil {
-		t.Fatal("expected Run to return the resolution error")
+	err := deps[0].Run()
+	if err == nil {
+		t.Fatal("expected Run to fail for missing inferred file")
+	}
+	if !strings.Contains(err.Error(), "nosuchfile.c") {
+		t.Errorf("error should mention the file name: %v", err)
 	}
 }
 
@@ -172,11 +179,14 @@ special.o :
 	}
 }
 
-func TestPatternNoMatch(t *testing.T) {
+func TestPatternNoMatchInfersFile(t *testing.T) {
 	b := newBuild(t, `'(.*)\.o' : $1.c`)
-	_, err := b.Resolve("main.c")
-	if err == nil {
-		t.Fatal("expected error for name that doesn't match pattern")
+	n, err := b.Resolve("main.c")
+	if err != nil {
+		t.Fatalf("Resolve: expected inferred file node, got error: %v", err)
+	}
+	if n.rule.Type != "file" {
+		t.Errorf("expected inferred file type, got %q", n.rule.Type)
 	}
 }
 

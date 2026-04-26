@@ -348,7 +348,11 @@ func (b *Build) findRule(name string) (*parse.TargetRule, error) {
 		b.concretes[name] = rule
 		return rule, nil
 	}
-	return nil, fmt.Errorf("no rule to build %q", name)
+	// No explicit or pattern rule: infer a file target so that source files
+	// don't need to be declared. Run() will fail if the file doesn't exist.
+	inferred := &parse.TargetRule{Type: "file", Target: name}
+	b.concretes[name] = inferred
+	return inferred, nil
 }
 
 // substituteCaptures replaces $1..$9 in s with the corresponding capture group.
@@ -609,6 +613,13 @@ func (n *TargetNode) Run() error {
 	}
 	if n.rule.Runner != "" {
 		return n.runOn()
+	}
+	// A file target with no body can't be built — fail if the file is absent.
+	if n.rule.Type == "file" && n.rule.Body == "" {
+		if _, err := os.Stat(n.target); err != nil {
+			return fmt.Errorf("file %q does not exist and has no rule to create it", n.target)
+		}
+		return nil
 	}
 	return n.runBash(gen.TargetFunc(n.target), true)
 }
