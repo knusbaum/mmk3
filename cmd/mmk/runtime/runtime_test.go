@@ -270,20 +270,15 @@ func TestPatternNoMatchInfersSource(t *testing.T) {
 
 // --- generated script ---
 
-func TestGeneratedScriptContainsConcreteTarget(t *testing.T) {
+func TestGeneratedScriptContainsBuiltinFunctions(t *testing.T) {
 	b := newBuild(t, `all : foo`)
 	content := readGenerated(t, b)
-	if !strings.Contains(content, "__mmk_target_all()") {
-		t.Errorf("generated script missing __mmk_target_all\n%s", content)
+	// target bodies are passed via MMK_EXECUTE; generated script has shared infrastructure only
+	if strings.Contains(content, "__mmk_target_all()") {
+		t.Error("generated script should not contain per-target functions with MMK_EXECUTE design")
 	}
-}
-
-func TestGeneratedScriptAppendedOnPatternInstantiation(t *testing.T) {
-	b := newBuild(t, `'(.*)\.o' : $1.c`)
-	_, _ = b.Resolve("main.o")
-	content := readGenerated(t, b)
-	if !strings.Contains(content, "__mmk_target_main.o()") {
-		t.Errorf("generated script missing instantiated target\n%s", content)
+	if !strings.Contains(content, "__mmk_type_file()") {
+		t.Errorf("generated script missing built-in __mmk_type_file\n%s", content)
 	}
 }
 

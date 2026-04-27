@@ -62,17 +62,13 @@ func TestTargetWithBody(t *testing.T) {
 	out := generate(t, `file main.o : main.c {
 	cc -c main.c -o main.o
 }`)
-	assertContains(t, out, "__mmk_target_main.o()")
-	assertContains(t, out, "cc -c main.c -o main.o")
-	assertContains(t, out, "# target: main.o (type: file)")
+	// target bodies are no longer emitted into the generated script
+	assertNotContains(t, out, "cc -c main.c -o main.o")
 	bashValid(t, out)
 }
 
 func TestTargetNoBody(t *testing.T) {
 	out := generate(t, `all : foo bar`)
-	assertContains(t, out, "__mmk_target_all()")
-	// No-op body should be valid bash.
-	assertContains(t, out, ":")
 	bashValid(t, out)
 }
 
@@ -132,8 +128,6 @@ all : main.o
 	out := generate(t, src)
 	assertContains(t, out, "__mmk_type_file()")
 	assertContains(t, out, "__mmk_runner_run_ubuntu()")
-	assertContains(t, out, "__mmk_target_main.o()")
-	assertContains(t, out, "__mmk_target_all()")
 	bashValid(t, out)
 }
 
@@ -142,7 +136,6 @@ func TestBodyWithNestedBraces(t *testing.T) {
 	setup() { mkdir -p out; }
 	setup
 }`)
-	assertContains(t, out, "__mmk_target_build()")
 	bashValid(t, out)
 }
 
@@ -150,7 +143,6 @@ func TestQuotedTargetName(t *testing.T) {
 	out := generate(t, `"ubuntu:latest" {
 	docker pull ubuntu:latest
 }`)
-	assertContains(t, out, "__mmk_target_ubuntu:latest()")
 	bashValid(t, out)
 }
 
@@ -163,16 +155,13 @@ file main.o : main.c {
 }
 `)
 	assertContains(t, out, "OBJECTS=main")
-	assertContains(t, out, "__mmk_target_main.o()")
 	bashValid(t, out)
 }
 
 func TestBuiltinImageDefaultBody(t *testing.T) {
-	// image target with no body should call __mmk_default_image.
+	// The default body function for image must be defined in the generated script.
 	out := generate(t, `image buildimage:latest : Dockerfile`)
 	assertContains(t, out, DefaultFunc("image")+"()")
-	assertContains(t, out, "__mmk_target_buildimage:latest")
-	assertContains(t, out, DefaultFunc("image"))
 	bashValid(t, out)
 }
 
@@ -191,23 +180,12 @@ image myimg : Dockerfile`)
 }
 
 func TestExplicitBodyOverridesDefault(t *testing.T) {
-	// An explicit body on the target takes precedence over defbody.
-	// The default function is still defined but not called by this target.
+	// Target bodies are no longer emitted into the generated script.
+	// The runtime passes the body via MMK_EXECUTE at execution time.
 	out := generate(t, `image myimg : Dockerfile {
 	docker build --squash -t "$target" .
 }`)
-	assertContains(t, out, "--squash")
-	// The target function itself should contain the explicit body, not a call to the default.
-	// Verify by checking --squash appears and the target function does not delegate to default.
-	targetFn := "__mmk_target_myimg"
-	targetIdx := strings.Index(out, targetFn+"()")
-	if targetIdx < 0 {
-		t.Fatal("target function not found in output")
-	}
-	targetBody := out[targetIdx:]
-	if strings.Contains(targetBody[:strings.Index(targetBody, "}")+1], DefaultFunc("image")) {
-		t.Error("target function should not call default when it has an explicit body")
-	}
+	assertNotContains(t, out, "--squash")
 	bashValid(t, out)
 }
 
@@ -237,7 +215,6 @@ func TestPassthroughBashFunctionIsValidBash(t *testing.T) {
 }
 all : { helper }`)
 	assertContains(t, out, "helper()")
-	assertContains(t, out, "__mmk_target_all()")
 	bashValid(t, out)
 }
 
@@ -286,5 +263,12 @@ func assertContains(t *testing.T, s, substr string) {
 	t.Helper()
 	if !strings.Contains(s, substr) {
 		t.Errorf("output does not contain %q\nfull output:\n%s", substr, s)
+	}
+}
+
+func assertNotContains(t *testing.T, s, substr string) {
+	t.Helper()
+	if strings.Contains(s, substr) {
+		t.Errorf("output should not contain %q\nfull output:\n%s", substr, s)
 	}
 }

@@ -63,9 +63,9 @@ var BuiltinDefTypes = map[string]string{
 	"source": "\n\tstat -c %Y \"$target\" 2>/dev/null || return 1\n",
 }
 
-// builtinDefBodies contains the built-in default body for each built-in type.
+// BuiltinDefBodies contains the built-in default body for each built-in type.
 // A user defbody for the same type name overrides these.
-var builtinDefBodies = map[string]string{
+var BuiltinDefBodies = map[string]string{
 	"file":   "\n\t[[ -e \"$target\" ]] && return 0\n\tprintf 'mmk: %s does not exist and has no rule to create it\\n' \"$target\" >&2; return 1\n",
 	"image":  "\n\tif [[ -n \"$deps\" ]]; then\n\t\tdocker build -t \"$target\" -f \"${deps%% *}\" .\n\telse\n\t\tdocker pull \"$target\"\n\tfi\n",
 	"source": "\n\t[[ -e \"$target\" ]] && return 0\n\tprintf 'mmk: %s does not exist and has no rule to create it\\n' \"$target\" >&2; return 1\n",
@@ -121,8 +121,9 @@ var builtinRunnerDefs = map[string]runnerDefBodies{
 		--user "$(id -u):$(id -g)" \
 		-e "MMK_TARGET=$MMK_TARGET" \
 		-e "MMK_DEPS=$MMK_DEPS" \
+		-e MMK_EXECUTE \
 		"$MMK_RUNNER_STATE" \
-		bash -c ". /mmk-generated.sh; target=\"\$MMK_TARGET\"; deps=\"\$MMK_DEPS\"; $MMK_FUNC"
+		bash -c ". /mmk-generated.sh; target=\"\$MMK_TARGET\"; deps=\"\$MMK_DEPS\"; eval \"\$MMK_EXECUTE\""
 `,
 		Cleanup: `
 	docker rm -f "$MMK_RUNNER_STATE" 2>/dev/null || true
@@ -191,7 +192,7 @@ func Generate(w io.Writer, f *parse.File, frozen []string) error {
 		if userDefBody[typeName] {
 			continue
 		}
-		body := builtinDefBodies[typeName]
+		body := BuiltinDefBodies[typeName]
 		if _, err := fmt.Fprintf(w, "\n# built-in default body: %s\n%s() {%s}\n", typeName, DefaultFunc(typeName), body); err != nil {
 			return err
 		}
@@ -230,22 +231,9 @@ func Generate(w io.Writer, f *parse.File, frozen []string) error {
 			if c.body == "" || phases[c.phase] {
 				continue
 			}
-			body := normalizeBody(c.body)
+			body := NormalizeBody(c.body)
 			if _, err := fmt.Fprintf(w, "\n# %s\n%s() {%s}\n", c.comment, c.fn, body); err != nil {
 				return err
-			}
-		}
-	}
-
-	// Track all types that have a default body (built-in or user-defined).
-	hasDefault := make(map[string]bool)
-	for typeName := range builtinDefBodies {
-		hasDefault[typeName] = true
-	}
-	for _, d := range f.Directives {
-		if db, ok := d.(*parse.DefBody); ok {
-			if db.Verb == "" {
-				hasDefault[db.Type] = true
 			}
 		}
 	}
@@ -273,7 +261,7 @@ func Generate(w io.Writer, f *parse.File, frozen []string) error {
 			if err := ValidateName(d.Type); err != nil {
 				return fmt.Errorf("defbody: %w", err)
 			}
-			body := normalizeBody(d.Body)
+			body := NormalizeBody(d.Body)
 			if d.Verb != "" {
 				if err := ValidateName(d.Verb); err != nil {
 					return fmt.Errorf("defbody verb: %w", err)
@@ -317,34 +305,10 @@ func Generate(w io.Writer, f *parse.File, frozen []string) error {
 			body = d.Body
 			comment = "defrunner " + d.Name + " " + phase
 		case *parse.TargetRule:
-			if d.Pattern != "" {
-				continue // pattern rules are instantiated on demand by the runtime
-			}
-			if err := ValidateName(d.Target); err != nil {
-				return fmt.Errorf("target: %w", err)
-			}
-			if d.Verb != "" {
-				if err := ValidateName(d.Verb); err != nil {
-					return fmt.Errorf("verb rule verb: %w", err)
-				}
-				name = VerbTargetFunc(d.Verb, d.Target)
-				body = d.Body
-				comment = "verb " + d.Verb + " for target: " + d.Target
-			} else {
-				name = TargetFunc(d.Target)
-				body = d.Body
-				comment = "target: " + d.Target
-				if d.Type != "" {
-					comment += " (type: " + d.Type + ")"
-				}
-				// No explicit body: use the type's default if one exists.
-				if body == "" && d.Type != "" && hasDefault[d.Type] {
-					body = "\n\t" + DefaultFunc(d.Type) + "\n"
-				}
-			}
+			continue // target bodies are passed via MMK_EXECUTE at execution time
 		}
 
-		body = normalizeBody(body)
+		body = NormalizeBody(body)
 
 		if _, err := fmt.Fprintf(w, "\n# %s\n%s() {%s}\n", comment, name, body); err != nil {
 			return err
@@ -353,10 +317,10 @@ func Generate(w io.Writer, f *parse.File, frozen []string) error {
 	return nil
 }
 
-// normalizeBody ensures a function body is suitable for embedding in `f() { body }`:
+// NormalizeBody ensures a function body is suitable for embedding in `f() { body }`:
 // empty bodies become a no-op, and bodies that don't end with '\n' get one appended
 // (bash requires a newline or ';' before the closing '}').
-func normalizeBody(body string) string {
+func NormalizeBody(body string) string {
 	if body == "" {
 		return "\n\t:\n"
 	}
@@ -364,36 +328,6 @@ func normalizeBody(body string) string {
 		return body + "\n"
 	}
 	return body
-}
-
-// GenerateRule writes a single concrete target function to w.
-// Used by the runtime when instantiating pattern-matched targets on demand.
-func GenerateRule(w io.Writer, rule *parse.TargetRule) error {
-	if err := ValidateName(rule.Target); err != nil {
-		return fmt.Errorf("target: %w", err)
-	}
-	body := normalizeBody(rule.Body)
-	comment := "target: " + rule.Target
-	if rule.Type != "" {
-		comment += " (type: " + rule.Type + ")"
-	}
-	_, err := fmt.Fprintf(w, "\n# %s\n%s() {%s}\n", comment, TargetFunc(rule.Target), body)
-	return err
-}
-
-// GenerateVerbRule writes a single concrete verb target function to w.
-// Used by the runtime when instantiating pattern-matched verb targets on demand.
-func GenerateVerbRule(w io.Writer, rule *parse.TargetRule) error {
-	if err := ValidateName(rule.Target); err != nil {
-		return fmt.Errorf("target: %w", err)
-	}
-	if err := ValidateName(rule.Verb); err != nil {
-		return fmt.Errorf("verb rule verb: %w", err)
-	}
-	body := normalizeBody(rule.Body)
-	comment := fmt.Sprintf("verb %s for target: %s", rule.Verb, rule.Target)
-	_, err := fmt.Fprintf(w, "\n# %s\n%s() {%s}\n", comment, VerbTargetFunc(rule.Verb, rule.Target), body)
-	return err
 }
 
 // ValidateDuplicates returns an error if any concrete (target, verb) pair appears more than once.
@@ -428,7 +362,7 @@ func PrintBuiltins(w io.Writer) error {
 				return err
 			}
 		}
-		if body, ok := builtinDefBodies[typeName]; ok {
+		if body, ok := BuiltinDefBodies[typeName]; ok {
 			if _, err := fmt.Fprintf(w, "\ndefbody %s {%s}\n", typeName, body); err != nil {
 				return err
 			}

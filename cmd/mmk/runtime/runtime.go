@@ -51,6 +51,7 @@ type Build struct {
 	verbNodes     map[verbNodeKey]*TargetNode
 	runnerNodes   map[string]*TargetNode // runner target name → synthetic runner init node
 	runnerDefs    map[string]runnerDefInfo
+	defBodies     map[string]bool      // type name → has default body (built-in or user defbody)
 	defVerbBodies map[defVerbBodyKey]bool
 	genPath       string
 	genFile       *os.File
@@ -180,6 +181,7 @@ func NewBuild(src []byte) (*Build, error) {
 		verbNodes:     make(map[verbNodeKey]*TargetNode),
 		runnerNodes:   make(map[string]*TargetNode),
 		runnerDefs:    make(map[string]runnerDefInfo),
+		defBodies:     make(map[string]bool),
 		defVerbBodies: make(map[defVerbBodyKey]bool),
 		runnerStates:  make(map[string]string),
 	}
@@ -202,6 +204,11 @@ func NewBuild(src []byte) (*Build, error) {
 		}
 	}
 
+	// Pre-populate with built-in default bodies.
+	for typeName := range gen.BuiltinDefBodies {
+		b.defBodies[typeName] = true
+	}
+
 	// Pre-populate with built-in verb bodies; user defbody entries below may override.
 	for typeName, verbs := range gen.BuiltinVerbBodies {
 		for verb := range verbs {
@@ -214,6 +221,8 @@ func NewBuild(src []byte) (*Build, error) {
 		case *parse.DefBody:
 			if d.Verb != "" {
 				b.defVerbBodies[defVerbBodyKey{d.Type, d.Verb}] = true
+			} else {
+				b.defBodies[d.Type] = true
 			}
 		case *parse.TargetRule:
 			if d.Pattern != "" {
@@ -419,9 +428,6 @@ func (b *Build) ResolveVerb(target, verb string) (*TargetNode, error) {
 					Verb:   dep.Verb,
 				})
 			}
-			if err := gen.GenerateVerbRule(b.genFile, instantiated); err != nil {
-				return nil, fmt.Errorf("instantiate verb pattern [%s %s]: %w", verb, target, err)
-			}
 			b.verbConcretes[key] = instantiated
 			rule = instantiated
 			break
@@ -474,9 +480,6 @@ func (b *Build) findRule(name string) (*parse.TargetRule, error) {
 				Verb:   dep.Verb,
 			})
 		}
-		if err := gen.GenerateRule(b.genFile, rule); err != nil {
-			return nil, fmt.Errorf("instantiate pattern for %q: %w", name, err)
-		}
 		b.concretes[name] = rule
 		return rule, nil
 	}
@@ -488,9 +491,6 @@ func (b *Build) findRule(name string) (*parse.TargetRule, error) {
 		Type:   "source",
 		Target: name,
 		Body:   "\n\t" + gen.DefaultFunc("source") + "\n",
-	}
-	if err := gen.GenerateRule(b.genFile, inferred); err != nil {
-		return nil, fmt.Errorf("infer file rule for %q: %w", name, err)
 	}
 	b.concretes[name] = inferred
 	return inferred, nil
@@ -759,27 +759,54 @@ func isAllDigits(s string) bool {
 	return true
 }
 
-// bodyFuncName returns the bash function name to call for this node's body
-// and whether there is a body to run. It handles both verb and non-verb nodes:
-//   - Non-verb: always gen.TargetFunc (the generated script embeds the defbody fallback).
-//   - Verb with explicit body: gen.VerbTargetFunc.
-//   - Verb with matching defbody: gen.DefaultVerbFunc.
-//   - Verb with no body: ("", false) — no-op.
-func (n *TargetNode) bodyFuncName() (string, bool) {
-	if n.verb == "" {
-		return gen.TargetFunc(n.target), true
-	}
+// wrapExecute wraps body in a self-contained bash snippet:
+// "__mmk_exec() { BODY }; __mmk_exec". The wrapper preserves `return` semantics
+// and lets runners execute the body with `eval "$MMK_EXECUTE"` without needing
+// to know about function naming.
+func wrapExecute(body string) string {
+	return "__mmk_exec() {" + body + "}; __mmk_exec"
+}
+
+// nonVerbBody returns the bash body for a non-verb node: the explicit body, a
+// call to the type's default function, or empty (phony no-op).
+func (n *TargetNode) nonVerbBody() string {
 	if n.rule != nil && n.rule.Body != "" {
-		return gen.VerbTargetFunc(n.verb, n.target), true
+		return n.rule.Body
+	}
+	if n.rule != nil && n.rule.Type != "" && n.build.defBodies[n.rule.Type] {
+		return "\n\t" + gen.DefaultFunc(n.rule.Type) + "\n"
+	}
+	return ""
+}
+
+// verbBody returns the bash body for a verb node: the explicit body, a call to
+// the type's default verb function, or empty string meaning no-op.
+func (n *TargetNode) verbBody() string {
+	if n.rule != nil && n.rule.Body != "" {
+		return n.rule.Body
 	}
 	defaultRule := n.build.concretes[n.target]
 	if defaultRule != nil && defaultRule.Type != "" {
 		key := defVerbBodyKey{defaultRule.Type, n.verb}
 		if n.build.defVerbBodies[key] {
-			return gen.DefaultVerbFunc(defaultRule.Type, n.verb), true
+			return "\n\t" + gen.DefaultVerbFunc(defaultRule.Type, n.verb) + "\n"
 		}
 	}
-	return "", false
+	return ""
+}
+
+// executeScript returns a self-contained bash snippet for MMK_EXECUTE and
+// whether there is anything to run. Non-verb nodes always have a snippet (at
+// minimum a no-op). Verb nodes return (_, false) when there is no body.
+func (n *TargetNode) executeScript() (string, bool) {
+	if n.verb == "" {
+		return wrapExecute(gen.NormalizeBody(n.nonVerbBody())), true
+	}
+	body := n.verbBody()
+	if body == "" {
+		return "", false
+	}
+	return wrapExecute(gen.NormalizeBody(body)), true
 }
 
 // Run executes the target's body. For kindRunner it runs the setup phase of
@@ -792,7 +819,7 @@ func (n *TargetNode) Run() error {
 	if n.kind == kindRunner {
 		return n.runnerSetup()
 	}
-	funcName, ok := n.bodyFuncName()
+	execute, ok := n.executeScript()
 	if !ok {
 		return nil
 	}
@@ -801,15 +828,14 @@ func (n *TargetNode) Run() error {
 		runner = n.rule.Runner
 	}
 	if runner != "" {
-		return n.runWithRunner(funcName)
+		return n.runWithRunner(execute)
 	}
-	return n.runBash(funcName, true)
+	return n.runBash(execute, true)
 }
 
-// runWithRunner executes funcName through the runner type's run bash function.
-// The runner target's state (from setup) and the task context are passed as
-// environment variables.
-func (n *TargetNode) runWithRunner(funcName string) error {
+// runWithRunner executes the given snippet through the runner type's run bash
+// function. The snippet and task context are passed as environment variables.
+func (n *TargetNode) runWithRunner(execute string) error {
 	runnerNode, err := n.build.Resolve(n.rule.Runner)
 	if err != nil {
 		return err
@@ -827,7 +853,7 @@ func (n *TargetNode) runWithRunner(funcName string) error {
 		"target="+runnerNode.target,
 		"deps="+strings.Join(runnerNode.explicitDepNames(), " "),
 		"MMK_RUNNER_STATE="+state,
-		"MMK_FUNC="+funcName,
+		"MMK_EXECUTE="+execute,
 		"MMK_TARGET="+n.target,
 		"MMK_DEPS="+strings.Join(n.explicitDepNames(), " "),
 	)
@@ -903,16 +929,17 @@ func (b *Build) expandDep(dep string) ([]string, error) {
 	return names, nil
 }
 
-// runBash sources generated.sh and runs cmd in a bash subprocess.
+// runBash sources generated.sh and evaluates the MMK_EXECUTE snippet.
 // If output is true, stdout/stderr are forwarded to the process's own streams.
 // Target and dep names are passed via environment to avoid quoting issues.
-func (n *TargetNode) runBash(cmd string, output bool) error {
-	script := `. "$MMK_GENFILE"; target="$MMK_TARGET"; deps="$MMK_DEPS"; ` + cmd
+func (n *TargetNode) runBash(execute string, output bool) error {
+	script := `. "$MMK_GENFILE"; target="$MMK_TARGET"; deps="$MMK_DEPS"; eval "$MMK_EXECUTE"`
 	c := exec.Command("bash", "-c", script)
 	c.Env = append(os.Environ(),
 		"MMK_GENFILE="+n.build.genPath,
 		"MMK_TARGET="+n.target,
 		"MMK_DEPS="+strings.Join(n.explicitDepNames(), " "),
+		"MMK_EXECUTE="+execute,
 	)
 	if output {
 		c.Stdin = os.Stdin
