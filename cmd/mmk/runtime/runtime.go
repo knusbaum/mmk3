@@ -1437,12 +1437,46 @@ func walkSubprojectTree(path, prefix string) []*subprojectSummary {
 // Targets are grouped into sections with a brief annotation per target
 // (runner, type, or dep list for aggregators). Verbs are listed with the
 // targets each one applies to.
+//
+// Subprojects appear inline in the Targets section: the subproject root is
+// annotated as `subproject (<path>/mmkfile)`, and its child targets are
+// listed below it with full path-from-root prefixes. Recursion (subprojects
+// of subprojects) follows the same pattern.
 func (b *Build) PrintList(w io.Writer) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "Targets:")
+	subSummaries := b.walkSubprojects()
+	subRoots := make(map[string]string) // prefix → "subproject (path/mmkfile)" annotation
+	for _, s := range subSummaries {
+		subRoots[s.prefix] = fmt.Sprintf("subproject (%s/mmkfile)", s.path)
+	}
+	type entry struct{ name, annot string }
+	all := make([]entry, 0, len(b.concretes))
 	for _, name := range b.Targets() {
-		r := b.concretes[name]
-		fmt.Fprintf(tw, "  %s\t%s\n", name, annotateRule(r))
+		annot := annotateRule(b.concretes[name])
+		if subAnnot, ok := subRoots[name]; ok {
+			// Merge: prefer the subproject identity, but keep the runner if any.
+			if annot != "" {
+				annot = subAnnot + ", " + annot
+			} else {
+				annot = subAnnot
+			}
+			delete(subRoots, name) // consumed; remaining roots are sub-of-sub
+		}
+		all = append(all, entry{name, annot})
+	}
+	// Sub-of-sub roots (not in top-level concretes) and sub-targets.
+	for _, s := range subSummaries {
+		if annot, ok := subRoots[s.prefix]; ok {
+			all = append(all, entry{name: s.prefix, annot: annot})
+		}
+		for _, t := range s.targets {
+			all = append(all, entry{name: s.prefix + "/" + t})
+		}
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].name < all[j].name })
+	for _, e := range all {
+		fmt.Fprintf(tw, "  %s\t%s\n", e.name, e.annot)
 	}
 	tw.Flush()
 
@@ -1471,25 +1505,8 @@ func (b *Build) PrintList(w io.Writer) {
 		tw.Flush()
 	}
 
-	if subs := b.walkSubprojects(); len(subs) > 0 {
-		fmt.Fprintln(w)
-		fmt.Fprintln(w, "Subproject contents (use `mmk <verb> <prefix>/<target>`):")
-		for i, s := range subs {
-			if i > 0 {
-				fmt.Fprintln(w)
-			}
-			fmt.Fprintf(w, "  %s (%s/mmkfile)\n", s.prefix, s.path)
-			tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
-			if len(s.targets) > 0 {
-				fmt.Fprintf(tw, "    Targets:\t%s\n", strings.Join(s.targets, ", "))
-			}
-			if len(s.verbs) > 0 {
-				fmt.Fprintf(tw, "    Verbs:\t%s\n", strings.Join(s.verbs, ", "))
-			}
-			tw.Flush()
-		}
-	}
 }
+
 
 // verbToPatternsMap returns each verb's pattern rules.
 func (b *Build) verbToPatternsMap() map[string][]string {
