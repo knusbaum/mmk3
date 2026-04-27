@@ -92,10 +92,14 @@ type TargetRule struct {
 // When a typed target has no explicit body, this body is used instead of a no-op.
 // Verb is non-empty for verb-specific default bodies (defbody type verb { ... }).
 // $target and $deps are available, same as in any target body.
+// Options are key=value annotations on the defbody header — the same shape
+// as TargetRule.Options. The defbody's options apply to every verb-rule
+// node that uses this defbody (when no per-rule body is set).
 type DefBody struct {
-	Type string
-	Verb string
-	Body string
+	Type    string
+	Verb    string
+	Body    string
+	Options []Option
 }
 
 // Passthrough is a raw line of bash that is not an mmk directive.
@@ -657,24 +661,48 @@ func (p *parser) parseDefBlock(keyword string, make func(name, body string) Dire
 	return make(name, body), nil
 }
 
-// parseDefBody handles 'defbody type [verb]? { body }' directives.
-// An optional verb word may appear between the type name and the opening brace.
+// parseDefBody handles 'defbody type [verb]? [key=value...]? { body }'.
+// Optional tokens after the type name are interpreted as the verb (the first
+// bare word) and as key=value options (one or more); they may appear in any
+// order between the type and the opening brace.
 func (p *parser) parseDefBody() (Directive, error) {
 	p.s.readWord() // consume "defbody"
 	typeName, err := p.parseName()
 	if err != nil {
 		return nil, fmt.Errorf("defbody: %w", err)
 	}
-	p.s.skipHorizontalSpace()
-	// Optional verb: a word (or quoted string) on the same line before '{' or newline.
 	var verb string
-	if b := p.s.peek(); b != 0 && b != '\n' && b != '{' && b != '#' {
-		if isWordByte(b) || b == '"' {
-			verb, err = p.parseName()
-			if err != nil {
-				return nil, fmt.Errorf("defbody verb: %w", err)
-			}
+	var options []Option
+	for {
+		p.s.skipHorizontalSpace()
+		b := p.s.peek()
+		if b == 0 || b == '\n' || b == '{' || b == '#' {
+			break
 		}
+		if !isWordByte(b) && b != '"' {
+			return nil, fmt.Errorf("line %d: unexpected %q after defbody %s", p.s.line, b, typeName)
+		}
+		// readWord-equivalent (preserve quoted strings via parseName).
+		var word string
+		if b == '"' {
+			word, err = p.s.readString()
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			word = p.s.readWord()
+		}
+		if k, v, ok := parseOptionToken(word); ok {
+			if k == "target" || k == "deps" || strings.HasPrefix(k, "MMK_") {
+				return nil, fmt.Errorf("line %d: option key %q is reserved", p.s.line, k)
+			}
+			options = append(options, Option{Key: k, Value: v})
+			continue
+		}
+		if verb != "" {
+			return nil, fmt.Errorf("line %d: unexpected token %q after defbody %s %s", p.s.line, word, typeName, verb)
+		}
+		verb = word
 	}
 	p.skipWhitespaceAndComments()
 	if p.s.peek() != '{' {
@@ -686,7 +714,7 @@ func (p *parser) parseDefBody() (Directive, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &DefBody{Type: typeName, Verb: verb, Body: body}, nil
+	return &DefBody{Type: typeName, Verb: verb, Body: body, Options: options}, nil
 }
 
 // parseDefRunner handles 'defrunner name [setup|cleanup]? { body }' directives.

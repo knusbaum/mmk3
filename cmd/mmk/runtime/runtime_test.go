@@ -972,6 +972,50 @@ dep :
 	}
 }
 
+func TestOrderOnlyBuiltinImageCleanAfterConsumers(t *testing.T) {
+	// Built-in `defbody image clean` ships order=after-consumers. The
+	// [clean myimg] verb-node should report [clean src] as an order-only
+	// dep so that the dag library can sequence it correctly when both are
+	// in the DAG (and drop the edge when only [clean myimg] is requested).
+	src := `
+image myimg : Dockerfile
+src on myimg : { :; }
+preload on myimg : { :; }
+`
+	b := newBuild(t, src)
+	n, err := b.ResolveVerb("myimg", "clean")
+	if err != nil {
+		t.Fatalf("ResolveVerb: %v", err)
+	}
+	orderDeps := n.OrderDependencies()
+	got := make(map[string]bool)
+	for _, d := range orderDeps {
+		got[d.target+":"+d.verb] = true
+	}
+	for _, want := range []string{"src:clean", "preload:clean"} {
+		if !got[want] {
+			t.Errorf("expected %q in OrderDependencies of [clean myimg]; got %v", want, got)
+		}
+	}
+	// Regular Dependencies should NOT include consumers (otherwise standalone
+	// `mmk clean myimg` would pull them in).
+	for _, d := range n.Dependencies() {
+		if d.target == "src" || d.target == "preload" {
+			t.Errorf("regular Dependencies of [clean myimg] should not include consumer %q", d.target)
+		}
+	}
+}
+
+func TestOrderOptionRejectedWithoutDefrunner(t *testing.T) {
+	_, err := NewBuild([]byte(`
+deftype mytype { echo 0 }
+defbody mytype clean order=after-consumers { true }
+`))
+	if err == nil || !strings.Contains(err.Error(), "defrunner") {
+		t.Fatalf("expected error mentioning 'defrunner'; got %v", err)
+	}
+}
+
 func TestVerbAugmentDepsCombinesWithInherited(t *testing.T) {
 	// `[verb t] :+ extra` combines explicit deps with the default rule's
 	// inherited deps.

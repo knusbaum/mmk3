@@ -88,6 +88,21 @@ var BuiltinVerbBodies = map[string]map[string]string{
 	"image": {"clean": "\n\tdocker image inspect \"$target\" >/dev/null 2>&1 || return 0\n\tdocker image rm -f \"$target\"\n"},
 }
 
+// DefBodyOptionsKey identifies a (type, verb) pair for built-in defbody options.
+// Verb is "" for the default-build defbody.
+type DefBodyOptionsKey struct {
+	Type string
+	Verb string
+}
+
+// BuiltinDefBodyOptions ships options for built-in (type, verb) defbody pairs.
+// `image clean` declares order=after-consumers so that cleaning a runner image
+// is automatically sequenced after every target that uses the image, without
+// the user needing to spell the ordering out per-mmkfile.
+var BuiltinDefBodyOptions = map[DefBodyOptionsKey][]parse.Option{
+	{Type: "image", Verb: "clean"}: {{Key: "order", Value: "after-consumers"}},
+}
+
 // RunnerDefInfo describes which optional phases are defined for a built-in runner type.
 // The run phase is always present for any valid runner type.
 type RunnerDefInfo struct {

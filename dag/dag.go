@@ -13,6 +13,18 @@ type Node[T any] interface {
 	Run() error
 }
 
+// Orderer is an optional interface for nodes that have order-only deps.
+// An order-only edge constrains scheduling — the referenced node must complete
+// before this one — but does NOT pull the referenced node into the DAG. The
+// edge is honored only when the referenced node is already in the graph via
+// some regular Dependencies() path.
+//
+// Use case: a destructive operation (e.g. cleaning a shared resource) wants
+// to run after consumers but should not force them when invoked alone.
+type Orderer[T any] interface {
+	OrderDependencies() []T
+}
+
 type Semaphore struct {
 	c chan struct{}
 }
@@ -88,13 +100,92 @@ type Graph[T Node[T]] struct {
 // graph without running any nodes. All Dependencies() calls happen here, so any
 // side effects of resolution (e.g. writing pattern rule functions to a script
 // file) are complete before Build returns.
+//
+// After regular dep resolution, nodes that implement Orderer get a second pass:
+// each OrderDependencies() entry that's already in the graph becomes an extra
+// upstream edge. Order-only edges that point at nodes outside the graph are
+// dropped silently — that's the whole point of "order-only".
 func Build[T Node[T]](root T) (*Graph[T], error) {
 	steps := make(map[any]*step[T])
 	s, err := buildGraph(steps, nil, root)
 	if err != nil {
 		return nil, err
 	}
+	if err := addOrderOnlyEdges(steps); err != nil {
+		return nil, err
+	}
 	return &Graph[T]{root: s, steps: steps}, nil
+}
+
+// addOrderOnlyEdges adds upstream edges for Orderer nodes whose order-only
+// dependencies are already in the graph. Detects cycles introduced by these
+// new edges (the regular cycle check during buildGraph doesn't see them).
+func addOrderOnlyEdges[T Node[T]](steps map[any]*step[T]) error {
+	for _, st := range steps {
+		orderer, ok := any(st.n).(Orderer[T])
+		if !ok {
+			continue
+		}
+		for _, dep := range orderer.OrderDependencies() {
+			depStep, ok := steps[any(dep)]
+			if !ok {
+				continue // referenced node isn't in the DAG; skip
+			}
+			st.upstream = append(st.upstream, depStep)
+		}
+	}
+	return detectCycle(steps)
+}
+
+// detectCycle reports an error if the upstream graph contains a cycle.
+// Used after order-only edges are added; buildGraph's chain-based check
+// only sees the regular dependency walk.
+func detectCycle[T Node[T]](steps map[any]*step[T]) error {
+	const (
+		white = iota
+		gray
+		black
+	)
+	color := make(map[*step[T]]int, len(steps))
+	var visit func(s *step[T], path []*step[T]) error
+	visit = func(s *step[T], path []*step[T]) error {
+		switch color[s] {
+		case gray:
+			var sb strings.Builder
+			sb.WriteString("cycle detected: ")
+			cycleStart := 0
+			for i, p := range path {
+				if p == s {
+					cycleStart = i
+					break
+				}
+			}
+			for _, p := range path[cycleStart:] {
+				fmt.Fprintf(&sb, "%v -> ", any(p.n))
+			}
+			fmt.Fprintf(&sb, "%v", any(s.n))
+			return errors.New(sb.String())
+		case black:
+			return nil
+		}
+		color[s] = gray
+		path = append(path, s)
+		for _, u := range s.upstream {
+			if err := visit(u, path); err != nil {
+				return err
+			}
+		}
+		color[s] = black
+		return nil
+	}
+	for _, st := range steps {
+		if color[st] == white {
+			if err := visit(st, nil); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // Run executes all nodes in the graph. parallelism <= 0 means unlimited.

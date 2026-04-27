@@ -2,21 +2,24 @@ package dag
 
 import (
 	"errors"
+	"sync"
 	"sync/atomic"
 	"testing"
 )
 
 // testNode is a simple in-memory Node for testing.
 type testNode struct {
-	name    string
-	deps    []*testNode
-	needsRun bool
-	runErr  error
-	runCount atomic.Int32
+	name      string
+	deps      []*testNode
+	orderDeps []*testNode
+	needsRun  bool
+	runErr    error
+	runCount  atomic.Int32
 }
 
-func (n *testNode) Dependencies() []*testNode { return n.deps }
-func (n *testNode) NeedsRun() bool            { return n.needsRun }
+func (n *testNode) Dependencies() []*testNode      { return n.deps }
+func (n *testNode) OrderDependencies() []*testNode { return n.orderDeps }
+func (n *testNode) NeedsRun() bool                 { return n.needsRun }
 func (n *testNode) Run() error {
 	n.runCount.Add(1)
 	return n.runErr
@@ -115,6 +118,82 @@ func TestCycleDetection(t *testing.T) {
 	err := Execute(a, 0)
 	if err == nil {
 		t.Fatal("expected cycle error")
+	}
+}
+
+func TestOrderOnlyEdgeIgnoredWhenTargetNotInGraph(t *testing.T) {
+	// `image` has an order-only edge to `consumer`, but only `image` is the
+	// root. `consumer` shouldn't be pulled into the DAG.
+	consumer := node("consumer", true)
+	image := node("image", true)
+	image.orderDeps = []*testNode{consumer}
+
+	g, err := Build(image)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if _, ok := g.steps[any(consumer)]; ok {
+		t.Error("consumer should not be in the DAG when only image is the root")
+	}
+	if err := g.Run(0); err != nil {
+		t.Fatal(err)
+	}
+	if image.runCount.Load() != 1 {
+		t.Errorf("image runCount: got %d, want 1", image.runCount.Load())
+	}
+	if consumer.runCount.Load() != 0 {
+		t.Errorf("consumer should not run when not in graph; runCount=%d", consumer.runCount.Load())
+	}
+}
+
+func TestOrderOnlyEdgeAppliedWhenTargetInGraph(t *testing.T) {
+	// `consumer` and `image` both reachable from `all`; `image` order-only
+	// depends on `consumer`. Verify `image` runs after `consumer`.
+	consumer := node("consumer", true)
+	image := node("image", true)
+	image.orderDeps = []*testNode{consumer}
+	all := node("all", true, consumer, image)
+
+	var order []string
+	var mu sync.Mutex
+	hooks := Hooks[*testNode]{
+		OnRun: func(n *testNode) {
+			mu.Lock()
+			order = append(order, n.name)
+			mu.Unlock()
+		},
+	}
+	if err := Execute(all, 1, hooks); err != nil {
+		t.Fatal(err)
+	}
+	// Order should be: consumer, image, all (or consumer, image at minimum).
+	consumerIdx, imageIdx := -1, -1
+	for i, name := range order {
+		switch name {
+		case "consumer":
+			consumerIdx = i
+		case "image":
+			imageIdx = i
+		}
+	}
+	if consumerIdx < 0 || imageIdx < 0 {
+		t.Fatalf("expected both consumer and image to run; got %v", order)
+	}
+	if !(consumerIdx < imageIdx) {
+		t.Errorf("expected consumer to run before image; got %v", order)
+	}
+}
+
+func TestOrderOnlyCycleDetected(t *testing.T) {
+	// Regular: A -> B (A depends on B). Order-only: B -> A. Cycle!
+	a := node("a", true)
+	b := node("b", true)
+	a.deps = []*testNode{b}
+	b.orderDeps = []*testNode{a}
+
+	_, err := Build(a)
+	if err == nil {
+		t.Fatal("expected cycle error from order-only edge")
 	}
 }
 

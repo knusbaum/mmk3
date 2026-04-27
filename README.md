@@ -127,12 +127,34 @@ the body can execute inside it. mmk does **not** automatically apply the
 verb to runners inherited from the default rule — the runner is build
 infrastructure shared across many targets, and propagating verbs to it
 (especially destructive ones like `clean`) would race with consumers.
-Express runner-verb ordering explicitly when you want it:
+
+For runner-typed verbs that *should* be sequenced relative to their
+consumers, declare it on the defbody (or a per-target verb rule) with the
+`order=` option:
 
 ```bash
-# Run [clean myimage] last, after the consumers' cleanup finishes.
-[clean myimage] : [clean prog] [clean lib]
+defbody myimage clean order=after-consumers {
+    docker image rm -f "$target"
+}
 ```
+
+`order=after-consumers` sequences `[verb T]` after every `[verb consumer]`
+where the consumer uses `T` as its runner. `order=before-consumers` is the
+inverse. The edges are **order-only**: when only `[verb T]` is invoked, no
+consumers are pulled in — the ordering only kicks in when both nodes are
+already in the DAG via independent paths.
+
+The built-in `image` type ships `defbody image clean order=after-consumers`,
+so cleaning a docker image automatically runs after every target that uses
+that image — no per-mmkfile setup needed. To pull image cleanup into
+`mmk clean all`, add the image to `all`'s deps (or augment with `:+`):
+
+```bash
+[clean all] :+ [clean myimage]
+```
+
+`order=` on a defbody is only valid for types that have a `defrunner` —
+you can't have "consumers" without a way to consume.
 
 ### Rule options (`key=value`)
 

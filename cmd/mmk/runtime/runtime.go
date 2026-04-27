@@ -51,8 +51,9 @@ type Build struct {
 	verbNodes     map[verbNodeKey]*TargetNode
 	runnerNodes   map[string]*TargetNode // runner target name → synthetic runner init node
 	runnerDefs    map[string]runnerDefInfo
-	defBodies     map[string]bool      // type name → has default body (built-in or user defbody)
-	defVerbBodies map[defVerbBodyKey]bool
+	defBodies          map[string]bool // type name → has default body (built-in or user defbody)
+	defVerbBodies      map[defVerbBodyKey]bool
+	userDefBodyOptions map[defVerbBodyKey][]parse.Option // user defbody options keyed by (type, verb)
 	genPath       string
 	genFile       *os.File
 
@@ -156,6 +157,45 @@ func validateDirectives(f *parse.File) error {
 				return fmt.Errorf("target %q uses runner %q of type %q, which cannot be used as a runner", name, r.Runner, runner.Type)
 			}
 		}
+		if err := validateOrderOption(r.Options, fmt.Sprintf("target %q", name), r.Type, validRunnerTypes); err != nil {
+			return err
+		}
+	}
+
+	// `order=` on a defbody is meaningful only when the type has a defrunner —
+	// otherwise no target can `on <T>` and there are no consumers to order
+	// relative to. Reject up front so users don't get silent no-ops.
+	for _, d := range f.Directives {
+		db, ok := d.(*parse.DefBody)
+		if !ok {
+			continue
+		}
+		ctx := fmt.Sprintf("defbody %q", db.Type)
+		if db.Verb != "" {
+			ctx = fmt.Sprintf("defbody %q verb %q", db.Type, db.Verb)
+		}
+		if err := validateOrderOption(db.Options, ctx, db.Type, validRunnerTypes); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// validateOrderOption checks that an `order=` option (if present) has a known
+// value AND that the type is a runner. Other option keys are not validated here.
+func validateOrderOption(options []parse.Option, ctx, typeName string, validRunnerTypes map[string]bool) error {
+	for _, opt := range options {
+		if opt.Key != "order" {
+			continue
+		}
+		switch opt.Value {
+		case "before-consumers", "after-consumers":
+		default:
+			return fmt.Errorf("%s: invalid order=%q (must be before-consumers or after-consumers)", ctx, opt.Value)
+		}
+		if typeName == "" || !validRunnerTypes[typeName] {
+			return fmt.Errorf("%s: order=%s requires a defrunner for type %q", ctx, opt.Value, typeName)
+		}
 	}
 	return nil
 }
@@ -169,15 +209,16 @@ func NewBuild(src []byte) (*Build, error) {
 	}
 
 	b := &Build{
-		concretes:     make(map[string]*parse.TargetRule),
-		verbConcretes: make(map[verbNodeKey]*parse.TargetRule),
-		nodes:         make(map[string]*TargetNode),
-		verbNodes:     make(map[verbNodeKey]*TargetNode),
-		runnerNodes:   make(map[string]*TargetNode),
-		runnerDefs:    make(map[string]runnerDefInfo),
-		defBodies:     make(map[string]bool),
-		defVerbBodies: make(map[defVerbBodyKey]bool),
-		runnerStates:  make(map[string]string),
+		concretes:          make(map[string]*parse.TargetRule),
+		verbConcretes:      make(map[verbNodeKey]*parse.TargetRule),
+		nodes:              make(map[string]*TargetNode),
+		verbNodes:          make(map[verbNodeKey]*TargetNode),
+		runnerNodes:        make(map[string]*TargetNode),
+		runnerDefs:         make(map[string]runnerDefInfo),
+		defBodies:          make(map[string]bool),
+		defVerbBodies:      make(map[defVerbBodyKey]bool),
+		userDefBodyOptions: make(map[defVerbBodyKey][]parse.Option),
+		runnerStates:       make(map[string]string),
 	}
 
 	// Populate runnerDefs from built-in definitions.
@@ -213,6 +254,9 @@ func NewBuild(src []byte) (*Build, error) {
 	// Register defbodies first; they don't depend on target-name expansion.
 	for _, d := range f.Directives {
 		if d, ok := d.(*parse.DefBody); ok {
+			if len(d.Options) > 0 {
+				b.userDefBodyOptions[defVerbBodyKey{d.Type, d.Verb}] = d.Options
+			}
 			if d.Verb != "" {
 				b.defVerbBodies[defVerbBodyKey{d.Type, d.Verb}] = true
 			} else {
@@ -698,6 +742,77 @@ func (n *TargetNode) inheritedVerbDeps() []*TargetNode {
 		}
 	}
 	return deps
+}
+
+// OrderDependencies returns order-only deps for this node — edges that
+// constrain scheduling but don't pull nodes into the DAG. The dag library
+// honors them only when the referenced node is independently in the graph.
+//
+// Two cases produce order-only edges:
+//
+//   - This node is `[verb T]` where T's effective options for verb include
+//     order=after-consumers. The runner-typed T runs after every
+//     `[verb consumer]` for consumers using T as their runner.
+//
+//   - This node is `[verb T]` where T's runner R has effective options for
+//     verb include order=before-consumers. T runs after `[verb R]`.
+func (n *TargetNode) OrderDependencies() []*TargetNode {
+	if n.verb == "" || n.kind == kindRunner {
+		return nil
+	}
+	var deps []*TargetNode
+
+	// Case 1: this is a verb on a runner-typed target with order=after-consumers.
+	if order := n.build.effectiveVerbOption(n.target, n.verb, "order"); order == "after-consumers" {
+		for _, r := range n.build.concretes {
+			if r.Runner == n.target && r.Verb == "" {
+				cn, err := n.build.ResolveVerb(r.Target, n.verb)
+				if err == nil {
+					deps = append(deps, cn)
+				}
+			}
+		}
+	}
+
+	// Case 2: this node's default rule has a runner R, and R's effective
+	// options for this verb include order=before-consumers.
+	defaultRule := n.build.concretes[n.target]
+	if defaultRule != nil && defaultRule.Runner != "" {
+		if order := n.build.effectiveVerbOption(defaultRule.Runner, n.verb, "order"); order == "before-consumers" {
+			rn, err := n.build.ResolveVerb(defaultRule.Runner, n.verb)
+			if err == nil {
+				deps = append(deps, rn)
+			}
+		}
+	}
+	return deps
+}
+
+// effectiveVerbOption returns the value of the named option for [verb target].
+// Verb-rule options take precedence over the type's defbody options.
+func (b *Build) effectiveVerbOption(target, verb, key string) string {
+	if r, ok := b.verbConcretes[verbNodeKey{target, verb}]; ok {
+		for _, opt := range r.Options {
+			if opt.Key == key {
+				return opt.Value
+			}
+		}
+	}
+	r, ok := b.concretes[target]
+	if !ok {
+		return ""
+	}
+	for _, opt := range b.userDefBodyOptions[defVerbBodyKey{r.Type, verb}] {
+		if opt.Key == key {
+			return opt.Value
+		}
+	}
+	for _, opt := range gen.BuiltinDefBodyOptions[gen.DefBodyOptionsKey{Type: r.Type, Verb: verb}] {
+		if opt.Key == key {
+			return opt.Value
+		}
+	}
+	return ""
 }
 
 // Date returns when the target artifact was last successfully built.
