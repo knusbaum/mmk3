@@ -179,6 +179,14 @@ var builtinRunnerDefs = map[string]runnerDefBodies{
 		return $?
 	fi
 	[ -t 0 ] && tty_flag=-t || tty_flag=
+	# Snapshot/restore the local terminal state across docker exec. Allocating
+	# a remote PTY (-t) puts the local tty in raw mode; if docker exec exits
+	# abnormally the host shell is left dirty (requiring 'stty sane'). The
+	# EXIT trap also covers signal-driven exits.
+	if [ -n "$tty_flag" ]; then
+		__mmk_tty_save=$(stty -g 2>/dev/null) || __mmk_tty_save=
+		[ -n "$__mmk_tty_save" ] && trap 'stty "$__mmk_tty_save" 2>/dev/null' EXIT
+	fi
 	__mmk_extra_env=()
 	for __mmk_v in $forward_env; do __mmk_extra_env+=(-e "$__mmk_v"); done
 ` + userFlag + `	docker exec -i $tty_flag \
