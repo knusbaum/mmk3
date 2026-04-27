@@ -78,31 +78,41 @@ func (s *step[T]) run(sem *Semaphore, h *Hooks[T]) {
 	s.status = s.n.Run()
 }
 
-// Execute builds and runs the DAG rooted at root.
-// parallelism <= 0 means unlimited.
+// Graph is a fully-resolved execution graph. Build one with Build, then run it with Run.
+type Graph[T Node[T]] struct {
+	root  *step[T]
+	steps map[any]*step[T]
+}
+
+// Build resolves all transitive dependencies of root and returns the execution
+// graph without running any nodes. All Dependencies() calls happen here, so any
+// side effects of resolution (e.g. writing pattern rule functions to a script
+// file) are complete before Build returns.
+func Build[T Node[T]](root T) (*Graph[T], error) {
+	steps := make(map[any]*step[T])
+	s, err := buildGraph(steps, nil, root)
+	if err != nil {
+		return nil, err
+	}
+	return &Graph[T]{root: s, steps: steps}, nil
+}
+
+// Run executes all nodes in the graph. parallelism <= 0 means unlimited.
 // An optional Hooks value may be passed to observe execution events.
-func Execute[T Node[T]](root T, parallelism int, hooks ...Hooks[T]) error {
+func (g *Graph[T]) Run(parallelism int, hooks ...Hooks[T]) error {
+	if g.root == nil {
+		return nil
+	}
 	var h *Hooks[T]
 	if len(hooks) > 0 {
 		h = &hooks[0]
 	}
-
-	steps := make(map[any]*step[T])
-	s, err := buildGraph(steps, nil, root)
-	if err != nil {
-		return err
-	}
-	if s == nil {
-		return nil
-	}
-
 	var sem *Semaphore
 	if parallelism > 0 {
 		sem = NewSemaphore(parallelism)
 	}
-
 	var wg sync.WaitGroup
-	for _, st := range steps {
+	for _, st := range g.steps {
 		wg.Add(1)
 		go func(st *step[T]) {
 			defer wg.Done()
@@ -110,8 +120,17 @@ func Execute[T Node[T]](root T, parallelism int, hooks ...Hooks[T]) error {
 		}(st)
 	}
 	wg.Wait()
+	return g.root.wait()
+}
 
-	return s.wait()
+// Execute builds and runs the DAG rooted at root.
+// It is a convenience wrapper around Build + Run.
+func Execute[T Node[T]](root T, parallelism int, hooks ...Hooks[T]) error {
+	g, err := Build(root)
+	if err != nil {
+		return err
+	}
+	return g.Run(parallelism, hooks...)
 }
 
 func buildGraph[T Node[T]](steps map[any]*step[T], chain []any, n T) (*step[T], error) {

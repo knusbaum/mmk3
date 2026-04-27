@@ -309,6 +309,23 @@ func (b *Build) HasTarget(name string) bool {
 	return false
 }
 
+// Prepare resolves all transitive dependencies of target+verb, fully populating
+// the generated bash script, without running any nodes.
+func (b *Build) Prepare(target, verb string) error {
+	var root *TargetNode
+	var err error
+	if verb == "" {
+		root, err = b.Resolve(target)
+	} else {
+		root, err = b.ResolveVerb(target, verb)
+	}
+	if err != nil {
+		return err
+	}
+	_, err = dag.Build(root)
+	return err
+}
+
 // Execute builds the DAG rooted at target (optionally qualified by verb) and
 // runs it with the given parallelism. parallelism <= 0 means unlimited.
 // When b.Verbose is true, each target is logged as it runs or is skipped.

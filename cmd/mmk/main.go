@@ -15,8 +15,9 @@ func main() {
 	dump := flag.Bool("dump", false, "print generated shell script and exit")
 	builtins := flag.Bool("builtins", false, "print built-in type definitions as mmk syntax and exit")
 	list := flag.Bool("list", false, "list available targets and verbs, then exit")
+	graph := flag.Bool("graph", false, "print dependency tree for target and exit")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: mmk [-j N] [-v] [-dump] [-builtins] [-list] [[verb] target]\n")
+		fmt.Fprintf(os.Stderr, "usage: mmk [-j N] [-v] [-dump] [-builtins] [-list] [-graph] [[verb] target]\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -57,16 +58,6 @@ func main() {
 		return
 	}
 
-	if *dump {
-		data, err := os.ReadFile(b.GenPath())
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "mmk: %v\n", err)
-			os.Exit(1)
-		}
-		os.Stdout.Write(data)
-		return
-	}
-
 	verb := ""
 	target := "all"
 	switch flag.NArg() {
@@ -85,6 +76,28 @@ func main() {
 	default:
 		fmt.Fprintf(os.Stderr, "usage: mmk [-j N] [-v] [[verb] target]\n")
 		os.Exit(1)
+	}
+
+	if *dump {
+		if err := b.Prepare(target, verb); err != nil {
+			fmt.Fprintf(os.Stderr, "mmk: %v\n", err)
+			os.Exit(1)
+		}
+		data, err := os.ReadFile(b.GenPath())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "mmk: %v\n", err)
+			os.Exit(1)
+		}
+		os.Stdout.Write(data)
+		return
+	}
+
+	if *graph {
+		if err := b.Graph(target, verb); err != nil {
+			fmt.Fprintf(os.Stderr, "mmk: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	if err := b.Execute(target, verb, *j); err != nil {
