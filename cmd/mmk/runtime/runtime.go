@@ -1378,6 +1378,61 @@ func appendRuleOptions(env []string, rule *parse.TargetRule) []string {
 	return env
 }
 
+// subprojectSummary captures what's in a (sub-)mmkfile for -list display.
+type subprojectSummary struct {
+	path     string                 // path relative to the root invocation
+	prefix   string                 // accumulated subproject path, e.g. "src/lib"
+	targets  []string               // concrete (non-pattern, non-verb) target names
+	verbs    []string               // harvested verbs
+	children []*subprojectSummary   // nested subprojects
+}
+
+// walkSubprojects descends into each direct subproject and returns a flat
+// (depth-first) list of subprojectSummary entries — one per (sub)project.
+// Sub-mmkfiles that fail to parse are skipped silently; -list shouldn't
+// turn into a hard error just because a sub-mmkfile is malformed.
+func (b *Build) walkSubprojects() []*subprojectSummary {
+	var summaries []*subprojectSummary
+	for _, sp := range b.subprojects {
+		summaries = append(summaries, walkSubprojectTree(sp.path, sp.target)...)
+	}
+	sort.Slice(summaries, func(i, j int) bool {
+		return summaries[i].prefix < summaries[j].prefix
+	})
+	return summaries
+}
+
+func walkSubprojectTree(path, prefix string) []*subprojectSummary {
+	f, err := readSubMmkfile(path)
+	if err != nil {
+		return nil
+	}
+	s := &subprojectSummary{path: path, prefix: prefix}
+	var nested []*subprojectSummary
+	for _, d := range f.Directives {
+		switch d := d.(type) {
+		case *parse.TargetRule:
+			if d.Pattern == "" && d.Verb == "" && d.Target != "" {
+				s.targets = append(s.targets, d.Target)
+			}
+		case *parse.Subproject:
+			childPath := filepath.Join(path, d.Target)
+			for _, opt := range d.Options {
+				if opt.Key == "path" {
+					childPath = filepath.Join(path, opt.Value)
+				}
+			}
+			childPrefix := prefix + "/" + d.Target
+			nested = append(nested, walkSubprojectTree(childPath, childPrefix)...)
+		}
+	}
+	s.verbs = harvestVerbs(f)
+	sort.Strings(s.targets)
+	out := []*subprojectSummary{s}
+	out = append(out, nested...)
+	return out
+}
+
 // PrintList renders a human-readable summary of targets and verbs to w.
 // Targets are grouped into sections with a brief annotation per target
 // (runner, type, or dep list for aggregators). Verbs are listed with the
@@ -1414,6 +1469,25 @@ func (b *Build) PrintList(w io.Writer) {
 			fmt.Fprintf(tw, "  %s\t%s\n", verb, strings.Join(parts, ", "))
 		}
 		tw.Flush()
+	}
+
+	if subs := b.walkSubprojects(); len(subs) > 0 {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "Subproject contents (use `mmk <verb> <prefix>/<target>`):")
+		for i, s := range subs {
+			if i > 0 {
+				fmt.Fprintln(w)
+			}
+			fmt.Fprintf(w, "  %s (%s/mmkfile)\n", s.prefix, s.path)
+			tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+			if len(s.targets) > 0 {
+				fmt.Fprintf(tw, "    Targets:\t%s\n", strings.Join(s.targets, ", "))
+			}
+			if len(s.verbs) > 0 {
+				fmt.Fprintf(tw, "    Verbs:\t%s\n", strings.Join(s.verbs, ", "))
+			}
+			tw.Flush()
+		}
 	}
 }
 
