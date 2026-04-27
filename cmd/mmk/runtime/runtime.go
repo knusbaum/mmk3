@@ -1522,7 +1522,17 @@ func (b *Build) PrintList(w io.Writer) {
 	for _, s := range subSummaries {
 		subRoots[s.prefix] = fmt.Sprintf("subproject (%s/mmkfile)", s.path)
 	}
-	type entry struct{ name, annot, desc string }
+	// Each target gets a single info column: the user's docstring if any,
+	// else the structural annotation (`on <runner>`, `type: ...`, `→ deps`).
+	// Falling back keeps the listing concise — annotation is only visible
+	// when the user hasn't supplied a more meaningful description.
+	type entry struct{ name, info string }
+	pickInfo := func(desc, annot string) string {
+		if desc != "" {
+			return desc
+		}
+		return annot
+	}
 	all := make([]entry, 0, len(b.concretes))
 	for _, name := range b.Targets() {
 		r := b.concretes[name]
@@ -1532,32 +1542,33 @@ func (b *Build) PrintList(w io.Writer) {
 			desc = firstLine(r.Description)
 		}
 		if subAnnot, ok := subRoots[name]; ok {
-			// Merge: prefer the subproject identity, but keep the runner if any.
+			// Subproject root: the "subproject (path/mmkfile)" annotation
+			// adds structural info beyond what the runner clause alone says,
+			// so prefer it when no description is supplied.
 			if annot != "" {
 				annot = subAnnot + ", " + annot
 			} else {
 				annot = subAnnot
 			}
-			delete(subRoots, name) // consumed; remaining roots are sub-of-sub
+			delete(subRoots, name)
 		}
-		all = append(all, entry{name, annot, desc})
+		all = append(all, entry{name, pickInfo(desc, annot)})
 	}
-	// Sub-of-sub roots (not in top-level concretes) and sub-targets.
+	// Sub-of-sub subproject roots (not in top-level concretes), and sub-targets.
 	for _, s := range subSummaries {
 		if annot, ok := subRoots[s.prefix]; ok {
-			all = append(all, entry{name: s.prefix, annot: annot})
+			all = append(all, entry{name: s.prefix, info: annot})
 		}
 		for _, t := range s.targets {
-			all = append(all, entry{name: s.prefix + "/" + t, desc: firstLine(s.targetDescriptions[t])})
+			all = append(all, entry{
+				name: s.prefix + "/" + t,
+				info: firstLine(s.targetDescriptions[t]),
+			})
 		}
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].name < all[j].name })
 	for _, e := range all {
-		if e.desc != "" {
-			fmt.Fprintf(tw, "  %s\t%s\t%s\n", e.name, e.annot, e.desc)
-		} else {
-			fmt.Fprintf(tw, "  %s\t%s\n", e.name, e.annot)
-		}
+		fmt.Fprintf(tw, "  %s\t%s\n", e.name, e.info)
 	}
 	tw.Flush()
 
