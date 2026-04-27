@@ -86,6 +86,7 @@ type TargetRule struct {
 	Deps        []Dep    // may be nil
 	Options     []Option // key=value annotations from the rule header; preserves source order
 	Body        string   // empty if no body (deps-only rule)
+	Description string   // joined `##`-prefixed comment lines immediately preceding this rule
 }
 
 // DefBody defines the default Run body for targets of the given type.
@@ -114,9 +115,10 @@ type Passthrough struct {
 // auto-generates top-level rules `[verb <name>]` whose bodies cd into the
 // subdir and recursively invoke mmk.
 type Subproject struct {
-	Target  string
-	Runner  string
-	Options []Option
+	Target      string
+	Runner      string
+	Options     []Option
+	Description string // joined `##`-prefixed comment lines immediately preceding this directive
 }
 
 func (*DefType) isDirective()     {}
@@ -328,9 +330,14 @@ func (s *scanner) readQuotedInto(sb *strings.Builder, quote byte, allowBackslash
 // --- parser ---
 
 type parser struct {
-	s *scanner
+	s          *scanner
+	pendingDoc string // accumulated `##`-comment text waiting to attach to the next directive
 }
 
+// skipWhitespaceAndComments consumes blank lines and comments while collecting
+// any `##`-prefixed comment lines into pendingDoc. A regular `#` comment (or
+// any non-comment line) clears pendingDoc — only `##` blocks immediately
+// preceding a directive (with blank lines OK in between) attach.
 func (p *parser) skipWhitespaceAndComments() {
 	for {
 		p.s.skipHorizontalSpace()
@@ -338,11 +345,39 @@ func (p *parser) skipWhitespaceAndComments() {
 		case '\n':
 			p.s.advance()
 		case '#':
-			p.s.skipToEndOfLine()
+			if p.s.pos+1 < len(p.s.src) && p.s.src[p.s.pos+1] == '#' {
+				p.s.advance() // first #
+				p.s.advance() // second #
+				if p.s.peek() == ' ' {
+					p.s.advance()
+				}
+				var sb strings.Builder
+				for {
+					b := p.s.peek()
+					if b == '\n' || b == 0 {
+						break
+					}
+					sb.WriteByte(p.s.advance())
+				}
+				if p.pendingDoc != "" {
+					p.pendingDoc += "\n"
+				}
+				p.pendingDoc += sb.String()
+			} else {
+				p.s.skipToEndOfLine()
+				p.pendingDoc = "" // regular comment resets pending docstring
+			}
 		default:
 			return
 		}
 	}
+}
+
+// consumePendingDoc returns and clears any accumulated `##`-comment text.
+func (p *parser) consumePendingDoc() string {
+	doc := p.pendingDoc
+	p.pendingDoc = ""
+	return doc
 }
 
 // parseName reads a word or double-quoted string.
@@ -451,9 +486,19 @@ func (p *parser) parseFile() (*File, error) {
 		if p.s.peek() == 0 {
 			break
 		}
+		doc := p.consumePendingDoc()
 		d, err := p.parseDirectiveOrPassthrough()
 		if err != nil {
 			return nil, err
+		}
+		// Attach pending docstring (if any) to directive types that carry one.
+		if doc != "" {
+			switch v := d.(type) {
+			case *TargetRule:
+				v.Description = doc
+			case *Subproject:
+				v.Description = doc
+			}
 		}
 		f.Directives = append(f.Directives, d)
 	}

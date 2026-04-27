@@ -1439,11 +1439,21 @@ func appendRuleOptions(env []string, rule *parse.TargetRule) []string {
 
 // subprojectSummary captures what's in a (sub-)mmkfile for -list display.
 type subprojectSummary struct {
-	path     string                 // path relative to the root invocation
-	prefix   string                 // accumulated subproject path, e.g. "src/lib"
-	targets  []string               // concrete (non-pattern, non-verb) target names
-	verbs    []string               // harvested verbs
-	children []*subprojectSummary   // nested subprojects
+	path               string                 // path relative to the root invocation
+	prefix             string                 // accumulated subproject path, e.g. "src/lib"
+	targets            []string               // concrete (non-pattern, non-verb) target names
+	targetDescriptions map[string]string      // target name → description
+	verbs              []string               // harvested verbs
+	children           []*subprojectSummary   // nested subprojects
+}
+
+// firstLine returns the first line of s, or s itself if there's no newline.
+// Used for one-line summaries in tabular output.
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
 }
 
 // walkSubprojects descends into each direct subproject and returns a flat
@@ -1466,13 +1476,16 @@ func walkSubprojectTree(path, prefix string) []*subprojectSummary {
 	if err != nil {
 		return nil
 	}
-	s := &subprojectSummary{path: path, prefix: prefix}
+	s := &subprojectSummary{path: path, prefix: prefix, targetDescriptions: make(map[string]string)}
 	var nested []*subprojectSummary
 	for _, d := range f.Directives {
 		switch d := d.(type) {
 		case *parse.TargetRule:
 			if d.Pattern == "" && d.Verb == "" && d.Target != "" {
 				s.targets = append(s.targets, d.Target)
+				if d.Description != "" {
+					s.targetDescriptions[d.Target] = d.Description
+				}
 			}
 		case *parse.Subproject:
 			childPath := filepath.Join(path, d.Target)
@@ -1509,10 +1522,15 @@ func (b *Build) PrintList(w io.Writer) {
 	for _, s := range subSummaries {
 		subRoots[s.prefix] = fmt.Sprintf("subproject (%s/mmkfile)", s.path)
 	}
-	type entry struct{ name, annot string }
+	type entry struct{ name, annot, desc string }
 	all := make([]entry, 0, len(b.concretes))
 	for _, name := range b.Targets() {
-		annot := annotateRule(b.concretes[name])
+		r := b.concretes[name]
+		annot := annotateRule(r)
+		desc := ""
+		if r != nil {
+			desc = firstLine(r.Description)
+		}
 		if subAnnot, ok := subRoots[name]; ok {
 			// Merge: prefer the subproject identity, but keep the runner if any.
 			if annot != "" {
@@ -1522,7 +1540,7 @@ func (b *Build) PrintList(w io.Writer) {
 			}
 			delete(subRoots, name) // consumed; remaining roots are sub-of-sub
 		}
-		all = append(all, entry{name, annot})
+		all = append(all, entry{name, annot, desc})
 	}
 	// Sub-of-sub roots (not in top-level concretes) and sub-targets.
 	for _, s := range subSummaries {
@@ -1530,12 +1548,16 @@ func (b *Build) PrintList(w io.Writer) {
 			all = append(all, entry{name: s.prefix, annot: annot})
 		}
 		for _, t := range s.targets {
-			all = append(all, entry{name: s.prefix + "/" + t})
+			all = append(all, entry{name: s.prefix + "/" + t, desc: firstLine(s.targetDescriptions[t])})
 		}
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].name < all[j].name })
 	for _, e := range all {
-		fmt.Fprintf(tw, "  %s\t%s\n", e.name, e.annot)
+		if e.desc != "" {
+			fmt.Fprintf(tw, "  %s\t%s\t%s\n", e.name, e.annot, e.desc)
+		} else {
+			fmt.Fprintf(tw, "  %s\t%s\n", e.name, e.annot)
+		}
 	}
 	tw.Flush()
 

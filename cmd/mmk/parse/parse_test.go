@@ -501,6 +501,76 @@ func TestTargetRuleReservedOptionKey(t *testing.T) {
 	expectError(t, `foo MMK_FOO=x : bar`, "reserved")
 }
 
+func TestDocstringAttachesToTargetRule(t *testing.T) {
+	src := `
+## Build the C library.
+foo : { :; }
+`
+	f := mustParse(t, src)
+	r := asRule(t, f.Directives[0])
+	if r.Description != "Build the C library." {
+		t.Errorf("Description: got %q, want %q", r.Description, "Build the C library.")
+	}
+}
+
+func TestDocstringMultilineConcatenates(t *testing.T) {
+	src := `
+## First line.
+## Second line.
+foo : { :; }
+`
+	f := mustParse(t, src)
+	r := asRule(t, f.Directives[0])
+	want := "First line.\nSecond line."
+	if r.Description != want {
+		t.Errorf("Description: got %q, want %q", r.Description, want)
+	}
+}
+
+func TestDocstringResetByRegularComment(t *testing.T) {
+	src := `
+## First doc.
+# regular comment
+foo : { :; }
+`
+	f := mustParse(t, src)
+	r := asRule(t, f.Directives[0])
+	if r.Description != "" {
+		t.Errorf("Description: got %q, want empty (reset by regular comment)", r.Description)
+	}
+}
+
+func TestDocstringSurvivesBlankLines(t *testing.T) {
+	src := `
+## Doc.
+
+foo : { :; }
+`
+	f := mustParse(t, src)
+	r := asRule(t, f.Directives[0])
+	if r.Description != "Doc." {
+		t.Errorf("Description: got %q, want %q", r.Description, "Doc.")
+	}
+}
+
+func TestDocstringDoesNotLeakBetweenDirectives(t *testing.T) {
+	src := `
+## Doc for foo.
+foo : { :; }
+
+bar : { :; }
+`
+	f := mustParse(t, src)
+	foo := asRule(t, f.Directives[0])
+	bar := asRule(t, f.Directives[1])
+	if foo.Description != "Doc for foo." {
+		t.Errorf("foo.Description: got %q", foo.Description)
+	}
+	if bar.Description != "" {
+		t.Errorf("bar.Description should be empty; got %q", bar.Description)
+	}
+}
+
 func TestSubprojectBare(t *testing.T) {
 	f := mustParse(t, `subproject src`)
 	if len(f.Directives) != 1 {

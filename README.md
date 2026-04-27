@@ -286,6 +286,25 @@ subproject src on $DOCKER_IMAGE
 subproject preload_go on $DOCKER_IMAGE
 ```
 
+### Docstrings (`##` comments)
+
+Lines starting with `##` immediately preceding a target rule (or subproject
+declaration) attach to it as a description. `mmk -list` displays the first
+line of the description in the targets table:
+
+```bash
+## Build the C launcher.preload.so library.
+file launcher.preload.so : main.c { gcc -o $target main.c }
+
+## All Go binaries plus telemetry forwarder.
+subproject preload_go on $DOCKER_IMAGE
+```
+
+Multiple `##` lines concatenate (joined with newlines). Blank lines between
+the docstring block and the directive are fine. A regular `#` comment (or any
+non-comment, non-blank line) resets the pending docstring, so docstrings only
+attach to what they're meant to describe.
+
 ### Passthrough bash
 
 Any line that is not an mmk directive is passed through verbatim to the
