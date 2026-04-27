@@ -1156,6 +1156,32 @@ weird {
 	}
 }
 
+func TestGraphPrunesEmptyVerbSubtrees(t *testing.T) {
+	// `all` has deps `foo` (with [test foo] rule) and `bar` (no [test bar]).
+	// `mmk -graph test all` should prune [test bar] but keep [test foo].
+	src := `
+all : foo bar
+foo :
+bar :
+[test foo] {
+    :
+}
+`
+	b := newBuild(t, src)
+	defer b.Close()
+	var buf strings.Builder
+	if err := b.GraphTo(&buf, "all", "test"); err != nil {
+		t.Fatalf("Graph: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "[test foo]") {
+		t.Errorf("expected [test foo] in graph; got:\n%s", out)
+	}
+	if strings.Contains(out, "[test bar]") {
+		t.Errorf("[test bar] should be pruned; got:\n%s", out)
+	}
+}
+
 func TestExecuteAllowsVerbWhenAtLeastOneRuleApplies(t *testing.T) {
 	// `clean` only applies to `foo` directly, not via [clean all] explicitly.
 	src := `

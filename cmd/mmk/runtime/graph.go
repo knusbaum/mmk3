@@ -7,10 +7,15 @@ import (
 )
 
 // Graph resolves target+verb and prints the dependency tree to stdout.
+func (b *Build) Graph(target, verb string) error {
+	return b.GraphTo(os.Stdout, target, verb)
+}
+
+// GraphTo is like Graph but writes to an arbitrary io.Writer (useful for tests).
 // Order-only edges (from nodes implementing OrderDependencies) are shown with
 // an "(order)" tag, but only for targets that are independently reachable from
 // the root via regular deps — matching the dag library's actual behavior.
-func (b *Build) Graph(target, verb string) error {
+func (b *Build) GraphTo(w io.Writer, target, verb string) error {
 	var root *TargetNode
 	var err error
 	if verb == "" {
@@ -42,10 +47,10 @@ func (b *Build) Graph(target, verb string) error {
 
 	visited := make(map[string]bool)
 	visited[nodeKey(root)] = true
-	fmt.Fprintln(os.Stdout, nodeLabel(root))
+	fmt.Fprintln(w, nodeLabel(root))
 	deps := visibleDeps(root, inGraph)
 	for i, dep := range deps {
-		printTreeNode(os.Stdout, dep, "", i == len(deps)-1, visited, inGraph)
+		printTreeNode(w, dep, "", i == len(deps)-1, visited, inGraph)
 	}
 	return nil
 }
@@ -99,10 +104,17 @@ func nodeKey(n *TargetNode) string {
 // targets are also reachable from the root. Order-only edges to nodes that
 // aren't in the graph (e.g. when only the runner-image's verb is requested)
 // are dropped, matching the dag library's runtime behavior.
+//
+// Verb subtrees with no executable body anywhere (e.g. [update python] when
+// nothing in python's tree defines an update verb) are pruned — they're
+// noise that obscures the real work without conveying useful structure.
 func visibleDeps(n *TargetNode, inGraph map[*TargetNode]bool) []displayDep {
 	var result []displayDep
 	for _, d := range n.Dependencies() {
 		if d.kind == kindRunner {
+			continue
+		}
+		if shouldPruneVerbSubtree(d) {
 			continue
 		}
 		result = append(result, displayDep{node: d, orderly: false})
@@ -114,7 +126,22 @@ func visibleDeps(n *TargetNode, inGraph map[*TargetNode]bool) []displayDep {
 		if !inGraph[d] {
 			continue
 		}
+		if shouldPruneVerbSubtree(d) {
+			continue
+		}
 		result = append(result, displayDep{node: d, orderly: true})
 	}
 	return result
+}
+
+// shouldPruneVerbSubtree returns true when n is a verb node whose entire
+// subtree contains no executable verb body. Non-verb nodes are never pruned
+// — they're real build steps. A verb node with its own body is never pruned.
+// A virtual / inherited verb node (no own body) is pruned only when none of
+// its descendants has work either.
+func shouldPruneVerbSubtree(n *TargetNode) bool {
+	if n.verb == "" {
+		return false
+	}
+	return !hasApplicableVerbBody(n, make(map[*TargetNode]bool))
 }
