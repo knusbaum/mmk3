@@ -119,6 +119,58 @@ suppress inheritance:
 }
 ```
 
+### Rule options (`key=value`)
+
+Any rule's header may carry `key=value` annotations. Each option is exported
+as a bash variable to bodies of the rule it's declared on. The built-in
+`image` runner honors two options out of the box:
+
+- `platform=<platform>` — passed as `--platform` to both `docker build` and
+  `docker run`.
+- `forward_env="VAR1 VAR2 …"` — each name is forwarded into `docker exec`
+  with `-e <VAR>` so the value is inherited from the surrounding env.
+
+```bash
+image winbuild:1 platform=linux/amd64 forward_env="VERSION TAG" : Dockerfile.windows
+
+build on winbuild:1 { cmake --build . }
+```
+
+Quoted values are supported for keys that need spaces (like `forward_env`);
+bare values are fine for everything else.
+
+For additional knobs, override the runner and read the option as a bash
+variable:
+
+```bash
+image myimg:1 platform=linux/amd64 user=1000:1000 : Dockerfile
+
+defrunner image setup {
+    docker run -d --rm \
+        ${platform:+--platform "$platform"} \
+        ${user:+--user "$user"} \
+        -v "$(pwd):/work" -w /work \
+        "$target" sleep infinity
+}
+```
+
+Options may appear before or after the optional `on <runner>` clause and in
+any order. Values may contain `:`, `/`, and `=`; values with spaces require
+that you put the value into a passthrough variable and reference it (option
+values are bare words).
+
+When a target uses a runner, the runner's options *and* the target's options
+are both in scope during the runner-run phase. If both define the same key,
+the target's value shadows the runner's:
+
+```bash
+mytarget on myimg:1 user=root { ... }      # `user` overrides image-level value
+```
+
+The runner author decides which keys to honor at which phase by referencing
+them in the relevant body. Keys named `target`, `deps`, or beginning with
+`MMK_` are reserved.
+
 ### Variable expansion in deps, target names, and runners
 
 Variables defined in passthrough bash are available in dep lists, concrete

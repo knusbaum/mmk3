@@ -158,6 +158,79 @@ build on $IMG : {
 	}
 }
 
+func TestTargetOptionVisibleInBody(t *testing.T) {
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.txt")
+	src := fmt.Sprintf(`mytarget mode=debug count=3 {
+    printf '%%s %%s' "$mode" "$count" > %q
+}
+`, out)
+	b := newBuild(t, src)
+	n, _ := b.Resolve("mytarget")
+	if err := n.Run(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(got) != "debug 3" {
+		t.Errorf("body output: got %q, want %q", got, "debug 3")
+	}
+}
+
+func TestImageOptionShadowedByTargetOption(t *testing.T) {
+	// When an image and a target both set the same option name, the runner-run
+	// phase should see the target's value (last-write-wins on cmd.Env).
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.txt")
+
+	// Custom image type whose runner just writes $platform to a file. No
+	// docker, no real container — the runner is just bash.
+	src := fmt.Sprintf(`deftype fake-image {
+    echo 1
+}
+defrunner fake-image setup {
+    printf 'state'
+}
+defrunner fake-image {
+    printf '%%s' "$platform" > %q
+}
+defrunner fake-image cleanup {
+    :
+}
+fake-image myimg platform=image-value :
+mytarget on myimg platform=target-value {
+    :
+}
+`, out)
+	b := newBuild(t, src)
+	defer b.Close()
+	n, _ := b.Resolve("mytarget")
+	n.Dependencies()
+	if err := b.Prepare("mytarget", ""); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	// Run setup so MMK_RUNNER_STATE is populated.
+	for _, dep := range n.Dependencies() {
+		if dep.kind == kindRunner {
+			if err := dep.Run(); err != nil {
+				t.Fatalf("setup: %v", err)
+			}
+		}
+	}
+	if err := n.Run(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(got) != "target-value" {
+		t.Errorf("expected target option to shadow image option; got %q", got)
+	}
+}
+
 func TestVarTargetNameMultiWordError(t *testing.T) {
 	_, err := NewBuild([]byte(`
 NAMES="a b"

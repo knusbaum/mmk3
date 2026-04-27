@@ -441,6 +441,66 @@ func TestPassthroughVariableAssignment(t *testing.T) {
 	}
 }
 
+func TestTargetRuleOptions(t *testing.T) {
+	f := mustParse(t, `image myimg:1 platform=linux/amd64 user=1000:1000 : Dockerfile`)
+	r := asRule(t, f.Directives[0])
+	if r.Type != "image" || r.Target != "myimg:1" {
+		t.Fatalf("unexpected header: type=%q target=%q", r.Type, r.Target)
+	}
+	want := []Option{{Key: "platform", Value: "linux/amd64"}, {Key: "user", Value: "1000:1000"}}
+	if len(r.Options) != len(want) {
+		t.Fatalf("options: got %v, want %v", r.Options, want)
+	}
+	for i, opt := range r.Options {
+		if opt != want[i] {
+			t.Errorf("Options[%d]: got %v, want %v", i, opt, want[i])
+		}
+	}
+	if len(r.Deps) != 1 || r.Deps[0].Target != "Dockerfile" {
+		t.Errorf("deps: got %v, want [Dockerfile]", r.Deps)
+	}
+}
+
+func TestTargetRuleOptionsAfterRunner(t *testing.T) {
+	f := mustParse(t, `windows-shell on myimg:1 tty=true { bash }`)
+	r := asRule(t, f.Directives[0])
+	if r.Runner != "myimg:1" {
+		t.Errorf("Runner: got %q, want %q", r.Runner, "myimg:1")
+	}
+	if len(r.Options) != 1 || r.Options[0].Key != "tty" || r.Options[0].Value != "true" {
+		t.Errorf("Options: got %v, want [{tty true}]", r.Options)
+	}
+}
+
+func TestTargetRuleOptionInterspersed(t *testing.T) {
+	// Options can appear before or after the `on` clause.
+	f := mustParse(t, `build platform=arm on myimg:1 mode=debug { :; }`)
+	r := asRule(t, f.Directives[0])
+	if r.Target != "build" || r.Runner != "myimg:1" {
+		t.Errorf("header parse: target=%q runner=%q", r.Target, r.Runner)
+	}
+	if len(r.Options) != 2 {
+		t.Fatalf("Options len: got %d, want 2: %v", len(r.Options), r.Options)
+	}
+}
+
+func TestTargetRuleOptionQuotedValue(t *testing.T) {
+	f := mustParse(t, `image myimg forward_env="A B C" : Dockerfile`)
+	r := asRule(t, f.Directives[0])
+	if len(r.Options) != 1 {
+		t.Fatalf("Options: got %v", r.Options)
+	}
+	if r.Options[0].Key != "forward_env" || r.Options[0].Value != "A B C" {
+		t.Errorf("Option: got %v, want {forward_env A B C}", r.Options[0])
+	}
+}
+
+func TestTargetRuleReservedOptionKey(t *testing.T) {
+	expectError(t, `foo target=oops : bar`, "reserved")
+	expectError(t, `foo deps=oops : bar`, "reserved")
+	expectError(t, `foo MMK_FOO=x : bar`, "reserved")
+}
+
 func TestPassthroughVariableAssignmentWithColon(t *testing.T) {
 	// Without the IDENT=... heuristic this gets parsed as a target rule
 	// because of the embedded ':'.

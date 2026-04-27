@@ -308,6 +308,7 @@ func (b *Build) Close() {
 			"target="+runnerTarget,
 			"MMK_RUNNER_STATE="+state,
 		)
+		cmd.Env = appendRuleOptions(cmd.Env, rule)
 		cmd.Run() //nolint — best-effort cleanup
 	}
 	b.genFile.Close()
@@ -882,6 +883,10 @@ func (n *TargetNode) runWithRunner(execute string) error {
 		"MMK_TARGET="+n.target,
 		"MMK_DEPS="+strings.Join(n.explicitDepNames(), " "),
 	)
+	// Image (runner) options first, then target options. On collision Go's
+	// os/exec resolves duplicate keys by last-write-wins, so target shadows.
+	cmd.Env = appendRuleOptions(cmd.Env, runnerNode.rule)
+	cmd.Env = appendRuleOptions(cmd.Env, n.rule)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -1008,6 +1013,7 @@ func (n *TargetNode) runBash(execute string, output bool) error {
 		"MMK_DEPS="+strings.Join(n.explicitDepNames(), " "),
 		"MMK_EXECUTE="+execute,
 	)
+	c.Env = appendRuleOptions(c.Env, n.rule)
 	if output {
 		c.Stdin = os.Stdin
 		c.Stdout = os.Stdout
@@ -1026,8 +1032,22 @@ func (n *TargetNode) runBashOutput(cmd string) (string, error) {
 		"MMK_TARGET="+n.target,
 		"MMK_DEPS="+strings.Join(n.explicitDepNames(), " "),
 	)
+	c.Env = appendRuleOptions(c.Env, n.rule)
 	out, err := c.Output()
 	return string(out), err
+}
+
+// appendRuleOptions exports the rule's key=value options as environment
+// variables for any bash subprocess that runs one of the rule's bodies.
+// Returns env unchanged when rule is nil or has no options.
+func appendRuleOptions(env []string, rule *parse.TargetRule) []string {
+	if rule == nil {
+		return env
+	}
+	for _, opt := range rule.Options {
+		env = append(env, opt.Key+"="+opt.Value)
+	}
+	return env
 }
 
 // Targets returns the names of all explicitly declared concrete (non-pattern)

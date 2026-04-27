@@ -77,7 +77,7 @@ var BuiltinDefTypes = map[string]string{
 // A user defbody for the same type name overrides these.
 var BuiltinDefBodies = map[string]string{
 	"file":   "\n\t[[ -e \"$target\" ]] && return 0\n\tprintf 'mmk: %s does not exist and has no rule to create it\\n' \"$target\" >&2; return 1\n",
-	"image":  "\n\tif [[ -n \"$deps\" ]]; then\n\t\tdocker build -t \"$target\" -f \"${deps%% *}\" .\n\telse\n\t\tdocker pull \"$target\"\n\tfi\n",
+	"image":  "\n\tif [[ -n \"$deps\" ]]; then\n\t\tdocker build ${platform:+--platform \"$platform\"} -t \"$target\" -f \"${deps%% *}\" .\n\telse\n\t\tdocker pull ${platform:+--platform \"$platform\"} \"$target\"\n\tfi\n",
 	"source": "\n\t[[ -e \"$target\" ]] && return 0\n\tprintf 'mmk: %s does not exist and has no rule to create it\\n' \"$target\" >&2; return 1\n",
 }
 
@@ -117,6 +117,7 @@ var builtinRunnerDefs = map[string]runnerDefBodies{
 	name="mmk-$(printf '%s' "$target" | tr -cs 'a-zA-Z0-9' '-')-$$"
 	docker rm -f "$name" 2>/dev/null || true
 	id=$(docker run -d --rm \
+		${platform:+--platform "$platform"} \
 		--name "$name" \
 		-v "$(pwd):/work" \
 		-v "$MMK_GENFILE:/mmk-generated.sh:ro" \
@@ -127,11 +128,14 @@ var builtinRunnerDefs = map[string]runnerDefBodies{
 `,
 		Run: `
 	[ -t 0 ] && tty_flag=-t || tty_flag=
+	__mmk_extra_env=()
+	for __mmk_v in $forward_env; do __mmk_extra_env+=(-e "$__mmk_v"); done
 	docker exec -i $tty_flag \
 		--user "$(id -u):$(id -g)" \
 		-e "MMK_TARGET=$MMK_TARGET" \
 		-e "MMK_DEPS=$MMK_DEPS" \
 		-e MMK_EXECUTE \
+		"${__mmk_extra_env[@]}" \
 		"$MMK_RUNNER_STATE" \
 		bash -c ". /mmk-generated.sh; target=\"\$MMK_TARGET\"; deps=\"\$MMK_DEPS\"; eval \"\$MMK_EXECUTE\""
 `,

@@ -64,6 +64,14 @@ type Dep struct {
 	Verb   string
 }
 
+// Option is a key=value annotation attached to a target rule's header.
+// Options are exported as bash variables to bodies of the rule they're
+// declared on. Runners and bodies decide what (if anything) to honor.
+type Option struct {
+	Key   string
+	Value string
+}
+
 // TargetRule is a single build target.
 // Exactly one of Target or Pattern is set.
 // Verb is non-empty for verb rules declared with [verb target] syntax.
@@ -72,10 +80,11 @@ type TargetRule struct {
 	Target  string // concrete name; empty if Pattern is set
 	Pattern string // regex from '...'; empty if Target is set
 	Runner  string // empty if no runner
-	Verb       string // empty for default build rules
-	HasDepSep  bool   // true if ':' was present (even with empty dep list)
-	Deps       []Dep  // may be nil
-	Body       string // empty if no body (deps-only rule)
+	Verb       string   // empty for default build rules
+	HasDepSep  bool     // true if ':' was present (even with empty dep list)
+	Deps       []Dep    // may be nil
+	Options    []Option // key=value annotations from the rule header; preserves source order
+	Body       string   // empty if no body (deps-only rule)
 }
 
 // DefBody defines the default Run body for targets of the given type.
@@ -402,7 +411,18 @@ func (p *parser) parseHeaderToken() (headerToken, error) {
 		if !isWordByte(b) && !(b == ':' && !p.s.colonIsSeparator()) {
 			return headerToken{}, fmt.Errorf("line %d: expected name, got %q", p.s.line, p.s.peek())
 		}
-		return headerToken{val: p.s.readWord()}, nil
+		word := p.s.readWord()
+		// If the word looks like IDENT="..." (option key, equals, then a
+		// double-quoted value), consume the quoted value and concat. This lets
+		// option values contain spaces and other shell-meaningful chars.
+		if strings.HasSuffix(word, "=") && p.s.peek() == '"' && isOptionKeyPrefix(word[:len(word)-1]) {
+			val, err := p.s.readString()
+			if err != nil {
+				return headerToken{}, err
+			}
+			word += val
+		}
+		return headerToken{val: word}, nil
 	}
 }
 
@@ -723,11 +743,18 @@ func (p *parser) parseTargetRule() (*TargetRule, error) {
 		header = append(header, tok)
 	}
 
+	// Pull off any IDENT=value tokens as options before interpreting the rest
+	// as type/target/runner. Options can appear anywhere in the header.
+	header, options, err := splitOptions(header)
+	if err != nil {
+		return nil, fmt.Errorf("line %d: %w", p.s.line, err)
+	}
+
 	typ, target, pattern, runner, verb, err := parseHeader(header)
 	if err != nil {
 		return nil, fmt.Errorf("line %d: %w", p.s.line, err)
 	}
-	rule := &TargetRule{Type: typ, Target: target, Pattern: pattern, Runner: runner, Verb: verb}
+	rule := &TargetRule{Type: typ, Target: target, Pattern: pattern, Runner: runner, Verb: verb, Options: options}
 
 	// Optional deps after ':'.
 	p.s.skipHorizontalSpace()
@@ -775,6 +802,66 @@ func (p *parser) parseTargetRule() (*TargetRule, error) {
 	}
 
 	return rule, nil
+}
+
+// splitOptions walks the header tokens and pulls out any that look like
+// `IDENT=value`, returning the remaining tokens and the parsed options in
+// source order. Pattern and verb-bracketed tokens are never options.
+//
+// Keys named "target" or "deps", or starting with "MMK_", are reserved (they
+// would shadow mmk's own bash variables) and produce a parse error.
+func splitOptions(tokens []headerToken) ([]headerToken, []Option, error) {
+	var rest []headerToken
+	var opts []Option
+	for _, tok := range tokens {
+		if tok.isPattern || tok.verb != "" {
+			rest = append(rest, tok)
+			continue
+		}
+		key, val, ok := parseOptionToken(tok.val)
+		if !ok {
+			rest = append(rest, tok)
+			continue
+		}
+		if key == "target" || key == "deps" || strings.HasPrefix(key, "MMK_") {
+			return nil, nil, fmt.Errorf("option key %q is reserved", key)
+		}
+		opts = append(opts, Option{Key: key, Value: val})
+	}
+	return rest, opts, nil
+}
+
+// parseOptionToken splits a header word into key and value if it has the
+// shape `IDENT=value`. Returns ok=false otherwise.
+func parseOptionToken(word string) (key, val string, ok bool) {
+	eq := strings.IndexByte(word, '=')
+	if eq <= 0 {
+		return "", "", false
+	}
+	if !isOptionKeyPrefix(word[:eq]) {
+		return "", "", false
+	}
+	return word[:eq], word[eq+1:], true
+}
+
+// isOptionKeyPrefix reports whether s is a valid bash variable name (used as
+// an option key).
+func isOptionKeyPrefix(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		switch {
+		case b >= 'A' && b <= 'Z':
+		case b >= 'a' && b <= 'z':
+		case b == '_':
+		case b >= '0' && b <= '9' && i > 0:
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // parseHeader interprets the header token slice as: type? (target|pattern) ('on' runner)?
