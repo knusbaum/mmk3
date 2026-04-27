@@ -111,13 +111,60 @@ type runnerDefBodies struct {
 // builtinRunnerDefs holds the bash bodies for each built-in runner type.
 // These are emitted as __mmk_runner_{setup,run,cleanup}_<type> functions unless
 // the user overrides them with their own defrunner directives.
+// __mmk_skip is the sentinel runner state used when skip_if matched at setup
+// time. The run and cleanup phases short-circuit on it.
+const skipSentinel = "__mmk_skip__"
+
+// skipIfCheck is bash that evaluates the user-supplied skip_if option:
+//
+//	empty   -> don't skip (returns 1)
+//	auto    -> skip if any common in-container signal matches
+//	<bash>  -> evaluate the snippet; skip if it returns 0
+//
+// Emitted at the top of each phase body. Each phase has its own copy because
+// the built-in's bodies are emitted as separate bash functions.
+const skipIfCheck = `	__mmk_skip_check() {
+		case "$skip_if" in
+			"")    return 1 ;;
+			auto)  [ -f /.dockerenv ] || [ -f /run/.containerenv ] \
+					|| [ -n "$KUBERNETES_SERVICE_HOST" ] \
+					|| grep -qE 'docker|containerd' /proc/1/cgroup 2>/dev/null ;;
+			*)     eval "$skip_if" ;;
+		esac
+	}
+`
+
+// userFlag is bash that populates the array __mmk_user with --user flags
+// based on the user= option:
+//
+//	empty   -> no --user flag (image's USER directive applies)
+//	host    -> --user $(id -u):$(id -g) on Linux; nothing on macOS/BSD where
+//	           the host UID typically doesn't exist inside the container
+//	<value> -> --user <value> verbatim
+//
+// Bind-mounted files written from inside the container will be owned by the
+// resulting UID, so `host` is the right choice when the build artifacts are
+// expected to be readable by the developer who started the container.
+const userFlag = `	__mmk_user=()
+	case "$user" in
+		"")    : ;;
+		host)  if [ "$(uname -s)" = "Linux" ]; then __mmk_user=(--user "$(id -u):$(id -g)"); fi ;;
+		*)     __mmk_user=(--user "$user") ;;
+	esac
+`
+
 var builtinRunnerDefs = map[string]runnerDefBodies{
 	"image": {
 		Setup: `
-	name="mmk-$(printf '%s' "$target" | tr -cs 'a-zA-Z0-9' '-')-$$"
+` + skipIfCheck + `	if __mmk_skip_check; then
+		printf '` + skipSentinel + `'
+		return 0
+	fi
+` + userFlag + `	name="mmk-$(printf '%s' "$target" | tr -cs 'a-zA-Z0-9' '-')-$$"
 	docker rm -f "$name" 2>/dev/null || true
 	id=$(docker run -d --rm \
 		${platform:+--platform "$platform"} \
+		"${__mmk_user[@]}" \
 		--name "$name" \
 		-v "$(pwd):/work" \
 		-v "$MMK_GENFILE:/mmk-generated.sh:ro" \
@@ -127,11 +174,15 @@ var builtinRunnerDefs = map[string]runnerDefBodies{
 	printf '%s' "$id"
 `,
 		Run: `
+	if [ "$MMK_RUNNER_STATE" = "` + skipSentinel + `" ]; then
+		target="$MMK_TARGET"; deps="$MMK_DEPS"; eval "$MMK_EXECUTE"
+		return $?
+	fi
 	[ -t 0 ] && tty_flag=-t || tty_flag=
 	__mmk_extra_env=()
 	for __mmk_v in $forward_env; do __mmk_extra_env+=(-e "$__mmk_v"); done
-	docker exec -i $tty_flag \
-		--user "$(id -u):$(id -g)" \
+` + userFlag + `	docker exec -i $tty_flag \
+		"${__mmk_user[@]}" \
 		-e "MMK_TARGET=$MMK_TARGET" \
 		-e "MMK_DEPS=$MMK_DEPS" \
 		-e MMK_EXECUTE \
@@ -140,6 +191,7 @@ var builtinRunnerDefs = map[string]runnerDefBodies{
 		bash -c ". /mmk-generated.sh; target=\"\$MMK_TARGET\"; deps=\"\$MMK_DEPS\"; eval \"\$MMK_EXECUTE\""
 `,
 		Cleanup: `
+	[ "$MMK_RUNNER_STATE" = "` + skipSentinel + `" ] && return 0
 	docker rm -f "$MMK_RUNNER_STATE" 2>/dev/null || true
 `,
 	},

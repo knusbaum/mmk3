@@ -179,6 +179,73 @@ func TestTargetOptionVisibleInBody(t *testing.T) {
 	}
 }
 
+func TestImageUserOptionLiteral(t *testing.T) {
+	// A literal user= value is exposed to the runner-run body as $user.
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.txt")
+	src := fmt.Sprintf(`image fakeimg user=root skip_if=true :
+build on fakeimg {
+    printf '%%s' "$user" > %q
+}
+`, out)
+	b := newBuild(t, src)
+	defer b.Close()
+	if err := b.Prepare("build", ""); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	n, _ := b.Resolve("build")
+	for _, dep := range n.Dependencies() {
+		if dep.kind == kindRunner {
+			if err := dep.Run(); err != nil {
+				t.Fatalf("setup: %v", err)
+			}
+		}
+	}
+	if err := n.Run(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got, _ := os.ReadFile(out)
+	if string(got) != "root" {
+		t.Errorf("got %q, want %q", got, "root")
+	}
+}
+
+func TestImageSkipIfRunsBodyLocally(t *testing.T) {
+	// skip_if=true unconditionally bypasses docker. The body should run via
+	// the runner-run phase's local-eval branch, NOT via docker exec — so this
+	// test passes even with no docker daemon available.
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.txt")
+	src := fmt.Sprintf(`image fakeimg skip_if=true :
+build on fakeimg {
+    printf 'ran' > %q
+}
+`, out)
+	b := newBuild(t, src)
+	defer b.Close()
+	if err := b.Prepare("build", ""); err != nil {
+		t.Fatalf("Prepare: %v", err)
+	}
+	n, _ := b.Resolve("build")
+	for _, dep := range n.Dependencies() {
+		if dep.kind == kindRunner {
+			if err := dep.Run(); err != nil {
+				t.Fatalf("setup: %v", err)
+			}
+		}
+	}
+	if err := n.Run(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if string(got) != "ran" {
+		t.Errorf("body output: got %q, want %q", got, "ran")
+	}
+}
+
 func TestImageOptionShadowedByTargetOption(t *testing.T) {
 	// When an image and a target both set the same option name, the runner-run
 	// phase should see the target's value (last-write-wins on cmd.Env).

@@ -123,15 +123,27 @@ suppress inheritance:
 
 Any rule's header may carry `key=value` annotations. Each option is exported
 as a bash variable to bodies of the rule it's declared on. The built-in
-`image` runner honors two options out of the box:
+`image` runner honors four options out of the box:
 
 - `platform=<platform>` — passed as `--platform` to both `docker build` and
   `docker run`.
 - `forward_env="VAR1 VAR2 …"` — each name is forwarded into `docker exec`
   with `-e <VAR>` so the value is inherited from the surrounding env.
+- `skip_if=<bash>` — bypass docker entirely and run target bodies in the
+  current shell when the snippet returns 0. The magic value `skip_if=auto`
+  expands to a built-in detection of common in-container signals
+  (`/.dockerenv`, `/run/.containerenv`, `$KUBERNETES_SERVICE_HOST`,
+  `/proc/1/cgroup`). Useful when the same mmkfile runs both on a developer
+  laptop and inside a CI job that's already in the build container.
+- `user=<value>` — passed as `--user` to `docker run` and `docker exec`.
+  The magic value `user=host` expands to `$(id -u):$(id -g)` on Linux and
+  to nothing on macOS/BSD (where the host UID typically doesn't exist
+  inside the container). Use it when you want bind-mounted artifacts to
+  end up owned by the developer rather than root.
 
 ```bash
 image winbuild:1 platform=linux/amd64 forward_env="VERSION TAG" : Dockerfile.windows
+image build:1   skip_if=auto                               : .ci/Dockerfile
 
 build on winbuild:1 { cmake --build . }
 ```
