@@ -2,23 +2,25 @@ all : executable
 
 image buildimage:latest : buildcontainer/Dockerfile
 image runimage:latest : othercontainer/Dockerfile
-
 image ubuntu:latest :
+image debian:latest :
 
 file '(.*)\.o' : $1.c {
      cc -c $1.c -o $target
 }
 
-[check '(.*)\.o'] on ubuntu:latest {
-    echo Checking $target
+[check '(.*)\.o'] on debian:latest {
+    cat /etc/os-release
+    echo Doing object file check for $target
 }
 
-#[clean all] on buildimage:latest {
-#    echo ok
-#}
+[check '(.*)\.c'] on ubuntu:latest {
+    cat /etc/os-release
+    echo Doing source check for $target
+}
 
-file executable on buildimage:latest : main.o {
-    cc -o $target main.c
+file executable on buildimage:latest : main.o io.o {
+    cc -o $target main.o io.o
 }
 
 run on runimage:latest : executable {
