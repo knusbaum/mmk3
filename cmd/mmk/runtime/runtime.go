@@ -237,7 +237,11 @@ func NewBuild(src []byte) (*Build, error) {
 	b.genPath = genf.Name()
 	b.genFile = genf
 
-	if err := gen.Generate(genf, f); err != nil {
+	frozen, err := evalPassthroughs(f)
+	if err != nil {
+		frozen = nil // fall back to verbatim passthroughs on error
+	}
+	if err := gen.Generate(genf, f, frozen); err != nil {
 		genf.Close()
 		os.Remove(b.genPath)
 		return nil, err

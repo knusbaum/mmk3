@@ -36,7 +36,7 @@ func generate(t *testing.T, src string) string {
 		t.Fatalf("parse: %v", err)
 	}
 	var sb strings.Builder
-	if err := Generate(&sb, f); err != nil {
+	if err := Generate(&sb, f, nil); err != nil {
 		t.Fatalf("generate: %v", err)
 	}
 	return sb.String()
