@@ -45,16 +45,7 @@ func main() {
 	b.Verbose = *v
 
 	if *list {
-		for _, t := range b.Targets() {
-			fmt.Println(t)
-		}
-		verbs := b.Verbs()
-		if len(verbs) > 0 {
-			fmt.Println()
-			for _, verb := range verbs {
-				fmt.Printf("[%s]\n", verb)
-			}
-		}
+		b.PrintList(os.Stdout)
 		return
 	}
 

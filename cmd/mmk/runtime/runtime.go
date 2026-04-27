@@ -5,6 +5,7 @@ package runtime
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"regexp"
@@ -12,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"text/tabwriter"
 	"time"
 
 	"github.com/knusbaum/mmk3/cmd/mmk/gen"
@@ -1176,6 +1178,131 @@ func appendRuleOptions(env []string, rule *parse.TargetRule) []string {
 		env = append(env, opt.Key+"="+opt.Value)
 	}
 	return env
+}
+
+// PrintList renders a human-readable summary of targets and verbs to w.
+// Targets are grouped into sections with a brief annotation per target
+// (runner, type, or dep list for aggregators). Verbs are listed with the
+// targets each one applies to.
+func (b *Build) PrintList(w io.Writer) {
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "Targets:")
+	for _, name := range b.Targets() {
+		r := b.concretes[name]
+		fmt.Fprintf(tw, "  %s\t%s\n", name, annotateRule(r))
+	}
+	tw.Flush()
+
+	patterns := b.Patterns()
+	if len(patterns) > 0 {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "Patterns:")
+		for _, p := range patterns {
+			fmt.Fprintf(w, "  '%s'\n", p)
+		}
+	}
+
+	verbToTargets := b.verbToTargetsMap()
+	verbPatterns := b.verbToPatternsMap()
+	if len(verbToTargets) > 0 || len(verbPatterns) > 0 {
+		fmt.Fprintln(w)
+		fmt.Fprintln(w, "Verbs (run as `mmk <verb>` or `mmk <verb> <target>`):")
+		tw = tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+		for _, verb := range b.Verbs() {
+			parts := append([]string{}, verbToTargets[verb]...)
+			for _, p := range verbPatterns[verb] {
+				parts = append(parts, "'"+p+"'")
+			}
+			fmt.Fprintf(tw, "  %s\t%s\n", verb, strings.Join(parts, ", "))
+		}
+		tw.Flush()
+	}
+}
+
+// verbToPatternsMap returns each verb's pattern rules.
+func (b *Build) verbToPatternsMap() map[string][]string {
+	out := make(map[string][]string)
+	for _, pe := range b.patterns {
+		if pe.rule.Verb != "" {
+			out[pe.rule.Verb] = append(out[pe.rule.Verb], pe.rule.Pattern)
+		}
+	}
+	for verb, ps := range out {
+		sort.Strings(ps)
+		out[verb] = ps
+	}
+	return out
+}
+
+// annotateRule returns a one-line description of a rule's salient property:
+// its runner, type, or (for aggregators with no body) its dep list.
+func annotateRule(r *parse.TargetRule) string {
+	if r == nil {
+		return ""
+	}
+	switch {
+	case r.Runner != "":
+		s := "on " + r.Runner
+		if r.Type != "" {
+			s = r.Type + " " + s
+		}
+		return s
+	case r.Type != "":
+		return "type: " + r.Type
+	case r.HasDepSep && r.Body == "" && len(r.Deps) > 0:
+		// Aggregator: shows what it pulls in.
+		parts := make([]string, len(r.Deps))
+		for i, d := range r.Deps {
+			if d.Verb != "" {
+				parts[i] = "[" + d.Verb + " " + d.Target + "]"
+			} else {
+				parts[i] = d.Target
+			}
+		}
+		return "→ " + strings.Join(parts, " ")
+	}
+	return ""
+}
+
+// verbToTargetsMap returns a map from verb name to the list of targets that
+// support that verb. A target supports a verb if there's an explicit
+// [verb target] rule, or if the target's type has a defbody for that verb
+// (built-in or user-defined).
+func (b *Build) verbToTargetsMap() map[string][]string {
+	out := make(map[string][]string)
+	add := func(verb, target string) {
+		out[verb] = append(out[verb], target)
+	}
+
+	// Explicit [verb target] rules.
+	for key := range b.verbConcretes {
+		add(key.verb, key.target)
+	}
+	// Type-defbody verbs apply to every target of that type.
+	verbsByType := make(map[string][]string)
+	for vbk := range b.defVerbBodies {
+		verbsByType[vbk.typeName] = append(verbsByType[vbk.typeName], vbk.verb)
+	}
+	for tname, r := range b.concretes {
+		for _, verb := range verbsByType[r.Type] {
+			add(verb, tname)
+		}
+	}
+
+	// Dedupe + sort each verb's target list.
+	for verb, targets := range out {
+		seen := make(map[string]bool, len(targets))
+		uniq := targets[:0]
+		for _, t := range targets {
+			if !seen[t] {
+				seen[t] = true
+				uniq = append(uniq, t)
+			}
+		}
+		sort.Strings(uniq)
+		out[verb] = uniq
+	}
+	return out
 }
 
 // Targets returns the names of all explicitly declared concrete (non-pattern)
