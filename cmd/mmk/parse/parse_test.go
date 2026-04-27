@@ -501,6 +501,34 @@ func TestTargetRuleReservedOptionKey(t *testing.T) {
 	expectError(t, `foo MMK_FOO=x : bar`, "reserved")
 }
 
+func TestVerbRuleAugmentDeps(t *testing.T) {
+	f := mustParse(t, `[clean all] :+ extra1 extra2`)
+	r := asRule(t, f.Directives[0])
+	if r.Verb != "clean" || r.Target != "all" {
+		t.Fatalf("unexpected header: verb=%q target=%q", r.Verb, r.Target)
+	}
+	if !r.HasDepSep {
+		t.Error("HasDepSep: got false, want true")
+	}
+	if !r.AugmentDeps {
+		t.Error("AugmentDeps: got false, want true")
+	}
+	expectDeps(t, r.Deps, "extra1", "extra2")
+}
+
+func TestVerbRuleColonOnly(t *testing.T) {
+	// Plain ':' is not augment.
+	f := mustParse(t, `[clean all] : extra`)
+	r := asRule(t, f.Directives[0])
+	if !r.HasDepSep || r.AugmentDeps {
+		t.Errorf("HasDepSep=%v AugmentDeps=%v; want true,false", r.HasDepSep, r.AugmentDeps)
+	}
+}
+
+func TestAugmentSepRejectedOnNonVerbRule(t *testing.T) {
+	expectError(t, `foo :+ bar`, ":+")
+}
+
 func TestPassthroughVariableAssignmentWithColon(t *testing.T) {
 	// Without the IDENT=... heuristic this gets parsed as a target rule
 	// because of the embedded ':'.

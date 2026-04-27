@@ -107,7 +107,7 @@ Run with `mmk clean all` or `mmk clean prog`.
 
 **Dep inheritance**: A verb rule with no colon inherits its target's dep
 list (with the verb applied to each dep). Use `: ` (colon, empty list) to
-suppress inheritance:
+suppress inheritance, or `:+` to inherit *and* add explicit deps:
 
 ```bash
 # Inherits deps from 'prog' rule, runs clean on each
@@ -117,6 +117,21 @@ suppress inheritance:
 [clean prog] : {
     rm -f prog
 }
+
+# Inherit prog's deps with `clean` applied, AND also add [clean image]
+[clean prog] :+ [clean myimage]
+```
+
+A verb rule's `on <runner>` clause adds the runner as a build-verb dep so
+the body can execute inside it. mmk does **not** automatically apply the
+verb to runners inherited from the default rule — the runner is build
+infrastructure shared across many targets, and propagating verbs to it
+(especially destructive ones like `clean`) would race with consumers.
+Express runner-verb ordering explicitly when you want it:
+
+```bash
+# Run [clean myimage] last, after the consumers' cleanup finishes.
+[clean myimage] : [clean prog] [clean lib]
 ```
 
 ### Rule options (`key=value`)

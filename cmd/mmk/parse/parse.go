@@ -80,11 +80,12 @@ type TargetRule struct {
 	Target  string // concrete name; empty if Pattern is set
 	Pattern string // regex from '...'; empty if Target is set
 	Runner  string // empty if no runner
-	Verb       string   // empty for default build rules
-	HasDepSep  bool     // true if ':' was present (even with empty dep list)
-	Deps       []Dep    // may be nil
-	Options    []Option // key=value annotations from the rule header; preserves source order
-	Body       string   // empty if no body (deps-only rule)
+	Verb        string   // empty for default build rules
+	HasDepSep   bool     // true if ':' was present (even with empty dep list)
+	AugmentDeps bool     // true if ':+' was used: deps inherit AND extend the default rule's deps (verb rules only)
+	Deps        []Dep    // may be nil
+	Options     []Option // key=value annotations from the rule header; preserves source order
+	Body        string   // empty if no body (deps-only rule)
 }
 
 // DefBody defines the default Run body for targets of the given type.
@@ -163,15 +164,16 @@ func isWordByte(b byte) bool {
 }
 
 // colonIsSeparator reports whether the ':' at the current scanner position
-// is the dep-list separator (followed by space, tab, newline, '{', '#', or EOF)
-// rather than an embedded ':' within a name like "image:tag".
+// is the dep-list separator (followed by space, tab, newline, '{', '#', '+',
+// or EOF) rather than an embedded ':' within a name like "image:tag". The '+'
+// case covers the ':+' augment-deps separator on verb rules.
 func (s *scanner) colonIsSeparator() bool {
 	next := s.pos + 1
 	if next >= len(s.src) {
 		return true
 	}
 	switch s.src[next] {
-	case ' ', '\t', '\n', '{', '#', 0:
+	case ' ', '\t', '\n', '{', '#', '+', 0:
 		return true
 	}
 	return false
@@ -756,11 +758,18 @@ func (p *parser) parseTargetRule() (*TargetRule, error) {
 	}
 	rule := &TargetRule{Type: typ, Target: target, Pattern: pattern, Runner: runner, Verb: verb, Options: options}
 
-	// Optional deps after ':'.
+	// Optional deps after ':' (or ':+' for augment-inherit mode on verb rules).
 	p.s.skipHorizontalSpace()
 	if p.s.peek() == ':' {
 		p.s.advance()
 		rule.HasDepSep = true
+		if p.s.peek() == '+' {
+			if rule.Verb == "" {
+				return nil, fmt.Errorf("line %d: ':+' is only valid on verb rules", p.s.line)
+			}
+			p.s.advance()
+			rule.AugmentDeps = true
+		}
 		for {
 			p.s.skipHorizontalSpace()
 			b := p.s.peek()

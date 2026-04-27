@@ -946,7 +946,12 @@ foo :
 	}
 }
 
-func TestVerbInheritancePropagatesRunner(t *testing.T) {
+func TestVerbInheritanceDoesNotPropagateToRunner(t *testing.T) {
+	// A verb-rule whose default rule has `on <runner>` should NOT auto-add
+	// [verb runner] as a dep. The runner is build infrastructure shared
+	// across many targets; propagating verbs to it (especially destructive
+	// ones like clean) causes races. Users who want the runner verb-applied
+	// can do so explicitly via ':+' or by listing it in deps.
 	src := `
 image myimage : {
 	true
@@ -960,17 +965,40 @@ dep :
 		t.Fatalf("ResolveVerb: %v", err)
 	}
 	deps := n.Dependencies()
-	targets := depTargets(deps)
-	found := false
-	for _, name := range targets {
-		if name == "myimage" {
-			found = true
+	for _, d := range deps {
+		if d.target == "myimage" {
+			t.Errorf("did not expect myimage in [clean target] deps; got %v", depTargets(deps))
 		}
 	}
-	if !found {
-		t.Errorf("expected [clean myimage] in deps, got %v", targets)
+}
+
+func TestVerbAugmentDepsCombinesWithInherited(t *testing.T) {
+	// `[verb t] :+ extra` combines explicit deps with the default rule's
+	// inherited deps.
+	src := `
+all : a b
+[clean all] :+ extra
+a :
+b :
+extra :
+`
+	b := newBuild(t, src)
+	n, err := b.ResolveVerb("all", "clean")
+	if err != nil {
+		t.Fatalf("ResolveVerb: %v", err)
+	}
+	got := depTargets(n.Dependencies())
+	want := []string{"extra", "a", "b"}
+	if len(got) != len(want) {
+		t.Fatalf("deps: got %v, want %v", got, want)
+	}
+	for i, name := range want {
+		if got[i] != name {
+			t.Errorf("Deps[%d]: got %q, want %q (full: %v)", i, got[i], name, got)
+		}
 	}
 }
+
 
 func TestVerbPatternBodyRunsWhenDepHasRunner(t *testing.T) {
 	tmp := t.TempDir()

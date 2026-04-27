@@ -606,9 +606,21 @@ func (n *TargetNode) Dependencies() []*TargetNode {
 	return n.deps
 }
 
-// verbDependencies resolves deps for a verb node. If the verb rule has explicit
-// deps, those are used. Otherwise deps are inherited from the default rule with
-// the same verb applied to each.
+// verbDependencies resolves deps for a verb node.
+//
+//   - With ':' (HasDepSep, AugmentDeps=false): the explicit deps replace any
+//     inherited list.
+//   - With ':+' (HasDepSep, AugmentDeps=true): the explicit deps are followed
+//     by the default rule's deps with the verb applied. Lets a verb rule add
+//     a few extras to whatever the target's normal deps are.
+//   - With no separator: the default rule's deps are inherited, verb-applied.
+//
+// Runner deps come only from the verb rule's own `on` clause, never from the
+// default rule's runner. The runner is build infrastructure shared across many
+// targets; auto-propagating verb-on-runner from the default rule causes
+// surprise (and races, when consumers and the runner-verb both end up in the
+// same DAG). Users who want a runner verb-applied as part of an aggregator
+// should list it explicitly via ':+' or in the relevant deps.
 func (n *TargetNode) verbDependencies() []*TargetNode {
 	if n.rule != nil && n.rule.HasDepSep {
 		for _, dep := range n.rule.Deps {
@@ -631,6 +643,9 @@ func (n *TargetNode) verbDependencies() []*TargetNode {
 				n.deps = append(n.deps, depNode)
 			}
 		}
+		if n.rule.AugmentDeps {
+			n.deps = append(n.deps, n.inheritedVerbDeps()...)
+		}
 		if n.rule.Runner != "" {
 			runnerNode, err := n.build.Resolve(n.rule.Runner)
 			if err != nil {
@@ -642,33 +657,7 @@ func (n *TargetNode) verbDependencies() []*TargetNode {
 		return n.deps
 	}
 
-	// Inherit deps from the default rule, applying the same verb to each dep.
-	defaultRule := n.build.concretes[n.target]
-	if defaultRule == nil {
-		// Try to instantiate a pattern rule first.
-		n.build.Resolve(n.target) //nolint — side effect: populates concretes
-		defaultRule = n.build.concretes[n.target]
-	}
-	if defaultRule == nil {
-		return n.deps
-	}
-	for _, dep := range defaultRule.Deps {
-		targets, err := n.build.expandDep(dep.Target)
-		if err != nil {
-			n.resolveErr = err
-			return n.deps
-		}
-		for _, target := range targets {
-			depNode, err := n.build.ResolveVerb(target, n.verb)
-			if err != nil {
-				n.resolveErr = err
-				return n.deps
-			}
-			n.deps = append(n.deps, depNode)
-		}
-	}
-	// If the verb rule itself has a runner, add runner + container for execution.
-	// Otherwise propagate the verb to the default rule's runner (e.g. clean).
+	n.deps = append(n.deps, n.inheritedVerbDeps()...)
 	if n.rule != nil && n.rule.Runner != "" {
 		runnerNode, err := n.build.Resolve(n.rule.Runner)
 		if err != nil {
@@ -676,15 +665,39 @@ func (n *TargetNode) verbDependencies() []*TargetNode {
 			return n.deps
 		}
 		n.deps = append(n.deps, runnerNode, n.build.runnerNode(runnerNode))
-	} else if defaultRule.Runner != "" {
-		runnerNode, err := n.build.ResolveVerb(defaultRule.Runner, n.verb)
-		if err != nil {
-			n.resolveErr = err
-			return n.deps
-		}
-		n.deps = append(n.deps, runnerNode)
 	}
 	return n.deps
+}
+
+// inheritedVerbDeps returns the default rule's deps with this node's verb
+// applied to each. Used both for no-colon inheritance and for ':+' augment.
+func (n *TargetNode) inheritedVerbDeps() []*TargetNode {
+	defaultRule := n.build.concretes[n.target]
+	if defaultRule == nil {
+		// Try to instantiate a pattern rule first.
+		n.build.Resolve(n.target) //nolint — side effect: populates concretes
+		defaultRule = n.build.concretes[n.target]
+	}
+	if defaultRule == nil {
+		return nil
+	}
+	var deps []*TargetNode
+	for _, dep := range defaultRule.Deps {
+		targets, err := n.build.expandDep(dep.Target)
+		if err != nil {
+			n.resolveErr = err
+			return deps
+		}
+		for _, target := range targets {
+			depNode, err := n.build.ResolveVerb(target, n.verb)
+			if err != nil {
+				n.resolveErr = err
+				return deps
+			}
+			deps = append(deps, depNode)
+		}
+	}
+	return deps
 }
 
 // Date returns when the target artifact was last successfully built.
