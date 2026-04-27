@@ -444,6 +444,14 @@ func (p *parser) parseDirectiveOrPassthrough() (Directive, error) {
 		return &Passthrough{Line: line}, nil
 	}
 
+	// A bash variable assignment (IDENT=...) is always passthrough. Without
+	// this, lines like `FOO=value:tag` get parsed as target rules because of
+	// the embedded ':'.
+	if isVarAssignmentPrefix(word) {
+		line := p.readRestOfLine()
+		return &Passthrough{Line: line}, nil
+	}
+
 	// Scan the rest of the line for ':' or '{' to decide whether to commit.
 	if p.lineHasDirectiveMarker() {
 		return p.parseDirective()
@@ -452,6 +460,28 @@ func (p *parser) parseDirectiveOrPassthrough() (Directive, error) {
 	// No marker found — treat the whole line as passthrough bash.
 	line := p.readRestOfLine()
 	return &Passthrough{Line: line}, nil
+}
+
+// isVarAssignmentPrefix reports whether word starts with `IDENT=`, where IDENT
+// is a valid bash variable name. Used to recognise lines that are bash variable
+// assignments and treat them as passthrough rather than target rules.
+func isVarAssignmentPrefix(word string) bool {
+	eq := strings.IndexByte(word, '=')
+	if eq <= 0 {
+		return false
+	}
+	for i := 0; i < eq; i++ {
+		b := word[i]
+		switch {
+		case b >= 'A' && b <= 'Z':
+		case b >= 'a' && b <= 'z':
+		case b == '_':
+		case b >= '0' && b <= '9' && i > 0:
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // firstWordFollowedByParen returns true if the first word on the current line

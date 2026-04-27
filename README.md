@@ -119,22 +119,30 @@ suppress inheritance:
 }
 ```
 
-### Variable expansion in deps
+### Variable expansion in deps, target names, and runners
 
-Variables defined in passthrough bash are available in dep lists:
+Variables defined in passthrough bash are available in dep lists, concrete
+target names, and `on` runner clauses:
 
 ```bash
 SRCS=$(ls *.c)
 OBJS=$(echo $SRCS | sed 's/\.c/.o/g')
+IMG=injector-build:1
 
-file prog : $OBJS {
+image $IMG : Dockerfile
+
+file prog on $IMG : $OBJS {
     gcc -o prog $OBJS
 }
 ```
 
-Word-splitting applies: a variable holding `foo.o bar.o` expands to two
-deps. Only tokens that start with `$` are expanded; literal names are
-used as-is.
+Only tokens that start with `$` are expanded; literal names are used as-is.
+
+For deps, word-splitting applies: a variable holding `foo.o bar.o` expands to
+two deps. For target names and runners, the expansion must produce exactly
+one word — multi-word values are an error.
+
+Pattern target names (single-quoted regexes) are not expanded.
 
 ### Passthrough bash
 

@@ -123,6 +123,53 @@ all : $ITEMS
 	}
 }
 
+func TestVarTargetNameExpansion(t *testing.T) {
+	b := newBuild(t, `
+NAME=resolved-target
+$NAME : {
+    :
+}
+all : $NAME
+`)
+	if _, ok := b.concretes["resolved-target"]; !ok {
+		t.Fatalf("expected concrete %q after $NAME expansion; got %v", "resolved-target", b.Targets())
+	}
+	all, _ := b.Resolve("all")
+	deps := all.Dependencies()
+	if len(deps) != 1 || deps[0].target != "resolved-target" {
+		t.Errorf("deps: got %v, want [resolved-target]", depTargets(deps))
+	}
+}
+
+func TestVarRunnerExpansion(t *testing.T) {
+	b := newBuild(t, `
+IMG=ubuntu
+image $IMG :
+build on $IMG : {
+    :
+}
+`)
+	r := b.concretes["build"]
+	if r == nil {
+		t.Fatalf("expected concrete %q", "build")
+	}
+	if r.Runner != "ubuntu" {
+		t.Errorf("Runner: got %q, want %q", r.Runner, "ubuntu")
+	}
+}
+
+func TestVarTargetNameMultiWordError(t *testing.T) {
+	_, err := NewBuild([]byte(`
+NAMES="a b"
+$NAMES : {
+    :
+}
+`))
+	if err == nil {
+		t.Fatal("expected error for multi-word target-name expansion")
+	}
+}
+
 func TestVarDepExpansionInVerbDeps(t *testing.T) {
 	b := newBuild(t, `
 ITEMS="foo bar"

@@ -500,8 +500,6 @@ These are deliberately deferred:
 - **`-k` / keep-going mode.**
 - **Watch mode.** Re-run on file change.
 - **Content-based fingerprinting.** Bazel/Nix style content hashes.
-- **Variable target names.** Pattern rules require a regex; computed target
-  names from shell variables are not supported.
 
 ---
 

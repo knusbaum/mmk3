@@ -167,12 +167,6 @@ func NewBuild(src []byte) (*Build, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := gen.ValidateDuplicates(f); err != nil {
-		return nil, err
-	}
-	if err := validateDirectives(f); err != nil {
-		return nil, err
-	}
 
 	b := &Build{
 		concretes:     make(map[string]*parse.TargetRule),
@@ -216,29 +210,19 @@ func NewBuild(src []byte) (*Build, error) {
 		}
 	}
 
+	// Register defbodies first; they don't depend on target-name expansion.
 	for _, d := range f.Directives {
-		switch d := d.(type) {
-		case *parse.DefBody:
+		if d, ok := d.(*parse.DefBody); ok {
 			if d.Verb != "" {
 				b.defVerbBodies[defVerbBodyKey{d.Type, d.Verb}] = true
 			} else {
 				b.defBodies[d.Type] = true
 			}
-		case *parse.TargetRule:
-			if d.Pattern != "" {
-				re, err := regexp.Compile(`^(?:` + d.Pattern + `)$`)
-				if err != nil {
-					return nil, fmt.Errorf("pattern %q: %w", d.Pattern, err)
-				}
-				b.patterns = append(b.patterns, &patternEntry{rule: d, re: re})
-			} else if d.Verb != "" {
-				b.verbConcretes[verbNodeKey{d.Target, d.Verb}] = d
-			} else {
-				b.concretes[d.Target] = d
-			}
 		}
 	}
 
+	// Generate the bash script first so target-name and runner expansion can
+	// source it for $VAR lookups.
 	genf, err := os.CreateTemp("", "mmk-generated-*.sh")
 	if err != nil {
 		return nil, err
@@ -254,6 +238,47 @@ func NewBuild(src []byte) (*Build, error) {
 		genf.Close()
 		os.Remove(b.genPath)
 		return nil, err
+	}
+
+	// Expand $VAR in concrete target names and runner clauses before validation
+	// and concrete-rule registration, so the rest of the build sees resolved
+	// names.
+	if err := b.expandRuleNames(f); err != nil {
+		b.genFile.Close()
+		os.Remove(b.genPath)
+		return nil, err
+	}
+
+	if err := gen.ValidateDuplicates(f); err != nil {
+		b.genFile.Close()
+		os.Remove(b.genPath)
+		return nil, err
+	}
+	if err := validateDirectives(f); err != nil {
+		b.genFile.Close()
+		os.Remove(b.genPath)
+		return nil, err
+	}
+
+	// Register concrete and pattern rules.
+	for _, d := range f.Directives {
+		r, ok := d.(*parse.TargetRule)
+		if !ok {
+			continue
+		}
+		if r.Pattern != "" {
+			re, err := regexp.Compile(`^(?:` + r.Pattern + `)$`)
+			if err != nil {
+				b.genFile.Close()
+				os.Remove(b.genPath)
+				return nil, fmt.Errorf("pattern %q: %w", r.Pattern, err)
+			}
+			b.patterns = append(b.patterns, &patternEntry{rule: r, re: re})
+		} else if r.Verb != "" {
+			b.verbConcretes[verbNodeKey{r.Target, r.Verb}] = r
+		} else {
+			b.concretes[r.Target] = r
+		}
 	}
 
 	return b, nil
@@ -909,24 +934,66 @@ func (n *TargetNode) explicitDepNames() []string {
 	return names
 }
 
-// expandDep returns the target names a dep resolves to. If dep starts with '$',
-// it is expanded by sourcing the genfile and letting bash word-split the value.
-// Otherwise it is returned as-is in a single-element slice.
+// expandDep returns the target names a dep resolves to. Tokens that start
+// with '$' are expanded via bash; the result is word-split, so a variable
+// holding multiple space-separated names produces multiple deps.
 func (b *Build) expandDep(dep string) ([]string, error) {
-	if !strings.HasPrefix(dep, "$") {
-		return []string{dep}, nil
+	return b.expandToken(dep, "dep")
+}
+
+// expandToken evaluates a single token by sourcing the genfile in bash and
+// echoing the token, then word-splitting the output. Tokens that don't start
+// with '$' are returned as-is in a single-element slice. Used for dep names,
+// target names, and runner references.
+func (b *Build) expandToken(token, kind string) ([]string, error) {
+	if !strings.HasPrefix(token, "$") {
+		return []string{token}, nil
 	}
-	cmd := exec.Command("bash", "-c", `. "$MMK_GENFILE"; echo `+dep)
+	cmd := exec.Command("bash", "-c", `. "$MMK_GENFILE"; echo `+token)
 	cmd.Env = append(os.Environ(), "MMK_GENFILE="+b.genPath)
 	out, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("expand dep %q: %w", dep, err)
+		return nil, fmt.Errorf("expand %s %q: %w", kind, token, err)
 	}
 	names := strings.Fields(string(out))
 	if len(names) == 0 {
-		return nil, fmt.Errorf("expand dep %q: empty expansion", dep)
+		return nil, fmt.Errorf("expand %s %q: empty expansion", kind, token)
 	}
 	return names, nil
+}
+
+// expandRuleNames mutates each TargetRule in f, expanding $VAR references in
+// its concrete target name and runner clause using bash. Pattern targets are
+// left untouched (their string is a regex). Both Target and Runner must
+// expand to exactly one word.
+func (b *Build) expandRuleNames(f *parse.File) error {
+	for _, d := range f.Directives {
+		r, ok := d.(*parse.TargetRule)
+		if !ok {
+			continue
+		}
+		if r.Pattern == "" && strings.HasPrefix(r.Target, "$") {
+			names, err := b.expandToken(r.Target, "target name")
+			if err != nil {
+				return err
+			}
+			if len(names) != 1 {
+				return fmt.Errorf("target name %q expanded to %d words; must be exactly one", r.Target, len(names))
+			}
+			r.Target = names[0]
+		}
+		if strings.HasPrefix(r.Runner, "$") {
+			names, err := b.expandToken(r.Runner, "runner")
+			if err != nil {
+				return err
+			}
+			if len(names) != 1 {
+				return fmt.Errorf("runner %q expanded to %d words; must be exactly one", r.Runner, len(names))
+			}
+			r.Runner = names[0]
+		}
+	}
+	return nil
 }
 
 // runBash sources generated.sh and evaluates the MMK_EXECUTE snippet.

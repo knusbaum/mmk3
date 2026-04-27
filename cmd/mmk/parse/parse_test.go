@@ -441,6 +441,22 @@ func TestPassthroughVariableAssignment(t *testing.T) {
 	}
 }
 
+func TestPassthroughVariableAssignmentWithColon(t *testing.T) {
+	// Without the IDENT=... heuristic this gets parsed as a target rule
+	// because of the embedded ':'.
+	f := mustParse(t, `IMG=ubuntu:latest`)
+	if len(f.Directives) != 1 {
+		t.Fatalf("expected 1 directive, got %d", len(f.Directives))
+	}
+	pt, ok := f.Directives[0].(*Passthrough)
+	if !ok {
+		t.Fatalf("expected *Passthrough, got %T", f.Directives[0])
+	}
+	if pt.Line != "IMG=ubuntu:latest" {
+		t.Errorf("Line: got %q, want %q", pt.Line, "IMG=ubuntu:latest")
+	}
+}
+
 func TestPassthroughForLoop(t *testing.T) {
 	src := `
 FOO=bar
