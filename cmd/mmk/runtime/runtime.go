@@ -1268,7 +1268,7 @@ func (b *Build) expandSubprojects(f *parse.File) error {
 			path:   path,
 		}
 
-		verbs := harvestVerbs(subFile)
+		verbs := harvestVerbsRecursive(subFile, path)
 
 		// Default-build rule. Use HasDepSep=true to suppress verb dep-inheritance.
 		f.Directives = append(f.Directives, &parse.TargetRule{
@@ -1359,6 +1359,53 @@ func readSubMmkfile(path string) (*parse.File, error) {
 // (for any type the file references) the built-in defbody verbs for that type.
 func harvestVerbs(f *parse.File) []string {
 	verbs := make(map[string]bool)
+	collectVerbsInto(verbs, f)
+	out := make([]string, 0, len(verbs))
+	for v := range verbs {
+		out = append(out, v)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// harvestVerbsRecursive returns the union of verb names declared in f and in
+// every subproject reachable from f. Needed at the parent level so that a
+// verb declared deep in a sub-subproject (e.g. tools/json_to_hardcoded_fb_policies's
+// `[update all]`) gets a top-level [verb tools] rule generated, which then
+// delegates `cd tools && mmk verb` and lets the sub-mmk further delegate.
+func harvestVerbsRecursive(f *parse.File, path string) []string {
+	verbs := make(map[string]bool)
+	collectVerbsInto(verbs, f)
+	for _, d := range f.Directives {
+		sp, ok := d.(*parse.Subproject)
+		if !ok {
+			continue
+		}
+		childPath := filepath.Join(path, sp.Target)
+		for _, opt := range sp.Options {
+			if opt.Key == "path" {
+				childPath = filepath.Join(path, opt.Value)
+			}
+		}
+		childFile, err := readSubMmkfile(childPath)
+		if err != nil {
+			continue // best-effort; missing/broken sub-mmkfile shouldn't break harvest
+		}
+		for _, v := range harvestVerbsRecursive(childFile, childPath) {
+			verbs[v] = true
+		}
+	}
+	out := make([]string, 0, len(verbs))
+	for v := range verbs {
+		out = append(out, v)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// collectVerbsInto adds verb names from f's direct rules and defbodies (plus
+// any built-in verbs implied by used types) into the given set.
+func collectVerbsInto(verbs map[string]bool, f *parse.File) {
 	typesUsed := make(map[string]bool)
 	for _, d := range f.Directives {
 		switch d := d.(type) {
@@ -1380,12 +1427,6 @@ func harvestVerbs(f *parse.File) []string {
 			verbs[verb] = true
 		}
 	}
-	out := make([]string, 0, len(verbs))
-	for v := range verbs {
-		out = append(out, v)
-	}
-	sort.Strings(out)
-	return out
 }
 
 // runBash sources generated.sh and evaluates the MMK_EXECUTE snippet.
