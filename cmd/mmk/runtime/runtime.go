@@ -403,6 +403,29 @@ func (b *Build) runnerNode(runnerTarget *TargetNode) *TargetNode {
 // GenPath returns the path of the generated bash script.
 func (b *Build) GenPath() string { return b.genPath }
 
+// HasVerb reports whether the given verb is defined anywhere visible from
+// this Build — top-level verb rules, verb patterns, defbody verbs, or any
+// (recursively reachable) subproject's verb set. Used to distinguish a typo
+// from a verb that happens not to fire on a particular target.
+func (b *Build) HasVerb(verb string) bool {
+	if verb == "" {
+		return false
+	}
+	for _, v := range b.Verbs() {
+		if v == verb {
+			return true
+		}
+	}
+	for _, s := range b.walkSubprojects() {
+		for _, v := range s.verbs {
+			if v == verb {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // HasTarget reports whether name is a known concrete or pattern-matched target.
 func (b *Build) HasTarget(name string) bool {
 	if _, ok := b.concretes[name]; ok {
@@ -433,6 +456,39 @@ func (b *Build) Prepare(target, verb string) error {
 	return err
 }
 
+// checkVerbApplicable returns an error if root is a verb node and no node in
+// its dependency tree has a non-empty body for that verb. This catches the
+// case where a verb is defined elsewhere in the project but doesn't apply to
+// any target reachable from the requested root — `mmk foop all` where `foop`
+// only has a rule for some target outside `all`'s subtree.
+func checkVerbApplicable(root *TargetNode) error {
+	if root.verb == "" {
+		return nil
+	}
+	if hasApplicableVerbBody(root, make(map[*TargetNode]bool)) {
+		return nil
+	}
+	return fmt.Errorf("verb %q has no applicable rule in the dependency tree of [%s %s]", root.verb, root.verb, root.target)
+}
+
+func hasApplicableVerbBody(n *TargetNode, seen map[*TargetNode]bool) bool {
+	if seen[n] {
+		return false
+	}
+	seen[n] = true
+	if n.verb != "" {
+		if _, has := n.executeScript(); has {
+			return true
+		}
+	}
+	for _, dep := range n.Dependencies() {
+		if hasApplicableVerbBody(dep, seen) {
+			return true
+		}
+	}
+	return false
+}
+
 // Execute builds the DAG rooted at target (optionally qualified by verb) and
 // runs it with the given parallelism. parallelism <= 0 means unlimited.
 // When b.Verbose is true, each target is logged as it runs or is skipped.
@@ -445,6 +501,9 @@ func (b *Build) Execute(target, verb string, parallelism int) error {
 		root, err = b.ResolveVerb(target, verb)
 	}
 	if err != nil {
+		return err
+	}
+	if err := checkVerbApplicable(root); err != nil {
 		return err
 	}
 	if !b.Verbose {

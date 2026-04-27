@@ -21,6 +21,9 @@ func (b *Build) Graph(target, verb string) error {
 	if err != nil {
 		return err
 	}
+	if err := checkVerbApplicable(root); err != nil {
+		return err
+	}
 
 	// First pass: collect all nodes reachable from root via regular deps.
 	// Order-only edges that point outside this set are dropped from the display.

@@ -72,6 +72,11 @@ func main() {
 		os.Exit(1)
 	}
 
+	if verb != "" && !b.HasVerb(verb) {
+		fmt.Fprintf(os.Stderr, "mmk: unknown verb %q\n", verb)
+		os.Exit(1)
+	}
+
 	if *dump {
 		if err := b.Prepare(target, verb); err != nil {
 			fmt.Fprintf(os.Stderr, "mmk: %v\n", err)

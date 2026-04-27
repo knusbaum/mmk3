@@ -1122,6 +1122,55 @@ func TestSubprojectMissingMmkfileErrors(t *testing.T) {
 	}
 }
 
+func TestHasVerbRecognizesDefinedVerbs(t *testing.T) {
+	b := newBuild(t, `
+foo :
+[fmt foo] {
+    :
+}
+`)
+	if !b.HasVerb("fmt") {
+		t.Error("expected HasVerb(\"fmt\") = true")
+	}
+	if b.HasVerb("nonexistent") {
+		t.Error("expected HasVerb(\"nonexistent\") = false")
+	}
+}
+
+func TestExecuteRejectsVerbWithNoApplicableRule(t *testing.T) {
+	// `foop` is defined for `weird`, but not for anything in `all`'s subtree.
+	src := `
+all : foo
+foo :
+weird {
+    :
+}
+[foop weird] {
+    :
+}
+`
+	b := newBuild(t, src)
+	err := b.Execute("all", "foop", 0)
+	if err == nil || !strings.Contains(err.Error(), "no applicable rule") {
+		t.Fatalf("expected 'no applicable rule' error, got %v", err)
+	}
+}
+
+func TestExecuteAllowsVerbWhenAtLeastOneRuleApplies(t *testing.T) {
+	// `clean` only applies to `foo` directly, not via [clean all] explicitly.
+	src := `
+all : foo
+foo :
+[clean foo] {
+    :
+}
+`
+	b := newBuild(t, src)
+	if err := b.Execute("all", "clean", 0); err != nil {
+		t.Errorf("expected verb-inheritance to succeed, got %v", err)
+	}
+}
+
 func TestVerbAugmentDepsCombinesWithInherited(t *testing.T) {
 	// `[verb t] :+ extra` combines explicit deps with the default rule's
 	// inherited deps.
