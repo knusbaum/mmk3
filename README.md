@@ -245,6 +245,47 @@ one word — multi-word values are an error.
 
 Pattern target names (single-quoted regexes) are not expanded.
 
+### Subprojects
+
+A `subproject` directive declares a directory containing its own mmkfile that
+the parent delegates to:
+
+```bash
+subproject src on $DOCKER_IMAGE
+subproject preload_go on $DOCKER_IMAGE
+```
+
+At parse time, mmk reads the subproject's mmkfile, harvests its top-level
+verbs (from explicit `[verb target]` rules, defbody verbs, and built-in
+defbodies for the types it uses), and auto-generates corresponding top-level
+rules:
+
+- `<name>` (default-build) — `(cd <path> && mmk)`.
+- `[<verb> <name>]` for each harvested verb — `(cd <path> && mmk <verb>)`.
+
+So `mmk fmt src` becomes `(cd src && mmk fmt)`, wrapped in the runner clause
+if `on <runner>` was specified. `mmk -list` shows the subproject's verbs as
+if they were declared at the top level.
+
+Sub-targets are addressable via slash syntax:
+
+```
+mmk fmt src/foo            # cd src && mmk fmt foo
+mmk src/lib/util           # cd src && mmk lib/util (recursive subprojects)
+```
+
+Options:
+
+- `path=<dir>` — directory to delegate to, if different from the target name.
+
+Subprojects don't auto-include in `all`'s deps; list them explicitly:
+
+```bash
+all : src preload_go
+subproject src on $DOCKER_IMAGE
+subproject preload_go on $DOCKER_IMAGE
+```
+
 ### Passthrough bash
 
 Any line that is not an mmk directive is passed through verbatim to the

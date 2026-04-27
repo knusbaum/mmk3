@@ -56,7 +56,7 @@ func main() {
 		// defaults
 	case 1:
 		arg := flag.Arg(0)
-		if b.HasTarget(arg) {
+		if b.HasTarget(arg) || b.ResolveSubpath(arg, "") {
 			target = arg
 		} else {
 			verb = arg
@@ -64,6 +64,9 @@ func main() {
 	case 2:
 		verb = flag.Arg(0)
 		target = flag.Arg(1)
+		// If target has the form `subproject/rest`, register a delegating
+		// rule so the rest of the pipeline can resolve it normally.
+		b.ResolveSubpath(target, verb)
 	default:
 		fmt.Fprintf(os.Stderr, "usage: mmk [-j N] [-v] [[verb] target]\n")
 		os.Exit(1)

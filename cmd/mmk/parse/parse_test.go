@@ -501,6 +501,40 @@ func TestTargetRuleReservedOptionKey(t *testing.T) {
 	expectError(t, `foo MMK_FOO=x : bar`, "reserved")
 }
 
+func TestSubprojectBare(t *testing.T) {
+	f := mustParse(t, `subproject src`)
+	if len(f.Directives) != 1 {
+		t.Fatalf("expected 1 directive, got %d", len(f.Directives))
+	}
+	sp, ok := f.Directives[0].(*Subproject)
+	if !ok {
+		t.Fatalf("expected *Subproject, got %T", f.Directives[0])
+	}
+	expect(t, "Target", sp.Target, "src")
+	expect(t, "Runner", sp.Runner, "")
+}
+
+func TestSubprojectWithRunner(t *testing.T) {
+	f := mustParse(t, `subproject src on injector-build:1`)
+	sp := f.Directives[0].(*Subproject)
+	expect(t, "Target", sp.Target, "src")
+	expect(t, "Runner", sp.Runner, "injector-build:1")
+}
+
+func TestSubprojectWithOptions(t *testing.T) {
+	f := mustParse(t, `subproject src path=lib on $IMG`)
+	sp := f.Directives[0].(*Subproject)
+	expect(t, "Target", sp.Target, "src")
+	expect(t, "Runner", sp.Runner, "$IMG")
+	if len(sp.Options) != 1 || sp.Options[0].Key != "path" || sp.Options[0].Value != "lib" {
+		t.Errorf("Options: got %v, want [{path lib}]", sp.Options)
+	}
+}
+
+func TestSubprojectRejectsBody(t *testing.T) {
+	expectError(t, `subproject src { foo }`, "does not take a body")
+}
+
 func TestVerbRuleAugmentDeps(t *testing.T) {
 	f := mustParse(t, `[clean all] :+ extra1 extra2`)
 	r := asRule(t, f.Directives[0])

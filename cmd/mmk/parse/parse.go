@@ -108,11 +108,23 @@ type Passthrough struct {
 	Line string
 }
 
+// Subproject declares a directory containing its own mmkfile that the parent
+// delegates to. Form: `subproject <name> [on <runner>] [key=value ...]`.
+// At runtime mmk reads <name>/mmkfile, harvests its top-level verbs, and
+// auto-generates top-level rules `[verb <name>]` whose bodies cd into the
+// subdir and recursively invoke mmk.
+type Subproject struct {
+	Target  string
+	Runner  string
+	Options []Option
+}
+
 func (*DefType) isDirective()     {}
 func (*DefRunner) isDirective()   {}
 func (*DefBody) isDirective()     {}
 func (*TargetRule) isDirective()  {}
 func (*Passthrough) isDirective() {}
+func (*Subproject) isDirective()  {}
 
 // Parse parses src and returns the AST or an error.
 func Parse(src []byte) (*File, error) {
@@ -458,7 +470,7 @@ func (p *parser) parseDirectiveOrPassthrough() (Directive, error) {
 	word := p.s.readWord()
 	p.s.pos, p.s.line = saved, savedLine
 
-	if word == "deftype" || word == "defrunner" || word == "defbody" {
+	if word == "deftype" || word == "defrunner" || word == "defbody" || word == "subproject" {
 		return p.parseDirective()
 	}
 
@@ -637,6 +649,8 @@ func (p *parser) parseDirective() (Directive, error) {
 		return p.parseDefRunner()
 	case "defbody":
 		return p.parseDefBody()
+	case "subproject":
+		return p.parseSubproject()
 	default:
 		return p.parseTargetRule()
 	}
@@ -750,6 +764,62 @@ func (p *parser) parseDefRunner() (Directive, error) {
 		return nil, err
 	}
 	return &DefRunner{Name: name, Phase: phase, Body: body}, nil
+}
+
+// parseSubproject handles 'subproject NAME [on RUNNER] [key=value ...]'.
+// No body, no deps.
+func (p *parser) parseSubproject() (Directive, error) {
+	p.s.readWord() // consume "subproject"
+	target, err := p.parseName()
+	if err != nil {
+		return nil, fmt.Errorf("subproject: %w", err)
+	}
+	var runner string
+	var options []Option
+	sawOn := false
+	for {
+		p.s.skipHorizontalSpace()
+		b := p.s.peek()
+		if b == 0 || b == '\n' || b == '#' {
+			break
+		}
+		if b == '{' {
+			return nil, fmt.Errorf("line %d: subproject %q does not take a body", p.s.line, target)
+		}
+		if !isWordByte(b) && b != '"' {
+			return nil, fmt.Errorf("line %d: unexpected %q in subproject %q", p.s.line, b, target)
+		}
+		var word string
+		if b == '"' {
+			word, err = p.s.readString()
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			word = p.s.readWord()
+		}
+		if k, v, ok := parseOptionToken(word); ok {
+			if k == "target" || k == "deps" || strings.HasPrefix(k, "MMK_") {
+				return nil, fmt.Errorf("line %d: option key %q is reserved", p.s.line, k)
+			}
+			options = append(options, Option{Key: k, Value: v})
+			continue
+		}
+		if word == "on" {
+			if sawOn {
+				return nil, fmt.Errorf("line %d: subproject %q has multiple 'on' clauses", p.s.line, target)
+			}
+			sawOn = true
+			p.s.skipHorizontalSpace()
+			runner, err = p.parseName()
+			if err != nil {
+				return nil, fmt.Errorf("subproject %q: expected runner after 'on': %w", target, err)
+			}
+			continue
+		}
+		return nil, fmt.Errorf("line %d: unexpected token %q in subproject %q", p.s.line, word, target)
+	}
+	return &Subproject{Target: target, Runner: runner, Options: options}, nil
 }
 
 func (p *parser) parseTargetRule() (*TargetRule, error) {

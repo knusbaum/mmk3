@@ -395,6 +395,8 @@ func Generate(w io.Writer, f *parse.File, frozen []string) error {
 			comment = "defrunner " + d.Name + " " + phase
 		case *parse.TargetRule:
 			continue // target bodies are passed via MMK_EXECUTE at execution time
+		case *parse.Subproject:
+			continue // subproject directives are expanded at runtime into TargetRules
 		}
 
 		body = NormalizeBody(body)

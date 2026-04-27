@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -40,6 +41,16 @@ type defVerbBodyKey struct {
 	verb     string
 }
 
+// subprojectInfo is what the runtime tracks about each `subproject` directive
+// after expansion: the target name (also the registered top-level target),
+// the runner clause to wrap delegations in, and the directory containing the
+// sub-mmkfile.
+type subprojectInfo struct {
+	target string
+	runner string
+	path   string
+}
+
 // Build holds the indexed rules and the generated bash script.
 // Create one with NewBuild; call Close when done to remove the temp script
 // and run cleanup for any runners that were started during the build.
@@ -56,6 +67,7 @@ type Build struct {
 	defBodies          map[string]bool // type name → has default body (built-in or user defbody)
 	defVerbBodies      map[defVerbBodyKey]bool
 	userDefBodyOptions map[defVerbBodyKey][]parse.Option // user defbody options keyed by (type, verb)
+	subprojects        map[string]*subprojectInfo        // subproject target → metadata for sub-path delegation
 	genPath       string
 	genFile       *os.File
 
@@ -220,6 +232,7 @@ func NewBuild(src []byte) (*Build, error) {
 		defBodies:          make(map[string]bool),
 		defVerbBodies:      make(map[defVerbBodyKey]bool),
 		userDefBodyOptions: make(map[defVerbBodyKey][]parse.Option),
+		subprojects:        make(map[string]*subprojectInfo),
 		runnerStates:       make(map[string]string),
 	}
 
@@ -290,6 +303,15 @@ func NewBuild(src []byte) (*Build, error) {
 	// and concrete-rule registration, so the rest of the build sees resolved
 	// names.
 	if err := b.expandRuleNames(f); err != nil {
+		b.genFile.Close()
+		os.Remove(b.genPath)
+		return nil, err
+	}
+
+	// Expand each `subproject` directive: read its sub-mmkfile, harvest verbs,
+	// and append synthetic TargetRules to f.Directives so the existing
+	// validation + registration loop picks them up.
+	if err := b.expandSubprojects(f); err != nil {
 		b.genFile.Close()
 		os.Remove(b.genPath)
 		return nil, err
@@ -1129,6 +1151,182 @@ func (b *Build) expandRuleNames(f *parse.File) error {
 		}
 	}
 	return nil
+}
+
+// expandSubprojects processes each `subproject` directive in f. For each, it
+// expands $VAR in the target/runner names, reads the subproject's mmkfile,
+// harvests its top-level verbs, and appends synthetic TargetRule directives
+// to f so the regular registration loop picks them up.
+//
+// The default-build rule's body is `(cd <path> && mmk)`. Each [verb T] rule's
+// body is `(cd <path> && mmk <verb>)`. The runner clause is propagated.
+//
+// If the subproject's mmkfile is missing, this returns an error — `subproject`
+// declares a contract that there's a sub-mmkfile to delegate to.
+func (b *Build) expandSubprojects(f *parse.File) error {
+	for _, d := range f.Directives {
+		sp, ok := d.(*parse.Subproject)
+		if !ok {
+			continue
+		}
+		if strings.HasPrefix(sp.Target, "$") {
+			names, err := b.expandToken(sp.Target, "subproject target")
+			if err != nil {
+				return err
+			}
+			if len(names) != 1 {
+				return fmt.Errorf("subproject target %q expanded to %d words; must be exactly one", sp.Target, len(names))
+			}
+			sp.Target = names[0]
+		}
+		if strings.HasPrefix(sp.Runner, "$") {
+			names, err := b.expandToken(sp.Runner, "subproject runner")
+			if err != nil {
+				return err
+			}
+			if len(names) != 1 {
+				return fmt.Errorf("subproject runner %q expanded to %d words; must be exactly one", sp.Runner, len(names))
+			}
+			sp.Runner = names[0]
+		}
+
+		// Path defaults to target name; allow override via path= option.
+		path := sp.Target
+		for _, opt := range sp.Options {
+			if opt.Key == "path" {
+				path = opt.Value
+			}
+		}
+
+		subFile, err := readSubMmkfile(path)
+		if err != nil {
+			return fmt.Errorf("subproject %q: %w", sp.Target, err)
+		}
+
+		b.subprojects[sp.Target] = &subprojectInfo{
+			target: sp.Target,
+			runner: sp.Runner,
+			path:   path,
+		}
+
+		verbs := harvestVerbs(subFile)
+
+		// Default-build rule. Use HasDepSep=true to suppress verb dep-inheritance.
+		f.Directives = append(f.Directives, &parse.TargetRule{
+			Target:    sp.Target,
+			Runner:    sp.Runner,
+			HasDepSep: true,
+			Body:      fmt.Sprintf("\n\t(cd %q && mmk)\n", path),
+		})
+
+		// One [verb target] rule per harvested verb.
+		for _, verb := range verbs {
+			f.Directives = append(f.Directives, &parse.TargetRule{
+				Target:    sp.Target,
+				Runner:    sp.Runner,
+				Verb:      verb,
+				HasDepSep: true,
+				Body:      fmt.Sprintf("\n\t(cd %q && mmk %s)\n", path, verb),
+			})
+		}
+	}
+	return nil
+}
+
+// ResolveSubpath checks whether `target` is of the form "<subproject>/<rest>"
+// and, if so, registers a synthetic rule that delegates to the subproject by
+// recursively invoking mmk in the sub-directory. Returns ok=true when a rule
+// was registered (and the caller should continue with normal Resolve(target)).
+//
+// If `target` doesn't have a slash, or its prefix isn't a known subproject,
+// returns ok=false and the caller falls through to normal lookup. Top-level
+// targets that already exist take precedence — registering the same target
+// twice is a duplicate, so we only synthesize when nothing is registered.
+func (b *Build) ResolveSubpath(target, verb string) bool {
+	i := strings.IndexByte(target, '/')
+	if i <= 0 {
+		return false
+	}
+	prefix, suffix := target[:i], target[i+1:]
+	sp, ok := b.subprojects[prefix]
+	if !ok {
+		return false
+	}
+	if verb == "" {
+		if _, exists := b.concretes[target]; exists {
+			return false
+		}
+	} else {
+		if _, exists := b.verbConcretes[verbNodeKey{target, verb}]; exists {
+			return false
+		}
+	}
+	body := fmt.Sprintf("\n\t(cd %q && mmk %s)\n", sp.path, suffix)
+	if verb != "" {
+		body = fmt.Sprintf("\n\t(cd %q && mmk %s %s)\n", sp.path, verb, suffix)
+	}
+	rule := &parse.TargetRule{
+		Target:    target,
+		Verb:      verb,
+		Runner:    sp.runner,
+		HasDepSep: true,
+		Body:      body,
+	}
+	if verb != "" {
+		b.verbConcretes[verbNodeKey{target, verb}] = rule
+	} else {
+		b.concretes[target] = rule
+	}
+	return true
+}
+
+// readSubMmkfile reads <path>/mmkfile or <path>/Mmkfile and returns the parsed AST.
+func readSubMmkfile(path string) (*parse.File, error) {
+	for _, name := range []string{"mmkfile", "Mmkfile"} {
+		p := filepath.Join(path, name)
+		data, err := os.ReadFile(p)
+		if err == nil {
+			return parse.Parse(data)
+		}
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("read %s: %w", p, err)
+		}
+	}
+	return nil, fmt.Errorf("no mmkfile or Mmkfile found in %q", path)
+}
+
+// harvestVerbs walks a parsed sub-mmkfile and returns the unique sorted set
+// of verb names declared in it: explicit [verb T] rules, defbody verbs, and
+// (for any type the file references) the built-in defbody verbs for that type.
+func harvestVerbs(f *parse.File) []string {
+	verbs := make(map[string]bool)
+	typesUsed := make(map[string]bool)
+	for _, d := range f.Directives {
+		switch d := d.(type) {
+		case *parse.TargetRule:
+			if d.Verb != "" {
+				verbs[d.Verb] = true
+			}
+			if d.Type != "" {
+				typesUsed[d.Type] = true
+			}
+		case *parse.DefBody:
+			if d.Verb != "" {
+				verbs[d.Verb] = true
+			}
+		}
+	}
+	for typeName := range typesUsed {
+		for verb := range gen.BuiltinVerbBodies[typeName] {
+			verbs[verb] = true
+		}
+	}
+	out := make([]string, 0, len(verbs))
+	for v := range verbs {
+		out = append(out, v)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // runBash sources generated.sh and evaluates the MMK_EXECUTE snippet.

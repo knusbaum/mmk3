@@ -1016,6 +1016,112 @@ defbody mytype clean order=after-consumers { true }
 	}
 }
 
+func TestSubprojectExpandsToTopLevelRules(t *testing.T) {
+	dir := t.TempDir()
+	subDir := filepath.Join(dir, "sub")
+	if err := os.MkdirAll(subDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// Sub-mmkfile declares a couple verbs and a typed target so we get
+	// the built-in 'clean' verb too.
+	subSrc := `
+all : foo
+file foo :
+[test foo] {
+    :
+}
+[fmt foo] {
+    :
+}
+`
+	if err := os.WriteFile(filepath.Join(subDir, "mmkfile"), []byte(subSrc), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cwd, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(cwd)
+
+	src := `
+all : sub
+subproject sub
+`
+	b := newBuild(t, src)
+
+	// Default-build target was created.
+	if _, ok := b.concretes["sub"]; !ok {
+		t.Fatalf("expected 'sub' in concretes; got %v", b.Targets())
+	}
+	// Verb-rules for the harvested verbs were created.
+	for _, verb := range []string{"clean", "fmt", "test"} {
+		if _, ok := b.verbConcretes[verbNodeKey{"sub", verb}]; !ok {
+			t.Errorf("expected [%s sub] to be registered", verb)
+		}
+	}
+}
+
+func TestSubprojectResolveSubpath(t *testing.T) {
+	dir := t.TempDir()
+	subDir := filepath.Join(dir, "sub")
+	os.MkdirAll(subDir, 0755)
+	subSrc := `
+all : foo
+file foo :
+[fmt foo] {
+    :
+}
+`
+	os.WriteFile(filepath.Join(subDir, "mmkfile"), []byte(subSrc), 0644)
+	cwd, _ := os.Getwd()
+	os.Chdir(dir)
+	defer os.Chdir(cwd)
+
+	b := newBuild(t, `subproject sub`)
+
+	// Default verb: `mmk sub/foo` should register `sub/foo` as a concrete.
+	if !b.ResolveSubpath("sub/foo", "") {
+		t.Fatal("ResolveSubpath returned false for known subproject prefix")
+	}
+	r, ok := b.concretes["sub/foo"]
+	if !ok {
+		t.Fatal("expected synthesized rule for sub/foo")
+	}
+	if !strings.Contains(r.Body, `cd "sub"`) || !strings.Contains(r.Body, "mmk foo") {
+		t.Errorf("body looks wrong: %q", r.Body)
+	}
+
+	// Verb form: `mmk fmt sub/foo`.
+	if !b.ResolveSubpath("sub/foo", "fmt") {
+		t.Fatal("ResolveSubpath returned false for fmt sub/foo")
+	}
+	r2, ok := b.verbConcretes[verbNodeKey{"sub/foo", "fmt"}]
+	if !ok {
+		t.Fatal("expected synthesized [fmt sub/foo] rule")
+	}
+	if !strings.Contains(r2.Body, "mmk fmt foo") {
+		t.Errorf("verb body looks wrong: %q", r2.Body)
+	}
+
+	// Unknown prefix: returns false.
+	if b.ResolveSubpath("not-a-sub/anything", "") {
+		t.Error("ResolveSubpath should return false for unknown prefix")
+	}
+}
+
+func TestSubprojectMissingMmkfileErrors(t *testing.T) {
+	dir := t.TempDir()
+	cwd, _ := os.Getwd()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(cwd)
+	_, err := NewBuild([]byte(`subproject does-not-exist`))
+	if err == nil {
+		t.Fatal("expected error for missing sub-mmkfile")
+	}
+}
+
 func TestVerbAugmentDepsCombinesWithInherited(t *testing.T) {
 	// `[verb t] :+ extra` combines explicit deps with the default rule's
 	// inherited deps.
