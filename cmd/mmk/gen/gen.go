@@ -6,6 +6,7 @@ package gen
 import (
 	"fmt"
 	"io"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -54,13 +55,22 @@ func VerbTargetFunc(verb, target string) string { return "__mmk_verb_" + verb + 
 // DefaultVerbFunc returns the bash function name for a type's default verb body.
 func DefaultVerbFunc(typeName, verb string) string { return "__mmk_default_" + verb + "_" + typeName }
 
+// statMtime is the bash body that prints the target's mtime to stdout.
+// stat's flags differ across platforms: -c %Y (GNU coreutils) vs -f %m (BSD).
+// Pick the right one based on the host OS where mmk runs.
+var statMtime = func() string {
+	if runtime.GOOS == "darwin" || runtime.GOOS == "freebsd" || runtime.GOOS == "openbsd" || runtime.GOOS == "netbsd" {
+		return "\n\tstat -f %m \"$target\" 2>/dev/null || return 1\n"
+	}
+	return "\n\tstat -c %Y \"$target\" 2>/dev/null || return 1\n"
+}()
+
 // BuiltinDefTypes contains the built-in deftype body (bash printing a timestamp)
 // for each built-in type. A user deftype with the same name overrides these.
-// Note: stat -c %Y is GNU coreutils (Linux); macOS users should override with stat -f %m.
 var BuiltinDefTypes = map[string]string{
-	"file":   "\n\tstat -c %Y \"$target\" 2>/dev/null || return 1\n",
+	"file":   statMtime,
 	"image":  "\n\tdocker inspect --format '{{.Created}}' \"$target\" 2>/dev/null || return 1\n",
-	"source": "\n\tstat -c %Y \"$target\" 2>/dev/null || return 1\n",
+	"source": statMtime,
 }
 
 // BuiltinDefBodies contains the built-in default body for each built-in type.
