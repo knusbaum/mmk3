@@ -992,8 +992,13 @@ func isAllDigits(s string) bool {
 // "__mmk_exec() { BODY }; __mmk_exec". The wrapper preserves `return` semantics
 // and lets runners execute the body with `eval "$MMK_EXECUTE"` without needing
 // to know about function naming.
+//
+// `set -x` for verbose mode is enabled inside the function so the trace starts
+// at the user's first command rather than the eval/define noise. Setting it
+// after the function call would be too late; setting it before would trace the
+// eval boundary itself, which is mmk infrastructure the user doesn't care about.
 func wrapExecute(body string) string {
-	return "__mmk_exec() {" + body + "}; __mmk_exec"
+	return `__mmk_exec() { [ -n "$MMK_VERBOSE" ] && set -x;` + body + "}; __mmk_exec"
 }
 
 // nonVerbBody returns the bash body for a non-verb node: the explicit body, a
@@ -1430,7 +1435,7 @@ func collectVerbsInto(verbs map[string]bool, f *parse.File) {
 // When Verbose is set, MMK_VERBOSE=1 is exported and the script enables
 // `set -x` around the eval so the user sees the bash commands being run.
 func (n *TargetNode) runBash(execute string, output bool) error {
-	script := `. "$MMK_GENFILE"; target="$MMK_TARGET"; deps="$MMK_DEPS"; [ -n "$MMK_VERBOSE" ] && set -x; eval "$MMK_EXECUTE"`
+	script := `. "$MMK_GENFILE"; target="$MMK_TARGET"; deps="$MMK_DEPS"; eval "$MMK_EXECUTE"`
 	c := exec.Command("bash", "-c", script)
 	c.Env = append(os.Environ(),
 		"MMK_GENFILE="+n.build.genPath,
