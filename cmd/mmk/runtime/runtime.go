@@ -43,12 +43,31 @@ type defVerbBodyKey struct {
 
 // subprojectInfo is what the runtime tracks about each `subproject` directive
 // after expansion: the target name (also the registered top-level target),
-// the runner clause to wrap delegations in, and the directory containing the
-// sub-mmkfile.
+// the runner clause that becomes the sub-Build's defaultRunner, the directory
+// containing the sub-mmkfile, and the eagerly-constructed sub-Build itself.
+//
+// In merged mode (current model), the sub-Build is part of the parent's
+// resolution chain: parent.Resolve("foo") → sub.Resolve("all") for a
+// subproject named foo. Sub-targets are real nodes in the unified DAG,
+// not opaque shell delegations.
 type subprojectInfo struct {
 	target string
 	runner string
 	path   string
+	build  *Build
+}
+
+// runnerRegistry holds the state for runner setup phases (e.g. container ids)
+// shared across a parent Build and all of its sub-Builds. Without sharing,
+// each Build would do its own `docker run` for the same image, even when
+// nodes from parent and sub use the same runner.
+type runnerRegistry struct {
+	mu     sync.Mutex
+	states map[string]string // runner target name → state from setup stdout
+}
+
+func newRunnerRegistry() *runnerRegistry {
+	return &runnerRegistry{states: map[string]string{}}
 }
 
 // Build holds the indexed rules and the generated bash script.
@@ -71,8 +90,20 @@ type Build struct {
 	genPath       string
 	genFile       *os.File
 
-	runnerStatesMu sync.Mutex
-	runnerStates   map[string]string // runner target name → state from setup stdout
+	// parent is non-nil for sub-Builds. Used for runner image fall-back
+	// resolution and to share genfile context.
+	parent *Build
+	// path is the working directory for this Build's body executions. The
+	// root Build leaves this empty (use os.Getwd at body time); sub-Builds
+	// set it to the subproject path so cmd.Dir gets the right cwd.
+	path string
+	// defaultRunner, if non-empty, fills in the Runner clause on rules that
+	// don't declare their own `on`. Set when the parent declared
+	// `subproject foo on R` — every body in foo's mmkfile should default
+	// to running on R.
+	defaultRunner string
+
+	runners *runnerRegistry
 }
 
 type patternEntry struct {
@@ -233,7 +264,7 @@ func NewBuild(src []byte) (*Build, error) {
 		defVerbBodies:      make(map[defVerbBodyKey]bool),
 		userDefBodyOptions: make(map[defVerbBodyKey][]parse.Option),
 		subprojects:        make(map[string]*subprojectInfo),
-		runnerStates:       make(map[string]string),
+		runners:            newRunnerRegistry(),
 	}
 
 	// Populate runnerDefs from built-in definitions.
@@ -353,12 +384,30 @@ func NewBuild(src []byte) (*Build, error) {
 }
 
 // Close runs cleanup for any runners that were started and removes the
-// temporary generated script.
+// temporary generated script. Sub-Builds share the runner registry with the
+// root, so only the root's Close should run cleanup; sub Closes just remove
+// their genfiles.
 func (b *Build) Close() {
-	b.runnerStatesMu.Lock()
-	states := b.runnerStates
-	b.runnerStates = nil
-	b.runnerStatesMu.Unlock()
+	if b.parent != nil {
+		// Sub-Build: only clean up our own genfile. Runner cleanup is the
+		// root's responsibility.
+		if b.genFile != nil {
+			b.genFile.Close()
+			os.Remove(b.genPath)
+			b.genFile = nil
+		}
+		for _, sp := range b.subprojects {
+			if sp.build != nil {
+				sp.build.Close()
+			}
+		}
+		return
+	}
+
+	b.runners.mu.Lock()
+	states := b.runners.states
+	b.runners.states = nil
+	b.runners.mu.Unlock()
 
 	for runnerTarget, state := range states {
 		rule := b.concretes[runnerTarget]
@@ -927,9 +976,9 @@ func (n *TargetNode) NeedsRun() bool {
 	}
 	if n.kind == kindRunner {
 		// Runner nodes run setup at most once per build per runner target.
-		n.build.runnerStatesMu.Lock()
-		_, started := n.build.runnerStates[n.runnerFor.target]
-		n.build.runnerStatesMu.Unlock()
+		n.build.runners.mu.Lock()
+		_, started := n.build.runners.states[n.runnerFor.target]
+		n.build.runners.mu.Unlock()
 		return !started
 	}
 	if n.rule.Type == "" {
@@ -1076,9 +1125,9 @@ func (n *TargetNode) runWithRunner(execute string) error {
 	}
 	runnerType := runnerNode.rule.Type
 
-	n.build.runnerStatesMu.Lock()
-	state := n.build.runnerStates[runnerNode.target]
-	n.build.runnerStatesMu.Unlock()
+	n.build.runners.mu.Lock()
+	state := n.build.runners.states[runnerNode.target]
+	n.build.runners.mu.Unlock()
 
 	script := `. "$MMK_GENFILE"; ` + gen.RunnerRunFunc(runnerType)
 	cmd := exec.Command("bash", "-c", script)
@@ -1114,9 +1163,9 @@ func (n *TargetNode) runnerSetup() error {
 	info := n.build.runnerDefs[runnerType]
 	if !info.hasSetup {
 		// No setup phase: record empty state so NeedsRun returns false next time.
-		n.build.runnerStatesMu.Lock()
-		n.build.runnerStates[runnerNode.target] = ""
-		n.build.runnerStatesMu.Unlock()
+		n.build.runners.mu.Lock()
+		n.build.runners.states[runnerNode.target] = ""
+		n.build.runners.mu.Unlock()
 		return nil
 	}
 
@@ -1125,9 +1174,9 @@ func (n *TargetNode) runnerSetup() error {
 		return fmt.Errorf("runner setup for %q: %w", runnerNode.target, err)
 	}
 
-	n.build.runnerStatesMu.Lock()
-	n.build.runnerStates[runnerNode.target] = strings.TrimSpace(out)
-	n.build.runnerStatesMu.Unlock()
+	n.build.runners.mu.Lock()
+	n.build.runners.states[runnerNode.target] = strings.TrimSpace(out)
+	n.build.runners.mu.Unlock()
 	return nil
 }
 
