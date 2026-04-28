@@ -165,7 +165,7 @@ func (lw *lineWriter) Write(p []byte) (int, error) {
 		if i < 0 {
 			break
 		}
-		line := string(lw.lineBuf.Bytes()[:i])
+		line := string(bytes.TrimRight(lw.lineBuf.Bytes()[:i], "\r"))
 		lw.lineBuf.Next(i + 1)
 		lw.ring.push(line)
 	}

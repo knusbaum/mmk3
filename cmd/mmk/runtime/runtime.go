@@ -1126,9 +1126,11 @@ func (n *TargetNode) runWithRunner(execute string) error {
 	cmd.Env = appendRuleOptions(cmd.Env, runnerNode.rule)
 	cmd.Env = appendRuleOptions(cmd.Env, n.rule)
 	stdout, stderr := n.bodyWriters()
-	cmd.Stdin = os.Stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
+	if n.build.OutputWriter == nil {
+		cmd.Stdin = os.Stdin
+	}
 	return cmd.Run()
 }
 
@@ -1477,9 +1479,16 @@ func (n *TargetNode) runBash(execute string, output bool) error {
 	c.Env = appendRuleOptions(c.Env, n.rule)
 	if output {
 		stdout, stderr := n.bodyWriters()
-		c.Stdin = os.Stdin
 		c.Stdout = stdout
 		c.Stderr = stderr
+		// Only forward stdin in interactive (default) mode. When OutputWriter is
+		// set, we're running under the TUI: bubbletea owns the terminal, and
+		// passing os.Stdin causes the inner bash to see [ -t 0 ] = true, which
+		// makes the image runner allocate a docker PTY (-t) and emit terminal
+		// control sequences interleaved with normal output.
+		if n.build.OutputWriter == nil {
+			c.Stdin = os.Stdin
+		}
 	}
 	return c.Run()
 }
