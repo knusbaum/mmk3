@@ -5,6 +5,7 @@ image runimage:latest : othercontainer/Dockerfile
 image ubuntu:latest :
 image debian:latest :
 
+
 file '(.*)\.o' : $1.c {
      cc -c $1.c -o $target
 }
@@ -31,3 +32,25 @@ run on runimage:latest : executable {
 shell on runimage:latest : executable {
     PS1='(run shell) $ ' bash -i
 }
+
+file 0 {
+    sleep '0.1';
+    echo hello 0
+    echo 0 > 0
+}
+
+file 1 {
+    sleep '0.1';
+    echo hello 1
+    echo 1 > 1
+}
+
+file '([0-9]+)' on buildimage:latest : $(( $1 - 1 )) $(( $1 - 2 )) {
+    sleep '0.1';
+    echo "fib( $target ) = fib( ${dep[0]} - 1 ) + fib( ${dep[1]} - 2 )"
+    echo "fib( $target ) = `cat ${dep[0]}` + `cat ${dep[1]}`"
+    echo "fib( $target ) = $(( `cat ${dep[0]}` + `cat ${dep[1]}` ))"
+    echo $(( `cat ${dep[0]}` + `cat ${dep[1]}` )) > $target
+    
+}
+

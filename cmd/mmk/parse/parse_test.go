@@ -126,6 +126,25 @@ func TestPatternDepsAreConcreteOrVars(t *testing.T) {
 	expectDeps(t, r.Deps, "$1.c", "$2.c")
 }
 
+func TestDepArithmeticExpansion(t *testing.T) {
+	// $((...)) in dep position must be parsed as a single token.
+	f := mustParse(t, `'([0-9]+)' : $(( $1 - 1 )) $(( $1 - 2 )) {
+	echo $target
+}`)
+	r := asRule(t, f.Directives[0])
+	expectDeps(t, r.Deps, "$(( $1 - 1 ))", "$(( $1 - 2 ))")
+	if r.Body == "" {
+		t.Fatal("expected non-empty body")
+	}
+}
+
+func TestDepCommandSubstitution(t *testing.T) {
+	// $(...) command substitution in dep position is a single token.
+	f := mustParse(t, `all : $(find . -name '*.c')`)
+	r := asRule(t, f.Directives[0])
+	expectDeps(t, r.Deps, "$(find . -name '*.c')")
+}
+
 func TestConcreteTargetUnaffected(t *testing.T) {
 	// Existing concrete target behaviour must not change.
 	f := mustParse(t, `file main.o : main.c lib.h {

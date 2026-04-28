@@ -212,7 +212,7 @@ var builtinRunnerDefs = map[string]runnerDefBodies{
 		-e MMK_VERBOSE \
 		"${__mmk_extra_env[@]}" \
 		"$MMK_RUNNER_STATE" \
-		bash -c ". /mmk-generated.sh; target=\"\$MMK_TARGET\"; deps=\"\$MMK_DEPS\"; eval \"\$MMK_EXECUTE\""
+		bash -c ". /mmk-generated.sh; target=\"\$MMK_TARGET\"; deps=\"\$MMK_DEPS\"; read -ra dep <<< \"\$deps\"; eval \"\$MMK_EXECUTE\""
 `,
 		Cleanup: `
 	[ "$MMK_RUNNER_STATE" = "` + skipSentinel + `" ] && return 0

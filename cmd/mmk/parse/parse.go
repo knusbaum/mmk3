@@ -202,7 +202,11 @@ func (s *scanner) readWord() string {
 	for {
 		b := s.peek()
 		if isWordByte(b) {
+			prev := b
 			sb.WriteByte(s.advance())
+			if prev == '$' && s.peek() == '(' {
+				s.readParensInto(&sb)
+			}
 		} else if b == ':' && !s.colonIsSeparator() {
 			sb.WriteByte(s.advance()) // ':' is part of the name, e.g. "image:tag"
 		} else {
@@ -210,6 +214,28 @@ func (s *scanner) readWord() string {
 		}
 	}
 	return sb.String()
+}
+
+// readParensInto reads a parenthesized sequence (including the outer parens)
+// into sb, tracking depth so nested parens are handled correctly. Used to
+// consume $(...) and $((...)) expressions as part of a word token.
+func (s *scanner) readParensInto(sb *strings.Builder) {
+	depth := 0
+	for {
+		b := s.peek()
+		if b == 0 || b == '\n' {
+			break
+		}
+		if b == '(' {
+			depth++
+		} else if b == ')' {
+			depth--
+		}
+		sb.WriteByte(s.advance())
+		if depth == 0 {
+			break
+		}
+	}
 }
 
 func (s *scanner) readString() (string, error) {
