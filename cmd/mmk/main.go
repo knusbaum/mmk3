@@ -7,6 +7,7 @@ import (
 
 	"github.com/knusbaum/mmk3/cmd/mmk/gen"
 	"github.com/knusbaum/mmk3/cmd/mmk/runtime"
+	"github.com/knusbaum/mmk3/cmd/mmk/tui"
 )
 
 func main() {
@@ -17,6 +18,7 @@ func main() {
 	list := flag.Bool("list", false, "list available targets and verbs, then exit")
 	graph := flag.Bool("graph", false, "print dependency tree for target and exit")
 	full := flag.Bool("full", false, "with -graph, recurse into subprojects (one mmk subprocess per subproject)")
+	useTUI := flag.Bool("tui", false, "render the build as a live TUI tree with status updates")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: mmk [-j N] [-v] [-dump] [-builtins] [-list] [-graph [-full]] [[verb] target]\n")
 		flag.PrintDefaults()
@@ -97,6 +99,14 @@ func main() {
 
 	if *graph {
 		if err := b.Graph(target, verb, *full); err != nil {
+			fmt.Fprintf(os.Stderr, "mmk: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	if *useTUI {
+		if err := tui.Run(b, target, verb, *j); err != nil {
 			fmt.Fprintf(os.Stderr, "mmk: %v\n", err)
 			os.Exit(1)
 		}

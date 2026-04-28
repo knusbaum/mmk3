@@ -47,6 +47,10 @@ type Hooks[T any] struct {
 	OnSkip func(T)
 	// OnRun is called immediately before Run() is invoked on a node.
 	OnRun func(T)
+	// OnFinish is called after a node completes, with the result of Run().
+	// Includes nodes that propagated an upstream error without running.
+	// Not called for skipped nodes — those go through OnSkip and never run.
+	OnFinish func(T, error)
 }
 
 type step[T Node[T]] struct {
@@ -67,6 +71,9 @@ func (s *step[T]) run(sem *Semaphore, h *Hooks[T]) {
 	for _, u := range s.upstream {
 		if err := u.wait(); err != nil {
 			s.status = err
+			if h != nil && h.OnFinish != nil {
+				h.OnFinish(s.n, err)
+			}
 			return
 		}
 	}
@@ -88,6 +95,9 @@ func (s *step[T]) run(sem *Semaphore, h *Hooks[T]) {
 	}
 
 	s.status = s.n.Run()
+	if h != nil && h.OnFinish != nil {
+		h.OnFinish(s.n, s.status)
+	}
 }
 
 // Graph is a fully-resolved execution graph. Build one with Build, then run it with Run.

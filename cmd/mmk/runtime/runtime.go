@@ -57,6 +57,10 @@ type subprojectInfo struct {
 // Set Verbose = true before calling Execute to log each target as it runs or is skipped.
 type Build struct {
 	Verbose       bool
+	// OutputWriter, if non-nil, supplies the stdout/stderr writers for a
+	// node's body execution. Used by the TUI to capture per-node output for
+	// later replay on failure. If nil, body output goes to os.Stdout/Stderr.
+	OutputWriter func(target string, verb string) (stdout, stderr io.Writer)
 	concretes     map[string]*parse.TargetRule
 	verbConcretes map[verbNodeKey]*parse.TargetRule
 	patterns      []*patternEntry
@@ -675,6 +679,29 @@ type TargetNode struct {
 	resolveErr error
 }
 
+// Target returns the target name for this node.
+func (n *TargetNode) Target() string { return n.target }
+
+// Verb returns the verb name for this node, or "" for a non-verb node.
+func (n *TargetNode) Verb() string { return n.verb }
+
+// DisplayDeps returns the regular deps of this node minus runner setup nodes
+// and verb subtrees that contain no executable body. Used by display layers
+// (TUI, future graph variants) to walk the tree the way it'd actually run.
+func (n *TargetNode) DisplayDeps() []*TargetNode {
+	var out []*TargetNode
+	for _, d := range n.Dependencies() {
+		if d.kind == kindRunner {
+			continue
+		}
+		if shouldPruneVerbSubtree(d) {
+			continue
+		}
+		out = append(out, d)
+	}
+	return out
+}
+
 // Dependencies resolves each named dep to a TargetNode, instantiating pattern
 // rules as needed. Targets with `on R` get two implicit deps appended: the
 // runner target R itself (for freshness) and the synthetic runner node for R
@@ -1098,9 +1125,10 @@ func (n *TargetNode) runWithRunner(execute string) error {
 	// os/exec resolves duplicate keys by last-write-wins, so target shadows.
 	cmd.Env = appendRuleOptions(cmd.Env, runnerNode.rule)
 	cmd.Env = appendRuleOptions(cmd.Env, n.rule)
+	stdout, stderr := n.bodyWriters()
 	cmd.Stdin = os.Stdin
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	return cmd.Run()
 }
 
@@ -1448,11 +1476,22 @@ func (n *TargetNode) runBash(execute string, output bool) error {
 	}
 	c.Env = appendRuleOptions(c.Env, n.rule)
 	if output {
+		stdout, stderr := n.bodyWriters()
 		c.Stdin = os.Stdin
-		c.Stdout = os.Stdout
-		c.Stderr = os.Stderr
+		c.Stdout = stdout
+		c.Stderr = stderr
 	}
 	return c.Run()
+}
+
+// bodyWriters returns the (stdout, stderr) writers for this node's body
+// execution. Defaults to os.Stdout/Stderr; the TUI overrides via OutputWriter
+// to capture per-node output.
+func (n *TargetNode) bodyWriters() (io.Writer, io.Writer) {
+	if n.build.OutputWriter != nil {
+		return n.build.OutputWriter(n.target, n.verb)
+	}
+	return os.Stdout, os.Stderr
 }
 
 // runBashOutput is like runBash but captures and returns stdout.
