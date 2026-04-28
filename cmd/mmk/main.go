@@ -16,8 +16,9 @@ func main() {
 	builtins := flag.Bool("builtins", false, "print built-in type definitions as mmk syntax and exit")
 	list := flag.Bool("list", false, "list available targets and verbs, then exit")
 	graph := flag.Bool("graph", false, "print dependency tree for target and exit")
+	full := flag.Bool("full", false, "with -graph, recurse into subprojects (one mmk subprocess per subproject)")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: mmk [-j N] [-v] [-dump] [-builtins] [-list] [-graph] [[verb] target]\n")
+		fmt.Fprintf(os.Stderr, "usage: mmk [-j N] [-v] [-dump] [-builtins] [-list] [-graph [-full]] [[verb] target]\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -92,7 +93,7 @@ func main() {
 	}
 
 	if *graph {
-		if err := b.Graph(target, verb); err != nil {
+		if err := b.Graph(target, verb, *full); err != nil {
 			fmt.Fprintf(os.Stderr, "mmk: %v\n", err)
 			os.Exit(1)
 		}

@@ -1,21 +1,27 @@
 package runtime
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"strings"
 )
 
 // Graph resolves target+verb and prints the dependency tree to stdout.
-func (b *Build) Graph(target, verb string) error {
-	return b.GraphTo(os.Stdout, target, verb)
+// When full is true, subproject delegations are expanded by recursively
+// invoking `mmk -graph -full` in the subproject directory and splicing
+// the result under the delegating node.
+func (b *Build) Graph(target, verb string, full bool) error {
+	return b.GraphTo(os.Stdout, target, verb, full)
 }
 
 // GraphTo is like Graph but writes to an arbitrary io.Writer (useful for tests).
 // Order-only edges (from nodes implementing OrderDependencies) are shown with
 // an "(order)" tag, but only for targets that are independently reachable from
 // the root via regular deps — matching the dag library's actual behavior.
-func (b *Build) GraphTo(w io.Writer, target, verb string) error {
+func (b *Build) GraphTo(w io.Writer, target, verb string, full bool) error {
 	var root *TargetNode
 	var err error
 	if verb == "" {
@@ -45,48 +51,147 @@ func (b *Build) GraphTo(w io.Writer, target, verb string) error {
 	}
 	collect(root)
 
-	visited := make(map[string]bool)
-	visited[nodeKey(root)] = true
+	gp := &graphPrinter{w: w, build: b, inGraph: inGraph, full: full, visited: map[string]bool{}}
+	gp.visited[nodeKey(root)] = true
 	fmt.Fprintln(w, nodeLabel(root))
-	deps := visibleDeps(root, inGraph)
-	for i, dep := range deps {
-		printTreeNode(w, dep, "", i == len(deps)-1, visited, inGraph)
-	}
+	gp.printChildren(root, "")
 	return nil
+}
+
+// graphPrinter carries per-call state for tree rendering (writer, full flag,
+// reachability set, visited cache) so the recursion doesn't need to thread
+// six parameters.
+type graphPrinter struct {
+	w       io.Writer
+	build   *Build
+	inGraph map[*TargetNode]bool
+	full    bool
+	visited map[string]bool
+}
+
+// printChildren renders the visible deps of n under prefix. When -full is set
+// and n is a subproject delegation, the sub-mmk's graph is appended as the
+// last child.
+func (gp *graphPrinter) printChildren(n *TargetNode, prefix string) {
+	deps := visibleDeps(n, gp.inGraph)
+
+	var subOutput string
+	if gp.full {
+		if path, args, ok := gp.build.subprojectDelegate(n.target, n.verb); ok {
+			subOutput = runSubGraph(path, args)
+		}
+	}
+
+	total := len(deps)
+	if subOutput != "" {
+		total++
+	}
+	for i, dep := range deps {
+		gp.printNode(dep, prefix, i == total-1)
+	}
+	if subOutput != "" {
+		spliceSubGraph(gp.w, subOutput, prefix, true)
+	}
+}
+
+func (gp *graphPrinter) printNode(dd displayDep, prefix string, isLast bool) {
+	connector := "├── "
+	childPrefix := prefix + "│   "
+	if isLast {
+		connector = "└── "
+		childPrefix = prefix + "    "
+	}
+	n := dd.node
+	key := nodeKey(n)
+	tag := ""
+	if dd.orderly {
+		tag = " (order)"
+	}
+	if gp.visited[key] {
+		fmt.Fprintf(gp.w, "%s%s%s%s (*)\n", prefix, connector, nodeLabel(n), tag)
+		return
+	}
+	gp.visited[key] = true
+	fmt.Fprintf(gp.w, "%s%s%s%s\n", prefix, connector, nodeLabel(n), tag)
+	gp.printChildren(n, childPrefix)
+}
+
+// runSubGraph invokes `mmk -graph -full <args>` in the given path and returns
+// stdout. The current binary is reused (os.Executable) so a recursive -full
+// from a freshly-built mmk doesn't accidentally pick up an older `mmk` from
+// PATH. Errors are folded into the returned string so the parent's tree
+// rendering doesn't abort on a malformed sub-mmkfile.
+func runSubGraph(path string, args []string) string {
+	exe, err := os.Executable()
+	if err != nil {
+		exe = "mmk"
+	}
+	cmdArgs := append([]string{"-graph", "-full"}, args...)
+	cmd := exec.Command(exe, cmdArgs...)
+	cmd.Dir = path
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	if err := cmd.Run(); err != nil {
+		return fmt.Sprintf("(mmk -graph in %s failed: %v)\n", path, err)
+	}
+	return out.String()
+}
+
+// spliceSubGraph writes sub-mmk graph output as the last child under the
+// caller's prefix. The first line becomes the connector child; subsequent
+// lines get the child's continuation prefix prepended verbatim, since the
+// sub-output already carries its own internal tree formatting.
+func spliceSubGraph(w io.Writer, output, prefix string, isLast bool) {
+	connector := "├── "
+	childPrefix := prefix + "│   "
+	if isLast {
+		connector = "└── "
+		childPrefix = prefix + "    "
+	}
+	lines := strings.Split(strings.TrimRight(output, "\n"), "\n")
+	for i, line := range lines {
+		if i == 0 {
+			fmt.Fprintf(w, "%s%s%s\n", prefix, connector, line)
+		} else {
+			fmt.Fprintf(w, "%s%s\n", childPrefix, line)
+		}
+	}
+}
+
+// subprojectDelegate returns (path, subArgs, ok) for a node that delegates
+// to a subproject — either a root subproject target like "src" or a subpath
+// target like "src/build". subArgs are the positional args to pass to the
+// sub-mmk (verb first if present, then the in-subproject target name).
+func (b *Build) subprojectDelegate(target, verb string) (string, []string, bool) {
+	if sp, ok := b.subprojects[target]; ok {
+		var args []string
+		if verb != "" {
+			args = append(args, verb)
+		}
+		return sp.path, args, true
+	}
+	i := strings.IndexByte(target, '/')
+	if i <= 0 {
+		return "", nil, false
+	}
+	sp, ok := b.subprojects[target[:i]]
+	if !ok {
+		return "", nil, false
+	}
+	suffix := target[i+1:]
+	var args []string
+	if verb != "" {
+		args = append(args, verb)
+	}
+	args = append(args, suffix)
+	return sp.path, args, true
 }
 
 // displayDep wraps a dependency with how it should be rendered.
 type displayDep struct {
 	node    *TargetNode
 	orderly bool // true for order-only edges
-}
-
-func printTreeNode(w io.Writer, dd displayDep, prefix string, isLast bool, visited map[string]bool, inGraph map[*TargetNode]bool) {
-	connector := "├── "
-	if isLast {
-		connector = "└── "
-	}
-	n := dd.node
-	key := nodeKey(n)
-	label := nodeLabel(n)
-	tag := ""
-	if dd.orderly {
-		tag = " (order)"
-	}
-	if visited[key] {
-		fmt.Fprintf(w, "%s%s%s%s (*)\n", prefix, connector, label, tag)
-		return
-	}
-	visited[key] = true
-	fmt.Fprintf(w, "%s%s%s%s\n", prefix, connector, label, tag)
-	childPrefix := prefix + "│   "
-	if isLast {
-		childPrefix = prefix + "    "
-	}
-	deps := visibleDeps(n, inGraph)
-	for i, dep := range deps {
-		printTreeNode(w, dep, childPrefix, i == len(deps)-1, visited, inGraph)
-	}
 }
 
 func nodeLabel(n *TargetNode) string {

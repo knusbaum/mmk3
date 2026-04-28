@@ -1122,6 +1122,40 @@ file foo :
 	if b.ResolveSubpath("not-a-sub/anything", "") {
 		t.Error("ResolveSubpath should return false for unknown prefix")
 	}
+
+	// subprojectDelegate helper: feeds the -graph -full sub-process spawn.
+	cases := []struct {
+		target, verb string
+		wantPath     string
+		wantArgs     []string
+	}{
+		{"sub", "", "sub", nil},
+		{"sub", "fmt", "sub", []string{"fmt"}},
+		{"sub/foo", "", "sub", []string{"foo"}},
+		{"sub/foo", "fmt", "sub", []string{"fmt", "foo"}},
+	}
+	for _, tc := range cases {
+		path, args, ok := b.subprojectDelegate(tc.target, tc.verb)
+		if !ok || path != tc.wantPath || !equalStrSlice(args, tc.wantArgs) {
+			t.Errorf("subprojectDelegate(%q,%q) = (%q, %v, %v); want (%q, %v, true)",
+				tc.target, tc.verb, path, args, ok, tc.wantPath, tc.wantArgs)
+		}
+	}
+	if _, _, ok := b.subprojectDelegate("not-a-sub/foo", ""); ok {
+		t.Error("subprojectDelegate should return ok=false for unknown subproject prefix")
+	}
+}
+
+func equalStrSlice(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestSubprojectMissingMmkfileErrors(t *testing.T) {
@@ -1185,7 +1219,7 @@ bar :
 	b := newBuild(t, src)
 	defer b.Close()
 	var buf strings.Builder
-	if err := b.GraphTo(&buf, "all", "test"); err != nil {
+	if err := b.GraphTo(&buf, "all", "test", false); err != nil {
 		t.Fatalf("Graph: %v", err)
 	}
 	out := buf.String()
