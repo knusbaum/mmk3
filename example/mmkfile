@@ -1,6 +1,6 @@
 all : executable
 
-image buildimage:latest : buildcontainer/Dockerfile
+image buildimage:latest user=host : buildcontainer/Dockerfile
 image runimage:latest : othercontainer/Dockerfile
 image ubuntu:latest :
 image debian:latest :
@@ -24,12 +24,12 @@ file executable on buildimage:latest : main.o io.o {
     cc -o $target main.o io.o
 }
 
-run on runimage:latest : executable {
+run on runimage:latest tty=true : executable {
     ./executable
 }
 
 
-shell on runimage:latest : executable {
+shell on runimage:latest tty=true : executable {
     PS1='(run shell) $ ' bash -i
 }
 
@@ -54,3 +54,12 @@ file '([0-9]+)' on buildimage:latest : $(( $1 - 1 )) $(( $1 - 2 )) {
     
 }
 
+[clean '([0-9]+)'] : [delete $( seq 0 $1 )]
+
+[delete '([0-9]+)'] : {
+    sleep $(( $RANDOM % 5 ));
+    echo rm $target
+    rm -f $target
+}
+
+#[clean '([0-9]+)'] : [delete $( seq 0 $1 )]

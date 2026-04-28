@@ -1216,7 +1216,15 @@ func (n *TargetNode) runWithRunner(execute string) error {
 
 	script := `. "$MMK_GENFILE"; ` + gen.RunnerRunFunc(runnerType)
 	cmd := exec.Command("bash", "-c", script)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// Setpgid only under TUI. Under TUI the user can't Ctrl+C the terminal
+	// (bubbletea raw mode), so SignalAll(-pgid, sig) is the only kill path —
+	// it needs the subprocess to be in its own PG to reach descendants like
+	// docker exec without affecting mmk. Under interactive mode we want
+	// terminal Ctrl+C to cascade to the subprocess naturally, which only
+	// works if it shares mmk's foreground PG.
+	if n.build.OutputWriter != nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	}
 	cmd.Env = append(os.Environ(),
 		"MMK_GENFILE="+n.build.genPath,
 		"target="+runnerNode.target,
@@ -1236,12 +1244,36 @@ func (n *TargetNode) runWithRunner(execute string) error {
 	stdout, stderr := n.bodyWriters()
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
-	if n.build.OutputWriter == nil {
+	// Forward host stdin only when the rule (or its runner image) opts in via
+	// tty=true. Default is /dev/null, so docker exec without -t doesn't try to
+	// read the host terminal. This avoids parallel runner tasks fighting over
+	// terminal state, and keeps interactive shells (tty=true) working.
+	if n.build.OutputWriter == nil && (ttyEnabled(n.rule) || ttyEnabled(runnerNode.rule)) {
 		cmd.Stdin = os.Stdin
 	}
 	n.build.registerCmd(cmd)
 	defer n.build.unregisterCmd(cmd)
 	return cmd.Run()
+}
+
+// ttyEnabled reports whether the rule has a truthy tty= option. A missing or
+// falsy (0/false/no/empty) value returns false; anything else is truthy.
+func ttyEnabled(rule *parse.TargetRule) bool {
+	if rule == nil {
+		return false
+	}
+	for _, opt := range rule.Options {
+		if opt.Key != "tty" {
+			continue
+		}
+		switch opt.Value {
+		case "", "0", "false", "no":
+			return false
+		default:
+			return true
+		}
+	}
+	return false
 }
 
 // runnerSetup runs the setup phase (if any) for the runner type associated
@@ -1580,7 +1612,12 @@ func (n *TargetNode) runBash(execute string, output bool) error {
 	}
 	script := `. "$MMK_GENFILE"; target="$MMK_TARGET"; deps="$MMK_DEPS"; read -ra dep <<< "$deps"; eval "$MMK_EXECUTE"`
 	c := exec.Command("bash", "-c", script)
-	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// See runWithRunner: Setpgid only under TUI so SignalAll-based cancellation
+	// can target the subprocess's PG. Interactive mode shares mmk's PG so
+	// terminal Ctrl+C cascades.
+	if n.build.OutputWriter != nil {
+		c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	}
 	c.Env = append(os.Environ(),
 		"MMK_GENFILE="+n.build.genPath,
 		"MMK_TARGET="+n.target,

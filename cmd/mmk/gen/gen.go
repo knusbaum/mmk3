@@ -193,18 +193,27 @@ var builtinRunnerDefs = map[string]runnerDefBodies{
 		target="$MMK_TARGET"; deps="$MMK_DEPS"; eval "$MMK_EXECUTE"
 		return $?
 	fi
-	[ -t 0 ] && tty_flag=-t || tty_flag=
-	# Snapshot/restore the local terminal state across docker exec. Allocating
-	# a remote PTY (-t) puts the local tty in raw mode; if docker exec exits
-	# abnormally the host shell is left dirty (requiring 'stty sane'). The
-	# EXIT trap also covers signal-driven exits.
-	if [ -n "$tty_flag" ]; then
+	# tty=true on the rule (or runner) opts the body into an in-container PTY
+	# and host stdin forwarding. Used for interactive shells (bash -i) and
+	# anything that needs line editing or TTY-detection. Default is no -t:
+	# build/clean tasks don't need a PTY, and parallel -t calls would fight
+	# over host terminal mode.
+	__mmk_tty_flag=
+	case "$tty" in
+		""|0|false|no) ;;
+		*) __mmk_tty_flag=-t ;;
+	esac
+	if [ -n "$__mmk_tty_flag" ]; then
+		# Snapshot/restore the local terminal state. Allocating a remote PTY
+		# puts the local tty in raw mode; if docker exec exits abnormally the
+		# host shell would be left dirty (requiring 'stty sane'). The EXIT
+		# trap also covers signal-driven exits.
 		__mmk_tty_save=$(stty -g 2>/dev/null) || __mmk_tty_save=
 		[ -n "$__mmk_tty_save" ] && trap 'stty "$__mmk_tty_save" 2>/dev/null' EXIT
 	fi
 	__mmk_extra_env=()
 	for __mmk_v in $forward_env; do __mmk_extra_env+=(-e "$__mmk_v"); done
-` + userFlag + `	docker exec -i $tty_flag \
+` + userFlag + `	docker exec -i $__mmk_tty_flag \
 		"${__mmk_user[@]}" \
 		-e "MMK_TARGET=$MMK_TARGET" \
 		-e "MMK_DEPS=$MMK_DEPS" \
