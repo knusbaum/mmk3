@@ -628,6 +628,10 @@ func (b *Build) findRuleForVerb(target, verb string) *parse.TargetRule {
 			Runner:    pe.rule.Runner,
 			HasDepSep: pe.rule.HasDepSep,
 			Body:      substituteCaptures(pe.rule.Body, captures),
+			// Preserve the source pattern regex so display layers can group
+			// children that came from the same pattern (the typical "huge .o
+			// fan-out" case worth collapsing in a tree view).
+			Pattern: pe.rule.Pattern,
 		}
 		for _, dep := range pe.rule.Deps {
 			instantiated.Deps = append(instantiated.Deps, parse.Dep{
@@ -684,6 +688,16 @@ func (n *TargetNode) Target() string { return n.target }
 
 // Verb returns the verb name for this node, or "" for a non-verb node.
 func (n *TargetNode) Verb() string { return n.verb }
+
+// SourcePattern returns the source pattern regex string if this node was
+// instantiated from a pattern rule, or "" if it has a concrete rule. Used
+// by display layers to group nodes that came from the same pattern.
+func (n *TargetNode) SourcePattern() string {
+	if n.rule == nil {
+		return ""
+	}
+	return n.rule.Pattern
+}
 
 // DisplayDeps returns the regular deps of this node minus runner setup nodes
 // and verb subtrees that contain no executable body. Used by display layers

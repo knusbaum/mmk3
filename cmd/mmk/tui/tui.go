@@ -182,9 +182,18 @@ func (lw *lineWriter) Write(p []byte) (int, error) {
 
 type treeLine struct {
 	prefix string // ASCII tree prefix to print before the icon
-	label  string // node label (target / [verb target])
-	key    string // nodeKey for status lookup
+	label  string // node label; for groups, the pattern source for display
+	key    string // nodeKey for status lookup; empty for groups
+
+	// When non-empty, this line represents a collapsed group of nodes that
+	// all came from the same pattern rule. The View aggregates statuses by
+	// looking these up in m.statuses and rendering counts.
+	groupKeys []string
 }
+
+// collapseThreshold is the minimum group size that triggers collapsing a set
+// of pattern-instantiated siblings into a single line.
+const collapseThreshold = 10
 
 type treeData struct {
 	rootLabel string
@@ -200,10 +209,90 @@ func buildTree(root *runtime.TargetNode) treeData {
 		rootNode:  root,
 	}
 	visited := map[string]bool{t.rootKey: true}
-	for i, dep := range root.DisplayDeps() {
-		appendChild(&t, dep, "", i == len(root.DisplayDeps())-1, visited)
-	}
+	emitChildren(&t, root.DisplayDeps(), "", visited)
 	return t
+}
+
+// emitChildren renders the deps of a node, collapsing any group of >10
+// pattern-instantiated siblings (sharing pattern + verb) into a single line.
+func emitChildren(t *treeData, children []*runtime.TargetNode, prefix string, visited map[string]bool) {
+	items := groupChildren(children)
+	for i, it := range items {
+		isLast := i == len(items)-1
+		if it.isGroup {
+			emitGroup(t, it, prefix, isLast)
+			continue
+		}
+		appendChild(t, it.node, prefix, isLast, visited)
+	}
+}
+
+type childItem struct {
+	node    *runtime.TargetNode // individual line if non-nil
+	isGroup bool
+	pattern string
+	verb    string
+	members []*runtime.TargetNode // group members
+}
+
+// groupChildren returns the display order of `children`: individual nodes
+// where they come, and one entry per group of >threshold pattern-siblings
+// (placed at the position of the first sibling). Mixed pattern + concrete
+// siblings preserve their original order; the group collapses in place.
+func groupChildren(children []*runtime.TargetNode) []childItem {
+	counts := map[string]int{}
+	for _, c := range children {
+		if p := c.SourcePattern(); p != "" {
+			counts[c.Verb()+"\x00"+p]++
+		}
+	}
+	rendered := map[string]bool{}
+	var out []childItem
+	for _, c := range children {
+		p := c.SourcePattern()
+		if p == "" || counts[c.Verb()+"\x00"+p] <= collapseThreshold {
+			out = append(out, childItem{node: c})
+			continue
+		}
+		key := c.Verb() + "\x00" + p
+		if rendered[key] {
+			continue
+		}
+		rendered[key] = true
+		var members []*runtime.TargetNode
+		for _, c2 := range children {
+			if c2.SourcePattern() == p && c2.Verb() == c.Verb() {
+				members = append(members, c2)
+			}
+		}
+		out = append(out, childItem{
+			isGroup: true,
+			pattern: p,
+			verb:    c.Verb(),
+			members: members,
+		})
+	}
+	return out
+}
+
+func emitGroup(t *treeData, it childItem, prefix string, isLast bool) {
+	connector := "├── "
+	if isLast {
+		connector = "└── "
+	}
+	keys := make([]string, len(it.members))
+	for i, m := range it.members {
+		keys[i] = nodeKey(m.Target(), m.Verb())
+	}
+	label := fmt.Sprintf("'%s' × %d", it.pattern, len(it.members))
+	if it.verb != "" {
+		label = fmt.Sprintf("[%s '%s'] × %d", it.verb, it.pattern, len(it.members))
+	}
+	t.lines = append(t.lines, treeLine{
+		prefix:    prefix + connector,
+		label:     label,
+		groupKeys: keys,
+	})
 }
 
 func appendChild(t *treeData, n *runtime.TargetNode, prefix string, isLast bool, visited map[string]bool) {
@@ -228,10 +317,7 @@ func appendChild(t *treeData, n *runtime.TargetNode, prefix string, isLast bool,
 		return
 	}
 	visited[key] = true
-	deps := n.DisplayDeps()
-	for i, dep := range deps {
-		appendChild(t, dep, childPrefix, i == len(deps)-1, visited)
-	}
+	emitChildren(t, n.DisplayDeps(), childPrefix, visited)
 }
 
 func nodeLabel(n *runtime.TargetNode) string {
@@ -279,7 +365,12 @@ func initialModel(t treeData, ring *logRing) model {
 	}
 	m.statuses[t.rootKey] = statusPending
 	for _, ln := range t.lines {
-		m.statuses[ln.key] = statusPending
+		if ln.key != "" {
+			m.statuses[ln.key] = statusPending
+		}
+		for _, gk := range ln.groupKeys {
+			m.statuses[gk] = statusPending
+		}
 	}
 	return m
 }
@@ -376,6 +467,11 @@ func (m model) render(final bool) string {
 	rootIcon, rootStyle := iconAndStyle(m.statuses[m.tree.rootKey])
 	fmt.Fprintf(&b, "%s %s\n", rootIcon, rootStyle.Render(m.tree.rootLabel))
 	for _, ln := range m.tree.lines {
+		if len(ln.groupKeys) > 0 {
+			icon, label := m.renderGroup(ln)
+			fmt.Fprintf(&b, "%s%s %s\n", ln.prefix, icon, label)
+			continue
+		}
 		icon, st := iconAndStyle(m.statuses[ln.key])
 		fmt.Fprintf(&b, "%s%s %s\n", ln.prefix, icon, st.Render(ln.label))
 	}
@@ -434,6 +530,60 @@ func failureLabel(f failure) string {
 		return fmt.Sprintf("[%s %s]", f.verb, f.target)
 	}
 	return f.target
+}
+
+// renderGroup returns the leading icon and the styled label for a collapsed
+// group line. The aggregate icon reflects the "worst" state — failed wins
+// over running wins over pending wins over done/skipped — and the label
+// appends counts for each non-zero state.
+func (m model) renderGroup(ln treeLine) (string, string) {
+	var pending, running, done, skipped, failed int
+	for _, k := range ln.groupKeys {
+		switch m.statuses[k] {
+		case statusRunning:
+			running++
+		case statusDone:
+			done++
+		case statusSkipped:
+			skipped++
+		case statusFailed:
+			failed++
+		default:
+			pending++
+		}
+	}
+	agg := statusPending
+	switch {
+	case failed > 0:
+		agg = statusFailed
+	case running > 0:
+		agg = statusRunning
+	case pending == 0 && (done > 0 || skipped > 0):
+		if done == 0 {
+			agg = statusSkipped
+		} else {
+			agg = statusDone
+		}
+	}
+	icon, _ := iconAndStyle(agg)
+
+	parts := []string{ln.label}
+	if done > 0 {
+		parts = append(parts, doneStyle.Render(fmt.Sprintf("✓%d", done)))
+	}
+	if running > 0 {
+		parts = append(parts, runningStyle.Render(fmt.Sprintf("●%d", running)))
+	}
+	if failed > 0 {
+		parts = append(parts, failedStyle.Render(fmt.Sprintf("✗%d", failed)))
+	}
+	if skipped > 0 {
+		parts = append(parts, skippedStyle.Render(fmt.Sprintf("≡%d", skipped)))
+	}
+	if pending > 0 {
+		parts = append(parts, pendingStyle.Render(fmt.Sprintf("○%d", pending)))
+	}
+	return icon, strings.Join(parts, " ")
 }
 
 func iconAndStyle(s status) (string, lipgloss.Style) {
