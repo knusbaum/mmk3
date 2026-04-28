@@ -19,7 +19,12 @@ const (
 // assignments and function definitions. These replace all passthrough lines
 // in the generated script so they execute exactly once at build time rather
 // than once per task. Returns nil if there are no passthrough directives.
-func evalPassthroughs(f *parse.File) ([]string, error) {
+//
+// cwd, when non-empty, is the working directory for the bash subprocess —
+// matters when passthroughs use $(pwd) or relative paths in globs (sub-Builds
+// pass their absolute path so $INJECTOR_OBJ etc. resolve against the right
+// directory).
+func evalPassthroughs(f *parse.File, cwd string) ([]string, error) {
 	var ptLines []string
 	for _, d := range f.Directives {
 		if p, ok := d.(*parse.Passthrough); ok {
@@ -29,7 +34,11 @@ func evalPassthroughs(f *parse.File) ([]string, error) {
 	if len(ptLines) == 0 {
 		return nil, nil
 	}
-	out, err := exec.Command("bash", "-c", buildEvalScript(ptLines)).Output()
+	cmd := exec.Command("bash", "-c", buildEvalScript(ptLines))
+	if cwd != "" {
+		cmd.Dir = cwd
+	}
+	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("evaluate passthroughs: %w", err)
 	}

@@ -182,7 +182,7 @@ var builtinRunnerDefs = map[string]runnerDefBodies{
 		"${__mmk_user[@]}" \
 		--name "$name" \
 		-v "$(pwd):/work" \
-		-v "$MMK_GENFILE:/mmk-generated.sh:ro" \
+		-v /tmp/mmk-genfiles:/tmp/mmk-genfiles:ro \
 		-w /work \
 		"$target" \
 		sleep infinity)
@@ -205,14 +205,16 @@ var builtinRunnerDefs = map[string]runnerDefBodies{
 	__mmk_extra_env=()
 	for __mmk_v in $forward_env; do __mmk_extra_env+=(-e "$__mmk_v"); done
 ` + userFlag + `	docker exec -i $tty_flag \
+		-w "/work${MMK_BUILD_PATH:+/$MMK_BUILD_PATH}" \
 		"${__mmk_user[@]}" \
 		-e "MMK_TARGET=$MMK_TARGET" \
 		-e "MMK_DEPS=$MMK_DEPS" \
 		-e MMK_EXECUTE \
 		-e MMK_VERBOSE \
+		-e "MMK_GENFILE=$MMK_GENFILE" \
 		"${__mmk_extra_env[@]}" \
 		"$MMK_RUNNER_STATE" \
-		bash -c ". /mmk-generated.sh; target=\"\$MMK_TARGET\"; deps=\"\$MMK_DEPS\"; eval \"\$MMK_EXECUTE\""
+		bash -c ". \"\$MMK_GENFILE\"; target=\"\$MMK_TARGET\"; deps=\"\$MMK_DEPS\"; eval \"\$MMK_EXECUTE\""
 `,
 		Cleanup: `
 	[ "$MMK_RUNNER_STATE" = "` + skipSentinel + `" ] && return 0

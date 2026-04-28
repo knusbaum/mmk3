@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -51,8 +52,8 @@ func (b *Build) GraphTo(w io.Writer, target, verb string, full bool) error {
 	}
 	collect(root)
 
-	gp := &graphPrinter{w: w, build: b, inGraph: inGraph, full: full, visited: map[string]bool{}}
-	gp.visited[nodeKey(root)] = true
+	gp := &graphPrinter{w: w, build: b, inGraph: inGraph, full: full, visited: map[*TargetNode]bool{}}
+	gp.visited[root] = true
 	fmt.Fprintln(w, nodeLabel(root))
 	gp.printChildren(root, "")
 	return nil
@@ -66,7 +67,9 @@ type graphPrinter struct {
 	build   *Build
 	inGraph map[*TargetNode]bool
 	full    bool
-	visited map[string]bool
+	// visited is keyed by node pointer. Target+verb is no longer unique once
+	// merged sub-Builds put two "all" targets in the same DAG (one per sub).
+	visited map[*TargetNode]bool
 }
 
 // printChildren renders the visible deps of n under prefix. When -full is set
@@ -102,16 +105,15 @@ func (gp *graphPrinter) printNode(dd displayDep, prefix string, isLast bool) {
 		childPrefix = prefix + "    "
 	}
 	n := dd.node
-	key := nodeKey(n)
 	tag := ""
 	if dd.orderly {
 		tag = " (order)"
 	}
-	if gp.visited[key] {
+	if gp.visited[n] {
 		fmt.Fprintf(gp.w, "%s%s%s%s (*)\n", prefix, connector, nodeLabel(n), tag)
 		return
 	}
-	gp.visited[key] = true
+	gp.visited[n] = true
 	fmt.Fprintf(gp.w, "%s%s%s%s\n", prefix, connector, nodeLabel(n), tag)
 	gp.printChildren(n, childPrefix)
 }
@@ -196,8 +198,19 @@ type displayDep struct {
 	orderly bool // true for order-only edges
 }
 
+// nodeLabel renders a node's display name. Sub-Build nodes whose target is
+// "all" are shown by their subproject's directory basename (e.g.
+// "preload_go" instead of the intrinsic "all"), matching how the parent's
+// mmkfile referenced them. Other sub-Build nodes display their intrinsic
+// name and pick up the surrounding tree context for disambiguation.
 func nodeLabel(n *TargetNode) string {
+	if n.verb == "" && n.target == "all" && n.build != nil && n.build.parent != nil {
+		return filepath.Base(n.build.path)
+	}
 	if n.verb != "" {
+		if n.target == "all" && n.build != nil && n.build.parent != nil {
+			return "[" + n.verb + " " + filepath.Base(n.build.path) + "]"
+		}
 		return "[" + n.verb + " " + n.target + "]"
 	}
 	return n.target

@@ -1064,14 +1064,17 @@ subproject sub
 `
 	b := newBuild(t, src)
 
-	// Default-build target was created.
-	if _, ok := b.concretes["sub"]; !ok {
-		t.Fatalf("expected 'sub' in concretes; got %v", b.Targets())
+	// In merged mode the sub-Build is registered under b.subprojects rather
+	// than as a synthetic concrete rule.
+	sp, ok := b.subprojects["sub"]
+	if !ok || sp.build == nil {
+		t.Fatalf("expected sub-Build registered under subprojects['sub']; got %v", b.subprojects)
 	}
-	// Verb-rules for the harvested verbs were created.
+	// HasVerb walks into sub-Builds, so verbs declared in the sub are
+	// visible from the parent.
 	for _, verb := range []string{"clean", "fmt", "test"} {
-		if _, ok := b.verbConcretes[verbNodeKey{"sub", verb}]; !ok {
-			t.Errorf("expected [%s sub] to be registered", verb)
+		if !b.HasVerb(verb) {
+			t.Errorf("expected verb %q to be visible via parent.HasVerb", verb)
 		}
 	}
 }
@@ -1094,69 +1097,37 @@ file foo :
 
 	b := newBuild(t, `subproject sub`)
 
-	// Default verb: `mmk sub/foo` should register `sub/foo` as a concrete.
+	// In merged mode, "sub/foo" resolves to the sub-Build's "foo" target.
+	// ResolveSubpath is now a read-only probe.
 	if !b.ResolveSubpath("sub/foo", "") {
 		t.Fatal("ResolveSubpath returned false for known subproject prefix")
 	}
-	r, ok := b.concretes["sub/foo"]
-	if !ok {
-		t.Fatal("expected synthesized rule for sub/foo")
+	n, err := b.Resolve("sub/foo")
+	if err != nil {
+		t.Fatalf("Resolve sub/foo: %v", err)
 	}
-	if !strings.Contains(r.Body, `cd "sub"`) || !strings.Contains(r.Body, "mmk foo") {
-		t.Errorf("body looks wrong: %q", r.Body)
+	if n.target != "foo" || n.build != b.subprojects["sub"].build {
+		t.Errorf("expected sub-Build's foo node; got target=%q build=%p sub=%p", n.target, n.build, b.subprojects["sub"].build)
 	}
 
-	// Verb form: `mmk fmt sub/foo`.
+	// Verb form: `[fmt sub/foo]` resolves into sub-Build.
 	if !b.ResolveSubpath("sub/foo", "fmt") {
 		t.Fatal("ResolveSubpath returned false for fmt sub/foo")
 	}
-	r2, ok := b.verbConcretes[verbNodeKey{"sub/foo", "fmt"}]
-	if !ok {
-		t.Fatal("expected synthesized [fmt sub/foo] rule")
+	vn, err := b.ResolveVerb("sub/foo", "fmt")
+	if err != nil {
+		t.Fatalf("ResolveVerb fmt sub/foo: %v", err)
 	}
-	if !strings.Contains(r2.Body, "mmk fmt foo") {
-		t.Errorf("verb body looks wrong: %q", r2.Body)
+	if vn.target != "foo" || vn.verb != "fmt" {
+		t.Errorf("expected [fmt foo] in sub; got target=%q verb=%q", vn.target, vn.verb)
 	}
 
 	// Unknown prefix: returns false.
 	if b.ResolveSubpath("not-a-sub/anything", "") {
 		t.Error("ResolveSubpath should return false for unknown prefix")
 	}
-
-	// subprojectDelegate helper: feeds the -graph -full sub-process spawn.
-	cases := []struct {
-		target, verb string
-		wantPath     string
-		wantArgs     []string
-	}{
-		{"sub", "", "sub", nil},
-		{"sub", "fmt", "sub", []string{"fmt"}},
-		{"sub/foo", "", "sub", []string{"foo"}},
-		{"sub/foo", "fmt", "sub", []string{"fmt", "foo"}},
-	}
-	for _, tc := range cases {
-		path, args, ok := b.subprojectDelegate(tc.target, tc.verb)
-		if !ok || path != tc.wantPath || !equalStrSlice(args, tc.wantArgs) {
-			t.Errorf("subprojectDelegate(%q,%q) = (%q, %v, %v); want (%q, %v, true)",
-				tc.target, tc.verb, path, args, ok, tc.wantPath, tc.wantArgs)
-		}
-	}
-	if _, _, ok := b.subprojectDelegate("not-a-sub/foo", ""); ok {
-		t.Error("subprojectDelegate should return ok=false for unknown subproject prefix")
-	}
 }
 
-func equalStrSlice(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
 
 func TestSubprojectMissingMmkfileErrors(t *testing.T) {
 	dir := t.TempDir()

@@ -22,6 +22,13 @@ import (
 	"github.com/knusbaum/mmk3/dag"
 )
 
+// genfileDir is the host directory where all Builds in this process write
+// their generated bash scripts. The image runner mounts this path 1:1 into
+// the container so bodies can source $MMK_GENFILE by its host path. A
+// dedicated dir (rather than /tmp itself) keeps the rest of /tmp writable
+// inside the container.
+const genfileDir = "/tmp/mmk-genfiles"
+
 // runnerDefInfo records which optional phases a runner type has defined.
 // The run phase is always assumed present for any type in Build.runnerDefs.
 type runnerDefInfo struct {
@@ -245,9 +252,31 @@ func validateOrderOption(options []parse.Option, ctx, typeName string, validRunn
 	return nil
 }
 
+// BuildOption configures a Build during construction. Used by sub-Build
+// construction to inject a path or parent reference before subproject
+// expansion runs (which needs the path to resolve sub-mmkfile locations).
+type BuildOption func(*Build)
+
+// WithPath sets the absolute filesystem path for this Build. Used by
+// expandSubprojects to root sub-Builds at the right directory so their own
+// subproject expansions can read sub-sub-mmkfiles from disk.
+func WithPath(p string) BuildOption {
+	return func(b *Build) { b.path = p }
+}
+
+// WithDefaultRunner sets the runner that fills in rules with no explicit
+// `on` clause. Set on sub-Builds whose parent declared `subproject foo on R`.
+// Must be set before NewBuild's body runs so passthrough freezing logic can
+// see it.
+func WithDefaultRunner(r string) BuildOption {
+	return func(b *Build) { b.defaultRunner = r }
+}
+
 // NewBuild parses src, validates names, generates the initial bash script, and
-// returns a Build ready for Execute.
-func NewBuild(src []byte) (*Build, error) {
+// returns a Build ready for Execute. By default the Build's working directory
+// is os.Getwd() at construction time; pass WithPath to override (used for
+// sub-Builds whose mmkfile lives in a subdirectory).
+func NewBuild(src []byte, opts ...BuildOption) (*Build, error) {
 	f, err := parse.Parse(src)
 	if err != nil {
 		return nil, err
@@ -265,6 +294,13 @@ func NewBuild(src []byte) (*Build, error) {
 		userDefBodyOptions: make(map[defVerbBodyKey][]parse.Option),
 		subprojects:        make(map[string]*subprojectInfo),
 		runners:            newRunnerRegistry(),
+	}
+
+	if cwd, err := os.Getwd(); err == nil {
+		b.path = cwd
+	}
+	for _, opt := range opts {
+		opt(b)
 	}
 
 	// Populate runnerDefs from built-in definitions.
@@ -311,18 +347,34 @@ func NewBuild(src []byte) (*Build, error) {
 		}
 	}
 
-	// Generate the bash script first so target-name and runner expansion can
-	// source it for $VAR lookups.
-	genf, err := os.CreateTemp("", "mmk-generated-*.sh")
+	// Genfiles live in a dedicated host directory so the docker image runner
+	// can mount only that path into the container (read-only) without
+	// shadowing /tmp wholesale. Keeps the container's /tmp writable for tools
+	// like `go run` while still letting bodies source the genfile by its
+	// host path (which equals the container path because we mount it 1:1).
+	if err := os.MkdirAll(genfileDir, 0o755); err != nil {
+		return nil, err
+	}
+	genf, err := os.CreateTemp(genfileDir, "mmk-generated-*.sh")
 	if err != nil {
 		return nil, err
 	}
 	b.genPath = genf.Name()
 	b.genFile = genf
 
-	frozen, err := evalPassthroughs(f)
-	if err != nil {
-		frozen = nil // fall back to verbatim passthroughs on error
+	// evalPassthroughs freezes variable values at parse time, so $(pwd) and
+	// similar resolve once. That's correct for bodies running in the same
+	// context as parsing — but when this Build has a default runner (set on
+	// sub-Builds whose parent declared `subproject foo on R`), bodies run
+	// inside that runner where the filesystem layout differs (e.g. /work vs
+	// the host path). Skip freezing in that case so the passthroughs
+	// re-evaluate fresh inside the runner each body.
+	var frozen []string
+	if b.defaultRunner == "" {
+		f, err := evalPassthroughs(f, b.path)
+		if err == nil {
+			frozen = f
+		}
 	}
 	if err := gen.Generate(genf, f, frozen); err != nil {
 		genf.Close()
@@ -465,17 +517,17 @@ func (b *Build) HasVerb(verb string) bool {
 			return true
 		}
 	}
-	for _, s := range b.walkSubprojects() {
-		for _, v := range s.verbs {
-			if v == verb {
-				return true
-			}
+	for _, sp := range b.subprojects {
+		if sp.build != nil && sp.build.HasVerb(verb) {
+			return true
 		}
 	}
 	return false
 }
 
-// HasTarget reports whether name is a known concrete or pattern-matched target.
+// HasTarget reports whether name is a known concrete or pattern-matched
+// target — including subproject names and "subproject/rest" paths that
+// resolve via sub-Builds.
 func (b *Build) HasTarget(name string) bool {
 	if _, ok := b.concretes[name]; ok {
 		return true
@@ -483,6 +535,14 @@ func (b *Build) HasTarget(name string) bool {
 	for _, pe := range b.patterns {
 		if pe.re.MatchString(name) {
 			return true
+		}
+	}
+	if sp, ok := b.subprojects[name]; ok && sp.build != nil {
+		return true
+	}
+	if i := strings.IndexByte(name, '/'); i > 0 {
+		if sp, ok := b.subprojects[name[:i]]; ok && sp.build != nil {
+			return sp.build.HasTarget(name[i+1:])
 		}
 	}
 	return false
@@ -580,9 +640,31 @@ func (b *Build) Execute(target, verb string, parallelism int) error {
 
 // Resolve returns (creating if necessary) the TargetNode for the named target.
 // It is safe to call multiple times with the same name; the same node is returned.
+//
+// Subproject delegation:
+//   - parent.Resolve("foo") for subproject `foo` returns sub.Resolve("all").
+//   - parent.Resolve("foo/bar") returns sub.Resolve("bar").
+// The returned node's build pointer is the sub-Build, so its body executes
+// with the sub-Build's genfile and cwd.
 func (b *Build) Resolve(name string) (*TargetNode, error) {
 	if n, ok := b.nodes[name]; ok {
 		return n, nil
+	}
+	if sp, ok := b.subprojects[name]; ok && sp.build != nil {
+		return sp.build.Resolve("all")
+	}
+	if i := strings.IndexByte(name, '/'); i > 0 {
+		if sp, ok := b.subprojects[name[:i]]; ok && sp.build != nil {
+			return sp.build.Resolve(name[i+1:])
+		}
+	}
+	// Parent fallback for typed concretes (typically runner images declared
+	// at the parent level). The returned node lives in the parent's Build,
+	// so its deps resolve relative to the parent's working directory.
+	if b.parent != nil {
+		if rule, ok := b.parent.concretes[name]; ok && rule.Type != "" && rule.Type != "source" {
+			return b.parent.Resolve(name)
+		}
 	}
 	rule, err := b.findRule(name)
 	if err != nil {
@@ -596,10 +678,21 @@ func (b *Build) Resolve(name string) (*TargetNode, error) {
 // ResolveVerb returns (creating if necessary) the verb-qualified TargetNode for
 // [verb target]. An explicit verb rule takes precedence; otherwise an inherited
 // node is created as long as the target has a default rule.
+//
+// Subproject delegation mirrors Resolve: [verb foo] → sub.ResolveVerb("all", verb),
+// [verb foo/bar] → sub.ResolveVerb("bar", verb).
 func (b *Build) ResolveVerb(target, verb string) (*TargetNode, error) {
 	key := verbNodeKey{target, verb}
 	if n, ok := b.verbNodes[key]; ok {
 		return n, nil
+	}
+	if sp, ok := b.subprojects[target]; ok && sp.build != nil {
+		return sp.build.ResolveVerb("all", verb)
+	}
+	if i := strings.IndexByte(target, '/'); i > 0 {
+		if sp, ok := b.subprojects[target[:i]]; ok && sp.build != nil {
+			return sp.build.ResolveVerb(target[i+1:], verb)
+		}
 	}
 	rule := b.findRuleForVerb(target, verb)
 	if rule == nil {
@@ -722,6 +815,13 @@ type TargetNode struct {
 	deps      []*TargetNode
 	depsBuilt bool
 	resolveErr error
+
+	// Date is computed once per node and cached. Recomputing is expensive
+	// when the type's Date function shells into a runner (e.g. docker exec
+	// per .o file's mtime check), and a node's Date is read by both its own
+	// NeedsRun and every consumer's NeedsRun.
+	dateOnce  sync.Once
+	dateValue time.Time
 }
 
 // Dependencies resolves each named dep to a TargetNode, instantiating pattern
@@ -948,6 +1048,13 @@ func (b *Build) effectiveVerbOption(target, verb, key string) string {
 //   - user-defined (deftype): runs __mmk_type_<name>, parses stdout as a
 //     timestamp (epoch seconds or RFC3339); non-zero exit returns zero time.
 func (n *TargetNode) Date() time.Time {
+	n.dateOnce.Do(func() {
+		n.dateValue = n.computeDate()
+	})
+	return n.dateValue
+}
+
+func (n *TargetNode) computeDate() time.Time {
 	if n.kind == kindRunner {
 		// Runner nodes are pure setup. Returning zero time means they never
 		// look "newer" than artifacts that depend on them.
@@ -956,6 +1063,21 @@ func (n *TargetNode) Date() time.Time {
 	switch n.rule.Type {
 	case "":
 		return time.Now()
+	case "source", "file":
+		// Fast path: skip the bash subprocess (which would be a docker exec
+		// for sub-Builds with a runner) and stat the file directly. The
+		// target path is resolved against this Build's cwd; we mount the
+		// project root 1:1 into the container, so the file we stat on host
+		// matches what the body would see in the runner.
+		path := n.target
+		if !filepath.IsAbs(path) && n.build.path != "" {
+			path = filepath.Join(n.build.path, path)
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			return time.Time{}
+		}
+		return info.ModTime()
 	default: // all typed targets run their deftype bash function
 		t, err := n.userTypeDate()
 		if err != nil {
@@ -1139,7 +1261,15 @@ func (n *TargetNode) runWithRunner(execute string) error {
 		"MMK_EXECUTE="+execute,
 		"MMK_TARGET="+n.target,
 		"MMK_DEPS="+strings.Join(n.explicitDepNames(), " "),
+		// Path relative to the root Build's working directory. The image
+		// runner uses this to set docker exec -w to the corresponding
+		// container path so that bodies in sub-Builds see the right cwd
+		// (`/work/<rel>`) instead of the container's WORKDIR (`/work`).
+		"MMK_BUILD_PATH="+n.build.relPath(),
 	)
+	if dir := n.build.workdir(); dir != "" {
+		cmd.Dir = dir
+	}
 	if n.build.Verbose {
 		cmd.Env = append(cmd.Env, "MMK_VERBOSE=1")
 	}
@@ -1216,6 +1346,9 @@ func (b *Build) expandToken(token, kind string) ([]string, error) {
 	}
 	cmd := exec.Command("bash", "-c", `. "$MMK_GENFILE"; echo `+token)
 	cmd.Env = append(os.Environ(), "MMK_GENFILE="+b.genPath)
+	if b.path != "" {
+		cmd.Dir = b.path
+	}
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("expand %s %q: %w", kind, token, err)
@@ -1262,15 +1395,15 @@ func (b *Build) expandRuleNames(f *parse.File) error {
 }
 
 // expandSubprojects processes each `subproject` directive in f. For each, it
-// expands $VAR in the target/runner names, reads the subproject's mmkfile,
-// harvests its top-level verbs, and appends synthetic TargetRule directives
-// to f so the regular registration loop picks them up.
+// expands $VAR in the target/runner names, reads the subproject's mmkfile
+// source, eagerly constructs a sub-Build, and registers it. Sub-Builds share
+// the parent's runner registry and inherit the parent's image rules so they
+// can resolve runner targets. Sub-Build rules with no explicit `on` inherit
+// the parent's `subproject foo on R` runner.
 //
-// The default-build rule's body is `(cd <path> && mmk)`. Each [verb T] rule's
-// body is `(cd <path> && mmk <verb>)`. The runner clause is propagated.
-//
-// If the subproject's mmkfile is missing, this returns an error — `subproject`
-// declares a contract that there's a sub-mmkfile to delegate to.
+// Resolution of subproject targets (e.g. parent.Resolve("foo") or
+// "foo/bar") then traverses into the sub-Build at lookup time — no
+// synthetic delegation rules are needed.
 func (b *Build) expandSubprojects(f *parse.File) error {
 	for _, d := range f.Directives {
 		sp, ok := d.(*parse.Subproject)
@@ -1306,50 +1439,118 @@ func (b *Build) expandSubprojects(f *parse.File) error {
 			}
 		}
 
-		subFile, err := readSubMmkfile(path)
+		absPath := path
+		if !filepath.IsAbs(absPath) {
+			absPath = filepath.Join(b.path, path)
+		}
+
+		subSrc, err := readSubMmkfileSource(absPath)
 		if err != nil {
 			return fmt.Errorf("subproject %q: %w", sp.Target, err)
 		}
+
+		sub, err := NewBuild(subSrc, WithPath(absPath), WithDefaultRunner(sp.Runner))
+		if err != nil {
+			return fmt.Errorf("subproject %q: %w", sp.Target, err)
+		}
+		// Wire sub into parent's chain. Recursive registry sharing handles
+		// any nested subprojects that the sub already constructed.
+		sub.parent = b
+		sub.shareRunnerRegistry(b.runners)
+		sub.applyDefaultRunner()
+		// Image rules (runner targets) are resolved via parent fallback at
+		// lookup time rather than copied — see Resolve. That keeps the
+		// image's relative deps (e.g. ".gitlab/Dockerfile") rooted at the
+		// parent's path.
 
 		b.subprojects[sp.Target] = &subprojectInfo{
 			target: sp.Target,
 			runner: sp.Runner,
 			path:   path,
-		}
-
-		verbs := harvestVerbsRecursive(subFile, path)
-
-		// Default-build rule. Use HasDepSep=true to suppress verb dep-inheritance.
-		f.Directives = append(f.Directives, &parse.TargetRule{
-			Target:    sp.Target,
-			Runner:    sp.Runner,
-			HasDepSep: true,
-			Body:      fmt.Sprintf("\n\t(cd %q && mmk)\n", path),
-		})
-
-		// One [verb target] rule per harvested verb.
-		for _, verb := range verbs {
-			f.Directives = append(f.Directives, &parse.TargetRule{
-				Target:    sp.Target,
-				Runner:    sp.Runner,
-				Verb:      verb,
-				HasDepSep: true,
-				Body:      fmt.Sprintf("\n\t(cd %q && mmk %s)\n", path, verb),
-			})
+			build:  sub,
 		}
 	}
 	return nil
 }
 
-// ResolveSubpath checks whether `target` is of the form "<subproject>/<rest>"
-// and, if so, registers a synthetic rule that delegates to the subproject by
-// recursively invoking mmk in the sub-directory. Returns ok=true when a rule
-// was registered (and the caller should continue with normal Resolve(target)).
-//
-// If `target` doesn't have a slash, or its prefix isn't a known subproject,
-// returns ok=false and the caller falls through to normal lookup. Top-level
-// targets that already exist take precedence — registering the same target
-// twice is a duplicate, so we only synthesize when nothing is registered.
+// readSubMmkfileSource is the byte-source variant of readSubMmkfile, used by
+// expandSubprojects to construct sub-Builds via NewBuild.
+func readSubMmkfileSource(path string) ([]byte, error) {
+	for _, name := range []string{"mmkfile", "Mmkfile"} {
+		p := filepath.Join(path, name)
+		data, err := os.ReadFile(p)
+		if err == nil {
+			return data, nil
+		}
+		if !os.IsNotExist(err) {
+			return nil, fmt.Errorf("read %s: %w", p, err)
+		}
+	}
+	return nil, fmt.Errorf("no mmkfile or Mmkfile found in %q", path)
+}
+
+// workdir returns the absolute cwd in which this Build's body bashes should
+// run. Set at construction (NewBuild captures os.Getwd or honors WithPath);
+// expandSubprojects passes the joined absolute path when building sub-Builds.
+func (b *Build) workdir() string { return b.path }
+
+// relPath returns this Build's path relative to the root Build (the topmost
+// ancestor with no parent). Empty for the root. Used to translate the host
+// working directory into a container-side workdir for runners.
+func (b *Build) relPath() string {
+	if b.parent == nil {
+		return ""
+	}
+	root := b
+	for root.parent != nil {
+		root = root.parent
+	}
+	rel, err := filepath.Rel(root.path, b.path)
+	if err != nil {
+		return ""
+	}
+	return rel
+}
+
+// shareRunnerRegistry sets b.runners and recursively propagates to all
+// sub-Builds, so the entire parent/sub tree uses one runner state map.
+func (b *Build) shareRunnerRegistry(r *runnerRegistry) {
+	b.runners = r
+	for _, sp := range b.subprojects {
+		if sp.build != nil {
+			sp.build.shareRunnerRegistry(r)
+		}
+	}
+}
+
+// applyDefaultRunner fills the Runner clause on rules that don't have one
+// with b.defaultRunner. Used after sub-Build construction to make rules
+// inherit "subproject foo on R" without needing each rule in foo to repeat.
+func (b *Build) applyDefaultRunner() {
+	if b.defaultRunner == "" {
+		return
+	}
+	for _, r := range b.concretes {
+		if r.Runner == "" && r.Type != "image" {
+			r.Runner = b.defaultRunner
+		}
+	}
+	for _, r := range b.verbConcretes {
+		if r.Runner == "" {
+			r.Runner = b.defaultRunner
+		}
+	}
+	for _, pe := range b.patterns {
+		if pe.rule.Runner == "" {
+			pe.rule.Runner = b.defaultRunner
+		}
+	}
+}
+
+// ResolveSubpath reports whether `target` is of the form "<subproject>/<rest>"
+// and resolvable via a registered sub-Build. In the merged subproject model
+// this is purely a probe — Resolve handles the redirection at lookup time.
+// Kept for back-compat with main's "is this a target or a verb?" check.
 func (b *Build) ResolveSubpath(target, verb string) bool {
 	i := strings.IndexByte(target, '/')
 	if i <= 0 {
@@ -1360,32 +1561,13 @@ func (b *Build) ResolveSubpath(target, verb string) bool {
 	if !ok {
 		return false
 	}
+	if sp.build == nil {
+		return false
+	}
 	if verb == "" {
-		if _, exists := b.concretes[target]; exists {
-			return false
-		}
-	} else {
-		if _, exists := b.verbConcretes[verbNodeKey{target, verb}]; exists {
-			return false
-		}
+		return sp.build.HasTarget(suffix)
 	}
-	body := fmt.Sprintf("\n\t(cd %q && mmk %s)\n", sp.path, suffix)
-	if verb != "" {
-		body = fmt.Sprintf("\n\t(cd %q && mmk %s %s)\n", sp.path, verb, suffix)
-	}
-	rule := &parse.TargetRule{
-		Target:    target,
-		Verb:      verb,
-		Runner:    sp.runner,
-		HasDepSep: true,
-		Body:      body,
-	}
-	if verb != "" {
-		b.verbConcretes[verbNodeKey{target, verb}] = rule
-	} else {
-		b.concretes[target] = rule
-	}
-	return true
+	return sp.build.HasTarget(suffix) && sp.build.HasVerb(verb)
 }
 
 // readSubMmkfile reads <path>/mmkfile or <path>/Mmkfile and returns the parsed AST.
@@ -1417,40 +1599,6 @@ func harvestVerbs(f *parse.File) []string {
 	return out
 }
 
-// harvestVerbsRecursive returns the union of verb names declared in f and in
-// every subproject reachable from f. Needed at the parent level so that a
-// verb declared deep in a sub-subproject (e.g. tools/json_to_hardcoded_fb_policies's
-// `[update all]`) gets a top-level [verb tools] rule generated, which then
-// delegates `cd tools && mmk verb` and lets the sub-mmk further delegate.
-func harvestVerbsRecursive(f *parse.File, path string) []string {
-	verbs := make(map[string]bool)
-	collectVerbsInto(verbs, f)
-	for _, d := range f.Directives {
-		sp, ok := d.(*parse.Subproject)
-		if !ok {
-			continue
-		}
-		childPath := filepath.Join(path, sp.Target)
-		for _, opt := range sp.Options {
-			if opt.Key == "path" {
-				childPath = filepath.Join(path, opt.Value)
-			}
-		}
-		childFile, err := readSubMmkfile(childPath)
-		if err != nil {
-			continue // best-effort; missing/broken sub-mmkfile shouldn't break harvest
-		}
-		for _, v := range harvestVerbsRecursive(childFile, childPath) {
-			verbs[v] = true
-		}
-	}
-	out := make([]string, 0, len(verbs))
-	for v := range verbs {
-		out = append(out, v)
-	}
-	sort.Strings(out)
-	return out
-}
 
 // collectVerbsInto adds verb names from f's direct rules and defbodies (plus
 // any built-in verbs implied by used types) into the given set.
@@ -1492,6 +1640,9 @@ func (n *TargetNode) runBash(execute string, output bool) error {
 		"MMK_DEPS="+strings.Join(n.explicitDepNames(), " "),
 		"MMK_EXECUTE="+execute,
 	)
+	if dir := n.build.workdir(); dir != "" {
+		c.Dir = dir
+	}
 	if n.build.Verbose {
 		c.Env = append(c.Env, "MMK_VERBOSE=1")
 	}
@@ -1514,6 +1665,9 @@ func (n *TargetNode) runBashOutput(cmd string) (string, error) {
 		"MMK_TARGET="+n.target,
 		"MMK_DEPS="+strings.Join(n.explicitDepNames(), " "),
 	)
+	if dir := n.build.workdir(); dir != "" {
+		c.Dir = dir
+	}
 	c.Env = appendRuleOptions(c.Env, n.rule)
 	out, err := c.Output()
 	return string(out), err
