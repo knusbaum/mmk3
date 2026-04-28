@@ -69,8 +69,14 @@ func Run(b *runtime.Build, target, verb string, parallelism int) error {
 	if runErr != nil {
 		return runErr
 	}
-	if fm, ok := finalModel.(model); ok && fm.buildErr != nil {
-		return fm.buildErr
+	if fm, ok := finalModel.(model); ok {
+		// Bubbletea has exited altscreen — the live render is gone. Print the
+		// final state to the regular terminal so the user can see it in
+		// scrollback.
+		fmt.Print(fm.FinalView())
+		if fm.buildErr != nil {
+			return fm.buildErr
+		}
 	}
 	return nil
 }
@@ -343,13 +349,27 @@ var (
 	pendingStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("240"))
 	runningStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("11")).Bold(true)
 	doneStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("10"))
-	skippedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
+	// Skipped uses bright cyan + a distinct glyph so it doesn't read as
+	// "still pending" the way a dim-gray arrow did.
+	skippedStyle = lipgloss.NewStyle().Foreground(lipgloss.Color("14")).Bold(true)
 	failedStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("9")).Bold(true)
 	logStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 	headerStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color("12")).Bold(true)
 )
 
 func (m model) View() string {
+	return m.render(false)
+}
+
+// FinalView returns the same content as View but without the interactive
+// "(press q to exit)" hint. The caller writes this to the regular terminal
+// after bubbletea exits altscreen, so the user sees the final state in
+// scrollback rather than nothing at all.
+func (m model) FinalView() string {
+	return m.render(true)
+}
+
+func (m model) render(final bool) string {
 	var b strings.Builder
 
 	// Tree.
@@ -360,24 +380,27 @@ func (m model) View() string {
 		fmt.Fprintf(&b, "%s%s %s\n", ln.prefix, icon, st.Render(ln.label))
 	}
 
-	// Log panel: last N lines that fit.
-	logRows := 8
-	if m.height > 0 {
-		// Reserve some rows for tree (best effort — tree may overflow; that's fine).
-		logRows = max(4, m.height/4)
-	}
-	tail := m.ring.tail(logRows)
-	if len(tail) > 0 {
-		b.WriteString("\n")
-		b.WriteString(headerStyle.Render("── log ──"))
-		b.WriteString("\n")
-		for _, line := range tail {
-			b.WriteString(logStyle.Render(line))
+	// Log panel: last N lines that fit. Skip on the scrollback final dump —
+	// the user will have already seen the live log; only the failure summary
+	// is worth preserving.
+	if !final {
+		logRows := 8
+		if m.height > 0 {
+			logRows = max(4, m.height/4)
+		}
+		tail := m.ring.tail(logRows)
+		if len(tail) > 0 {
 			b.WriteString("\n")
+			b.WriteString(headerStyle.Render("── log ──"))
+			b.WriteString("\n")
+			for _, line := range tail {
+				b.WriteString(logStyle.Render(line))
+				b.WriteString("\n")
+			}
 		}
 	}
 
-	// Final-state failure summary.
+	// Failure summary.
 	if m.buildDone && len(m.failures) > 0 {
 		b.WriteString("\n")
 		b.WriteString(failedStyle.Render(fmt.Sprintf("─── %d failure(s) ───", len(m.failures))))
@@ -397,7 +420,7 @@ func (m model) View() string {
 		}
 	}
 
-	if m.buildDone {
+	if !final && m.buildDone {
 		b.WriteString("\n")
 		b.WriteString(headerStyle.Render("(press q to exit)"))
 		b.WriteString("\n")
@@ -420,7 +443,7 @@ func iconAndStyle(s status) (string, lipgloss.Style) {
 	case statusDone:
 		return doneStyle.Render("✓"), doneStyle
 	case statusSkipped:
-		return skippedStyle.Render("→"), skippedStyle
+		return skippedStyle.Render("≡"), skippedStyle
 	case statusFailed:
 		return failedStyle.Render("✗"), failedStyle
 	default:
