@@ -139,14 +139,16 @@ func runSubGraph(path string, args []string) string {
 }
 
 // spliceSubGraph writes sub-mmk graph output as the last child under the
-// caller's prefix. The first line becomes the connector child; subsequent
-// lines get the child's continuation prefix prepended verbatim, since the
-// sub-output already carries its own internal tree formatting.
+// caller's prefix. The first line uses an arrow connector (└─▶) to mark the
+// edge as "expansion of" rather than "dependency of" — the sub-graph isn't
+// a dep of the parent node, it's what running that node actually does.
+// Continuation prefix matches the width of the regular tee/elbow so columns
+// inside the spliced subtree line up the same as the rest of the tree.
 func spliceSubGraph(w io.Writer, output, prefix string, isLast bool) {
-	connector := "├── "
+	connector := "├─▶ "
 	childPrefix := prefix + "│   "
 	if isLast {
-		connector = "└── "
+		connector = "└─▶ "
 		childPrefix = prefix + "    "
 	}
 	lines := strings.Split(strings.TrimRight(output, "\n"), "\n")
