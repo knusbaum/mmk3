@@ -961,12 +961,12 @@ foo :
 	}
 }
 
-func TestVerbInheritanceDoesNotPropagateToRunner(t *testing.T) {
-	// A verb-rule whose default rule has `on <runner>` should NOT auto-add
-	// [verb runner] as a dep. The runner is build infrastructure shared
-	// across many targets; propagating verbs to it (especially destructive
-	// ones like clean) causes races. Users who want the runner verb-applied
-	// can do so explicitly via ':+' or by listing it in deps.
+func TestVerbInheritsRunnerVerbButNotRunnerOn(t *testing.T) {
+	// An inherited verb-rule on a target with `on R`:
+	//   - The verb is propagated to R (regular dep on [verb R]) so cleaning
+	//     a target also reaches the underlying build infrastructure.
+	//   - The `on R` itself is NOT inherited: the verb body runs locally,
+	//     not inside R. Otherwise destructive verbs would race against R.
 	src := `
 image myimage : {
 	true
@@ -980,22 +980,32 @@ dep :
 		t.Fatalf("ResolveVerb: %v", err)
 	}
 	deps := n.Dependencies()
+	var sawCleanMyimage bool
 	for _, d := range deps {
-		if d.target == "myimage" {
-			t.Errorf("did not expect myimage in [clean target] deps; got %v", depTargets(deps))
+		if d.target == "myimage" && d.verb == "" {
+			t.Errorf("[clean target] should not inherit `on myimage`; got bare myimage in deps: %v", depTargets(deps))
 		}
+		if d.target == "myimage" && d.verb == "clean" {
+			sawCleanMyimage = true
+		}
+	}
+	if !sawCleanMyimage {
+		t.Errorf("expected [clean myimage] in [clean target] deps; got %v", depTargets(deps))
 	}
 }
 
 func TestOrderOnlyBuiltinImageCleanAfterConsumers(t *testing.T) {
 	// Built-in `defbody image clean` ships order=after-consumers. The
-	// [clean myimg] verb-node should report [clean src] as an order-only
-	// dep so that the dag library can sequence it correctly when both are
-	// in the DAG (and drop the edge when only [clean myimg] is requested).
+	// consumers are the nodes whose body actually runs inside the image:
+	//   - default-build rules with `on myimg` (the bare `src`/`preload` nodes)
+	//   - explicit verb-rules with their own `on myimg` (any verb)
+	// Inherited verbs whose body runs locally are NOT consumers under the
+	// new "verbs don't inherit `on`" model.
 	src := `
 image myimg : Dockerfile
 src on myimg : { :; }
 preload on myimg : { :; }
+[lint src] on myimg { :; }
 `
 	b := newBuild(t, src)
 	n, err := b.ResolveVerb("myimg", "clean")
@@ -1007,10 +1017,16 @@ preload on myimg : { :; }
 	for _, d := range orderDeps {
 		got[d.target+":"+d.verb] = true
 	}
-	for _, want := range []string{"src:clean", "preload:clean"} {
+	// Default-build consumers are the bare nodes themselves.
+	for _, want := range []string{"src:", "preload:"} {
 		if !got[want] {
 			t.Errorf("expected %q in OrderDependencies of [clean myimg]; got %v", want, got)
 		}
+	}
+	// Explicit verb rules with their own `on myimg` are also consumers,
+	// regardless of which verb they are.
+	if !got["src:lint"] {
+		t.Errorf("expected %q in OrderDependencies of [clean myimg]; got %v", "src:lint", got)
 	}
 	// Regular Dependencies should NOT include consumers (otherwise standalone
 	// `mmk clean myimg` would pull them in).
@@ -1018,6 +1034,166 @@ preload on myimg : { :; }
 		if d.target == "src" || d.target == "preload" {
 			t.Errorf("regular Dependencies of [clean myimg] should not include consumer %q", d.target)
 		}
+	}
+}
+
+// hasDep reports whether deps contains a node with the given verb/target.
+func hasDep(deps []*TargetNode, verb, target string) bool {
+	for _, d := range deps {
+		if d.target == target && d.verb == verb {
+			return true
+		}
+	}
+	return false
+}
+
+// TestVerbPropagation_InheritedNoCycle covers Case 1: `target on R` with no
+// explicit verb-rule. `mmk clean target` propagates [clean R] as a regular
+// dep but does NOT inherit `on R` (body runs locally), and the resulting
+// graph has no cycle even though `[clean R]` ships order=after-consumers.
+func TestVerbPropagation_InheritedNoCycle(t *testing.T) {
+	src := `
+image R : Dockerfile
+file target on R : main.o
+file main.o : main.c
+`
+	b := newBuild(t, src)
+	if err := b.Prepare("target", "clean"); err != nil {
+		t.Fatalf("Prepare(clean target) returned error (cycle?): %v", err)
+	}
+	n, err := b.ResolveVerb("target", "clean")
+	if err != nil {
+		t.Fatalf("ResolveVerb: %v", err)
+	}
+	deps := n.Dependencies()
+	if !hasDep(deps, "clean", "R") {
+		t.Errorf("expected [clean R] in [clean target] deps; got %v", depTargets(deps))
+	}
+	if hasDep(deps, "", "R") {
+		t.Errorf("[clean target] should not inherit `on R`; got bare R in deps: %v", depTargets(deps))
+	}
+}
+
+// TestVerbPropagation_ExplicitOnRunnerNoPropagate covers Case 2:
+// `[clean target] on R` (own runner == default runner). The verb-rule body
+// runs in R, so [clean R] must NOT be a regular dep of [clean target] —
+// otherwise the order=after-consumers edge would cycle against it.
+func TestVerbPropagation_ExplicitOnRunnerNoPropagate(t *testing.T) {
+	src := `
+image R : Dockerfile
+file target on R : main.o
+file main.o : main.c
+[clean target] on R {
+	rm -f /opt/$target
+}
+`
+	b := newBuild(t, src)
+	n, err := b.ResolveVerb("target", "clean")
+	if err != nil {
+		t.Fatalf("ResolveVerb: %v", err)
+	}
+	deps := n.Dependencies()
+	if hasDep(deps, "clean", "R") {
+		t.Errorf("[clean target] on R should NOT regular-dep on [clean R]; got %v", depTargets(deps))
+	}
+	if !hasDep(deps, "", "R") {
+		t.Errorf("[clean target] on R should regular-dep on R (build); got %v", depTargets(deps))
+	}
+	if err := b.Prepare("target", "clean"); err != nil {
+		t.Fatalf("Prepare(clean target) returned error: %v", err)
+	}
+}
+
+// TestVerbPropagation_AfterConsumersFiresOnExplicitOn covers Case 3: when
+// both [clean target] (explicit on R) and [clean R] are in the graph, the
+// after-consumers order edge sequences [clean target] before [clean R].
+func TestVerbPropagation_AfterConsumersFiresOnExplicitOn(t *testing.T) {
+	src := `
+image R : Dockerfile
+file target on R : main.o
+file main.o : main.c
+[clean target] on R {
+	rm -f /opt/$target
+}
+all : target
+[clean all] :+ [clean R]
+`
+	b := newBuild(t, src)
+	if err := b.Prepare("all", "clean"); err != nil {
+		t.Fatalf("Prepare(clean all) returned error: %v", err)
+	}
+	cleanR, err := b.ResolveVerb("R", "clean")
+	if err != nil {
+		t.Fatalf("ResolveVerb([clean R]): %v", err)
+	}
+	if !hasDep(cleanR.OrderDependencies(), "clean", "target") {
+		t.Errorf("expected [clean target] in [clean R].OrderDependencies; got %v",
+			depTargets(cleanR.OrderDependencies()))
+	}
+}
+
+// TestVerbPropagation_CrossRunner covers Case 4: `target on R` with
+// `[clean target] on S` (different runner). The verb body runs in S, so
+// [clean target] auto-propagates [clean R] (the default's runner) as a
+// regular dep, AND when [clean S] is in the graph, the order edge fires
+// because `target` has Runner==R but the `[clean target]` verb-rule has
+// Runner==S — both endpoints sequence relative to their own runners.
+func TestVerbPropagation_CrossRunner(t *testing.T) {
+	src := `
+image R : Dockerfile
+image S : Dockerfile
+file target on R : main.o
+file main.o : main.c
+[clean target] on S {
+	echo cross-runner clean
+}
+all : target
+[clean all] :+ [clean S]
+`
+	b := newBuild(t, src)
+	if err := b.Prepare("all", "clean"); err != nil {
+		t.Fatalf("Prepare(clean all) returned error: %v", err)
+	}
+	cleanTarget, err := b.ResolveVerb("target", "clean")
+	if err != nil {
+		t.Fatalf("ResolveVerb([clean target]): %v", err)
+	}
+	deps := cleanTarget.Dependencies()
+	if !hasDep(deps, "clean", "R") {
+		t.Errorf("[clean target] on S should auto-propagate [clean R]; got %v", depTargets(deps))
+	}
+	if !hasDep(deps, "", "S") {
+		t.Errorf("[clean target] on S should regular-dep on S (build); got %v", depTargets(deps))
+	}
+	cleanS, err := b.ResolveVerb("S", "clean")
+	if err != nil {
+		t.Fatalf("ResolveVerb([clean S]): %v", err)
+	}
+	if !hasDep(cleanS.OrderDependencies(), "clean", "target") {
+		t.Errorf("expected [clean target] in [clean S].OrderDependencies; got %v",
+			depTargets(cleanS.OrderDependencies()))
+	}
+}
+
+// TestVerbPropagation_NonVerbConsumerOrdered covers the user's specific
+// example: when a build of `target on R` is in the graph alongside [clean R]
+// (e.g. as siblings under a parent), [clean R] must order after the build
+// of `target` so the image isn't removed mid-build.
+func TestVerbPropagation_NonVerbConsumerOrdered(t *testing.T) {
+	src := `
+image R : Dockerfile
+file target on R : main.o
+file main.o : main.c
+all : target [clean R]
+`
+	b := newBuild(t, src)
+	cleanR, err := b.ResolveVerb("R", "clean")
+	if err != nil {
+		t.Fatalf("ResolveVerb([clean R]): %v", err)
+	}
+	if !hasDep(cleanR.OrderDependencies(), "", "target") {
+		t.Errorf("expected bare `target` in [clean R].OrderDependencies; got %v",
+			depTargets(cleanR.OrderDependencies()))
 	}
 }
 

@@ -831,6 +831,13 @@ func (n *TargetNode) verbDependencies() []*TargetNode {
 
 // inheritedVerbDeps returns the default rule's deps with this node's verb
 // applied to each. Used both for no-colon inheritance and for ':+' augment.
+//
+// When the default rule has `on R` and the verb-rule's own runner doesn't
+// match R, [verb R] is appended too — so cleaning a target that was built on
+// an image also reaches the image's verb. The own-runner-matches-default case
+// is skipped because the verb body is already running in R; the user chose
+// that, and adding [verb R] there would cycle against R's after-consumers
+// order edge.
 func (n *TargetNode) inheritedVerbDeps() []*TargetNode {
 	defaultRule := n.build.concretes[n.target]
 	if defaultRule == nil {
@@ -857,6 +864,14 @@ func (n *TargetNode) inheritedVerbDeps() []*TargetNode {
 			deps = append(deps, depNode)
 		}
 	}
+	if defaultRule.Runner != "" && (n.rule == nil || n.rule.Runner != defaultRule.Runner) {
+		runnerVerb, err := n.build.ResolveVerb(defaultRule.Runner, n.verb)
+		if err != nil {
+			n.resolveErr = err
+			return deps
+		}
+		deps = append(deps, runnerVerb)
+	}
 	return deps
 }
 
@@ -866,23 +881,41 @@ func (n *TargetNode) inheritedVerbDeps() []*TargetNode {
 //
 // Two cases produce order-only edges:
 //
-//   - This node is `[verb T]` where T's effective options for verb include
-//     order=after-consumers. The runner-typed T runs after every
-//     `[verb consumer]` for consumers using T as their runner.
+//   - This node is `[verb T]` where T has order=after-consumers for verb.
+//     The verb-on-runner runs after every consumer whose body actually
+//     executes inside T — i.e., default rules with `on T` (the bare build
+//     node) and verb rules with their own `on T` clause (the [r.Verb r.Target]
+//     node). Inherited verb nodes whose body runs locally are NOT consumers
+//     of T under the new "verbs don't inherit `on`" model.
 //
-//   - This node is `[verb T]` where T's runner R has effective options for
-//     verb include order=before-consumers. T runs after `[verb R]`.
+//   - This node is `[verb T]` where T has its own runner R (n.rule.Runner),
+//     and R has order=before-consumers for verb. T runs after `[verb R]`.
+//     Only fires for explicit-on verb rules; inherited verbs auto-propagate
+//     [verb default.Runner] as a regular dep, which already provides the
+//     "before" ordering through normal upstream edges.
 func (n *TargetNode) OrderDependencies() []*TargetNode {
 	if n.verb == "" || n.kind == kindRunner {
 		return nil
 	}
 	var deps []*TargetNode
 
-	// Case 1: this is a verb on a runner-typed target with order=after-consumers.
+	// Case 1: this is [verb T] with order=after-consumers. Walk both maps
+	// and add the consumer node itself (not [n.verb consumer]) so the order
+	// edge points at whichever node actually executes inside T.
 	if order := n.build.effectiveVerbOption(n.target, n.verb, "order"); order == "after-consumers" {
 		for _, r := range n.build.concretes {
-			if r.Runner == n.target && r.Verb == "" {
-				cn, err := n.build.ResolveVerb(r.Target, n.verb)
+			if r.Runner == n.target {
+				cn, err := n.build.Resolve(r.Target)
+				if err == nil {
+					deps = append(deps, cn)
+				}
+			}
+		}
+		// Verb-rule consumers run inside T regardless of which verb they are
+		// (e.g. [lint t] on T must finish before [clean T] removes the image).
+		for _, r := range n.build.verbConcretes {
+			if r.Runner == n.target {
+				cn, err := n.build.ResolveVerb(r.Target, r.Verb)
 				if err == nil {
 					deps = append(deps, cn)
 				}
@@ -890,12 +923,13 @@ func (n *TargetNode) OrderDependencies() []*TargetNode {
 		}
 	}
 
-	// Case 2: this node's default rule has a runner R, and R's effective
-	// options for this verb include order=before-consumers.
-	defaultRule := n.build.concretes[n.target]
-	if defaultRule != nil && defaultRule.Runner != "" {
-		if order := n.build.effectiveVerbOption(defaultRule.Runner, n.verb, "order"); order == "before-consumers" {
-			rn, err := n.build.ResolveVerb(defaultRule.Runner, n.verb)
+	// Case 2: this node has its own `on R` (body runs in R), and R has
+	// order=before-consumers for this verb. Inherited verbs don't reach
+	// here — n.rule.Runner is empty for those, and auto-propagation already
+	// gives them a regular dep on [verb default.Runner].
+	if n.rule != nil && n.rule.Runner != "" {
+		if order := n.build.effectiveVerbOption(n.rule.Runner, n.verb, "order"); order == "before-consumers" {
+			rn, err := n.build.ResolveVerb(n.rule.Runner, n.verb)
 			if err == nil {
 				deps = append(deps, rn)
 			}
@@ -1479,7 +1513,7 @@ func collectVerbsInto(verbs map[string]bool, f *parse.File) {
 // When Verbose is set, MMK_VERBOSE=1 is exported and the script enables
 // `set -x` around the eval so the user sees the bash commands being run.
 func (n *TargetNode) runBash(execute string, output bool) error {
-	script := `. "$MMK_GENFILE"; target="$MMK_TARGET"; deps="$MMK_DEPS"; eval "$MMK_EXECUTE"`
+	script := `. "$MMK_GENFILE"; target="$MMK_TARGET"; deps="$MMK_DEPS"; read -ra dep <<< "$deps"; eval "$MMK_EXECUTE"`
 	c := exec.Command("bash", "-c", script)
 	c.Env = append(os.Environ(),
 		"MMK_GENFILE="+n.build.genPath,
