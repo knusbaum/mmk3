@@ -190,7 +190,7 @@ var builtinRunnerDefs = map[string]runnerDefBodies{
 `,
 		Run: `
 	if [ "$MMK_RUNNER_STATE" = "` + skipSentinel + `" ]; then
-		target="$MMK_TARGET"; deps="$MMK_DEPS"; eval "$MMK_EXECUTE"
+		target="$MMK_TARGET"; deps="$MMK_DEPS"; [ -n "$MMK_VERBOSE" ] && set -x; eval "$MMK_EXECUTE"
 		return $?
 	fi
 	[ -t 0 ] && tty_flag=-t || tty_flag=
@@ -209,9 +209,10 @@ var builtinRunnerDefs = map[string]runnerDefBodies{
 		-e "MMK_TARGET=$MMK_TARGET" \
 		-e "MMK_DEPS=$MMK_DEPS" \
 		-e MMK_EXECUTE \
+		-e MMK_VERBOSE \
 		"${__mmk_extra_env[@]}" \
 		"$MMK_RUNNER_STATE" \
-		bash -c ". /mmk-generated.sh; target=\"\$MMK_TARGET\"; deps=\"\$MMK_DEPS\"; eval \"\$MMK_EXECUTE\""
+		bash -c ". /mmk-generated.sh; target=\"\$MMK_TARGET\"; deps=\"\$MMK_DEPS\"; [ -n \"\$MMK_VERBOSE\" ] && set -x; eval \"\$MMK_EXECUTE\""
 `,
 		Cleanup: `
 	[ "$MMK_RUNNER_STATE" = "` + skipSentinel + `" ] && return 0

@@ -1086,6 +1086,9 @@ func (n *TargetNode) runWithRunner(execute string) error {
 		"MMK_TARGET="+n.target,
 		"MMK_DEPS="+strings.Join(n.explicitDepNames(), " "),
 	)
+	if n.build.Verbose {
+		cmd.Env = append(cmd.Env, "MMK_VERBOSE=1")
+	}
 	// Image (runner) options first, then target options. On collision Go's
 	// os/exec resolves duplicate keys by last-write-wins, so target shadows.
 	cmd.Env = appendRuleOptions(cmd.Env, runnerNode.rule)
@@ -1424,8 +1427,10 @@ func collectVerbsInto(verbs map[string]bool, f *parse.File) {
 // runBash sources generated.sh and evaluates the MMK_EXECUTE snippet.
 // If output is true, stdout/stderr are forwarded to the process's own streams.
 // Target and dep names are passed via environment to avoid quoting issues.
+// When Verbose is set, MMK_VERBOSE=1 is exported and the script enables
+// `set -x` around the eval so the user sees the bash commands being run.
 func (n *TargetNode) runBash(execute string, output bool) error {
-	script := `. "$MMK_GENFILE"; target="$MMK_TARGET"; deps="$MMK_DEPS"; eval "$MMK_EXECUTE"`
+	script := `. "$MMK_GENFILE"; target="$MMK_TARGET"; deps="$MMK_DEPS"; [ -n "$MMK_VERBOSE" ] && set -x; eval "$MMK_EXECUTE"`
 	c := exec.Command("bash", "-c", script)
 	c.Env = append(os.Environ(),
 		"MMK_GENFILE="+n.build.genPath,
@@ -1433,6 +1438,9 @@ func (n *TargetNode) runBash(execute string, output bool) error {
 		"MMK_DEPS="+strings.Join(n.explicitDepNames(), " "),
 		"MMK_EXECUTE="+execute,
 	)
+	if n.build.Verbose {
+		c.Env = append(c.Env, "MMK_VERBOSE=1")
+	}
 	c.Env = appendRuleOptions(c.Env, n.rule)
 	if output {
 		c.Stdin = os.Stdin

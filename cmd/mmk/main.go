@@ -43,7 +43,10 @@ func main() {
 		os.Exit(1)
 	}
 	defer b.Close()
-	b.Verbose = *v
+	// MMK_VERBOSE=1 (forwarded from a parent mmk that was started with -v)
+	// makes a sub-mmk inherit verbose mode without the parent having to
+	// rewrite synthetic subproject bodies to pass -v explicitly.
+	b.Verbose = *v || os.Getenv("MMK_VERBOSE") == "1"
 
 	if *list {
 		b.PrintList(os.Stdout)
