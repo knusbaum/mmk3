@@ -4,6 +4,7 @@
 package runtime
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -14,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"text/tabwriter"
 	"time"
 
@@ -21,6 +24,11 @@ import (
 	"github.com/knusbaum/mmk3/cmd/mmk/parse"
 	"github.com/knusbaum/mmk3/dag"
 )
+
+// ErrCancelled is returned from a node's Run when the build was cancelled
+// (Build.Cancel) before the node started executing. dag treats it like any
+// other failure — downstream nodes propagate it and skip their own work.
+var ErrCancelled = errors.New("build cancelled")
 
 // runnerDefInfo records which optional phases a runner type has defined.
 // The run phase is always assumed present for any type in Build.runnerDefs.
@@ -77,6 +85,54 @@ type Build struct {
 
 	runnerStatesMu sync.Mutex
 	runnerStates   map[string]string // runner target name → state from setup stdout
+
+	// Cancellation: the TUI (and any other supervisor) can stop scheduling
+	// new task bodies via Cancel, then escalate via SignalAll(SIGTERM/SIGKILL)
+	// to interrupt in-flight bash subprocesses. A node already past the
+	// IsCancelled check at entry continues until its bash returns or is signaled.
+	cancelled     atomic.Bool
+	runningCmdsMu sync.Mutex
+	runningCmds   map[*exec.Cmd]struct{}
+}
+
+// Cancel marks the build as cancelled. Subsequent calls to TargetNode.Run
+// return ErrCancelled before spawning a new subprocess. In-flight bash
+// processes are not affected; use SignalAll to terminate them.
+func (b *Build) Cancel() { b.cancelled.Store(true) }
+
+// IsCancelled reports whether Cancel has been called.
+func (b *Build) IsCancelled() bool { return b.cancelled.Load() }
+
+// SignalAll sends sig to the process group of every currently-running task
+// subprocess. Each cmd is launched with Setpgid so the signal reaches bash
+// and any descendants it has spawned (e.g. cc, docker exec). Errors from
+// individual signal calls are ignored — a process may have just exited.
+func (b *Build) SignalAll(sig syscall.Signal) {
+	b.runningCmdsMu.Lock()
+	defer b.runningCmdsMu.Unlock()
+	for c := range b.runningCmds {
+		if c.Process == nil {
+			continue
+		}
+		_ = syscall.Kill(-c.Process.Pid, sig)
+	}
+}
+
+// registerCmd / unregisterCmd track in-flight subprocesses so SignalAll can
+// reach them. Callers must invoke unregisterCmd via defer once cmd.Run returns.
+func (b *Build) registerCmd(c *exec.Cmd) {
+	b.runningCmdsMu.Lock()
+	defer b.runningCmdsMu.Unlock()
+	if b.runningCmds == nil {
+		b.runningCmds = make(map[*exec.Cmd]struct{})
+	}
+	b.runningCmds[c] = struct{}{}
+}
+
+func (b *Build) unregisterCmd(c *exec.Cmd) {
+	b.runningCmdsMu.Lock()
+	defer b.runningCmdsMu.Unlock()
+	delete(b.runningCmds, c)
 }
 
 type patternEntry struct {
@@ -1145,6 +1201,9 @@ func (n *TargetNode) Run() error {
 // runWithRunner executes the given snippet through the runner type's run bash
 // function. The snippet and task context are passed as environment variables.
 func (n *TargetNode) runWithRunner(execute string) error {
+	if n.build.IsCancelled() {
+		return ErrCancelled
+	}
 	runnerNode, err := n.build.Resolve(n.rule.Runner)
 	if err != nil {
 		return err
@@ -1157,6 +1216,7 @@ func (n *TargetNode) runWithRunner(execute string) error {
 
 	script := `. "$MMK_GENFILE"; ` + gen.RunnerRunFunc(runnerType)
 	cmd := exec.Command("bash", "-c", script)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Env = append(os.Environ(),
 		"MMK_GENFILE="+n.build.genPath,
 		"target="+runnerNode.target,
@@ -1179,6 +1239,8 @@ func (n *TargetNode) runWithRunner(execute string) error {
 	if n.build.OutputWriter == nil {
 		cmd.Stdin = os.Stdin
 	}
+	n.build.registerCmd(cmd)
+	defer n.build.unregisterCmd(cmd)
 	return cmd.Run()
 }
 
@@ -1513,8 +1575,12 @@ func collectVerbsInto(verbs map[string]bool, f *parse.File) {
 // When Verbose is set, MMK_VERBOSE=1 is exported and the script enables
 // `set -x` around the eval so the user sees the bash commands being run.
 func (n *TargetNode) runBash(execute string, output bool) error {
+	if n.build.IsCancelled() {
+		return ErrCancelled
+	}
 	script := `. "$MMK_GENFILE"; target="$MMK_TARGET"; deps="$MMK_DEPS"; read -ra dep <<< "$deps"; eval "$MMK_EXECUTE"`
 	c := exec.Command("bash", "-c", script)
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	c.Env = append(os.Environ(),
 		"MMK_GENFILE="+n.build.genPath,
 		"MMK_TARGET="+n.target,
@@ -1538,6 +1604,8 @@ func (n *TargetNode) runBash(execute string, output bool) error {
 			c.Stdin = os.Stdin
 		}
 	}
+	n.build.registerCmd(c)
+	defer n.build.unregisterCmd(c)
 	return c.Run()
 }
 

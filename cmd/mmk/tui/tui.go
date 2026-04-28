@@ -17,6 +17,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -47,7 +48,7 @@ func Run(b *runtime.Build, target, verb string, parallelism int) error {
 		return w, w
 	}
 
-	m := initialModel(tree, ring)
+	m := initialModel(tree, ring, b)
 	prog := tea.NewProgram(m, tea.WithAltScreen())
 
 	// Drive the build from a goroutine. Hooks publish events to the program.
@@ -351,17 +352,24 @@ type model struct {
 	statuses map[string]status
 	ring     *logRing
 	failures []failure
+	build    *runtime.Build
+
+	// cancelStage advances on each Ctrl+C while the build is running:
+	//   0 normal, 1 graceful (Cancel), 2 SIGTERM in-flight, 3 SIGKILL in-flight.
+	// After buildDone is true Ctrl+C just exits the TUI.
+	cancelStage int
 
 	width, height int
 	buildErr      error
 	buildDone     bool
 }
 
-func initialModel(t treeData, ring *logRing) model {
+func initialModel(t treeData, ring *logRing, b *runtime.Build) model {
 	m := model{
 		tree:     t,
 		statuses: map[string]status{},
 		ring:     ring,
+		build:    b,
 	}
 	m.statuses[t.rootKey] = statusPending
 	for _, ln := range t.lines {
@@ -400,9 +408,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = msg.Width, msg.Height
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "q", "ctrl+c", "esc":
+		case "q", "esc":
 			if m.buildDone {
 				return m, tea.Quit
+			}
+		case "ctrl+c":
+			if m.buildDone {
+				return m, tea.Quit
+			}
+			m.cancelStage++
+			switch m.cancelStage {
+			case 1:
+				m.build.Cancel()
+			case 2:
+				m.build.SignalAll(syscall.SIGTERM)
+			case 3:
+				m.build.SignalAll(syscall.SIGKILL)
 			}
 		}
 	case runMsg:
@@ -462,6 +483,22 @@ func (m model) FinalView() string {
 
 func (m model) render(final bool) string {
 	var b strings.Builder
+
+	// Cancel-stage banner: tells the user what each additional Ctrl+C does.
+	// Hidden once the build is fully done.
+	if !m.buildDone && m.cancelStage > 0 {
+		var line string
+		switch m.cancelStage {
+		case 1:
+			line = "cancelling — waiting for in-flight tasks (ctrl+c again: SIGTERM)"
+		case 2:
+			line = "SIGTERM sent (ctrl+c again: SIGKILL)"
+		default:
+			line = "SIGKILL sent"
+		}
+		b.WriteString(failedStyle.Render(line))
+		b.WriteString("\n")
+	}
 
 	// Tree.
 	rootIcon, rootStyle := iconAndStyle(m.statuses[m.tree.rootKey])
