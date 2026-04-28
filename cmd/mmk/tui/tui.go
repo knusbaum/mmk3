@@ -17,6 +17,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
@@ -35,18 +36,18 @@ func Run(b *runtime.Build, target, verb string, parallelism int) error {
 	tree := buildTree(root)
 
 	caps := &captures{m: map[string]*bytes.Buffer{}}
-	logCh := make(chan string, 256)
+	ring := newLogRing(2000)
 	b.OutputWriter = func(target, verb string) (io.Writer, io.Writer) {
 		w := &lineWriter{
 			key:     nodeKey(target, verb),
 			caps:    caps,
-			lines:   logCh,
+			ring:    ring,
 			lineBuf: &bytes.Buffer{},
 		}
 		return w, w
 	}
 
-	m := initialModel(tree)
+	m := initialModel(tree, ring)
 	prog := tea.NewProgram(m, tea.WithAltScreen())
 
 	// Drive the build from a goroutine. Hooks publish events to the program.
@@ -60,15 +61,7 @@ func Run(b *runtime.Build, target, verb string, parallelism int) error {
 	}
 
 	go func() {
-		// Drain log lines and forward to program.
-		for line := range logCh {
-			prog.Send(logLineMsg{line: line})
-		}
-	}()
-
-	go func() {
 		err := dag.Execute(root, parallelism, hooks)
-		close(logCh)
 		prog.Send(buildDoneMsg{err: err})
 	}()
 
@@ -120,12 +113,47 @@ func (c *captures) take(key string) string {
 	return ""
 }
 
-// lineWriter is an io.Writer that captures all bytes for failure replay and
-// forwards complete lines to the log channel for the live log panel.
+// logRing is a thread-safe bounded list of recent log lines. The TUI reads
+// the tail at render time; producers write at body-execution speed. We avoid
+// shipping each line through bubbletea's message queue because high-volume
+// output (e.g. `set -x` + parallel jobs) triggers thousands of redraws per
+// second, which causes flicker.
+type logRing struct {
+	mu     sync.Mutex
+	lines  []string
+	maxLen int
+}
+
+func newLogRing(max int) *logRing { return &logRing{maxLen: max} }
+
+func (r *logRing) push(line string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.lines = append(r.lines, line)
+	if len(r.lines) > r.maxLen {
+		r.lines = r.lines[len(r.lines)-r.maxLen:]
+	}
+}
+
+func (r *logRing) tail(n int) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.lines) <= n {
+		out := make([]string, len(r.lines))
+		copy(out, r.lines)
+		return out
+	}
+	out := make([]string, n)
+	copy(out, r.lines[len(r.lines)-n:])
+	return out
+}
+
+// lineWriter captures bytes for failure replay and pushes complete lines
+// into the shared log ring.
 type lineWriter struct {
 	key     string
 	caps    *captures
-	lines   chan<- string
+	ring    *logRing
 	lineBuf *bytes.Buffer
 }
 
@@ -139,10 +167,7 @@ func (lw *lineWriter) Write(p []byte) (int, error) {
 		}
 		line := string(lw.lineBuf.Bytes()[:i])
 		lw.lineBuf.Next(i + 1)
-		select {
-		case lw.lines <- line:
-		default: // drop on backpressure to keep build moving
-		}
+		lw.ring.push(line)
 	}
 	return len(p), nil
 }
@@ -232,7 +257,7 @@ type failure struct {
 type model struct {
 	tree     treeData
 	statuses map[string]status
-	logTail  []string
+	ring     *logRing
 	failures []failure
 
 	width, height int
@@ -240,10 +265,11 @@ type model struct {
 	buildDone     bool
 }
 
-func initialModel(t treeData) model {
+func initialModel(t treeData, ring *logRing) model {
 	m := model{
 		tree:     t,
 		statuses: map[string]status{},
+		ring:     ring,
 	}
 	m.statuses[t.rootKey] = statusPending
 	for _, ln := range t.lines {
@@ -260,10 +286,16 @@ type finishMsg struct {
 	key, target, verb, output string
 	err                       error
 }
-type logLineMsg struct{ line string }
 type buildDoneMsg struct{ err error }
+type tickMsg struct{}
 
-func (m model) Init() tea.Cmd { return nil }
+// tick triggers a redraw on a slow cadence so the log panel reflects new
+// lines from the ring buffer without each line being a bubbletea message.
+func tick() tea.Cmd {
+	return tea.Tick(80*time.Millisecond, func(time.Time) tea.Msg { return tickMsg{} })
+}
+
+func (m model) Init() tea.Cmd { return tick() }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -292,11 +324,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else {
 			m.statuses[msg.key] = statusDone
 		}
-	case logLineMsg:
-		m.logTail = append(m.logTail, msg.line)
-		if len(m.logTail) > 200 {
-			m.logTail = m.logTail[len(m.logTail)-200:]
+	case tickMsg:
+		if m.buildDone {
+			return m, nil
 		}
+		return m, tick()
 	case buildDoneMsg:
 		m.buildDone = true
 		m.buildErr = msg.err
@@ -334,10 +366,7 @@ func (m model) View() string {
 		// Reserve some rows for tree (best effort — tree may overflow; that's fine).
 		logRows = max(4, m.height/4)
 	}
-	tail := m.logTail
-	if len(tail) > logRows {
-		tail = tail[len(tail)-logRows:]
-	}
+	tail := m.ring.tail(logRows)
 	if len(tail) > 0 {
 		b.WriteString("\n")
 		b.WriteString(headerStyle.Render("── log ──"))
