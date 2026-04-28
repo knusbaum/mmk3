@@ -552,40 +552,7 @@ func (b *Build) ResolveVerb(target, verb string) (*TargetNode, error) {
 	if n, ok := b.verbNodes[key]; ok {
 		return n, nil
 	}
-	var rule *parse.TargetRule
-	if r, ok := b.verbConcretes[key]; ok {
-		rule = r
-	}
-	if rule == nil {
-		// Check for a matching verb pattern rule.
-		for _, pe := range b.patterns {
-			if pe.rule.Verb != verb {
-				continue
-			}
-			m := pe.re.FindStringSubmatch(target)
-			if m == nil {
-				continue
-			}
-			captures := m[1:]
-			instantiated := &parse.TargetRule{
-				Type:      pe.rule.Type,
-				Target:    target,
-				Verb:      verb,
-				Runner:    pe.rule.Runner,
-				HasDepSep: pe.rule.HasDepSep,
-				Body:      substituteCaptures(pe.rule.Body, captures),
-			}
-			for _, dep := range pe.rule.Deps {
-				instantiated.Deps = append(instantiated.Deps, parse.Dep{
-					Target: substituteCaptures(dep.Target, captures),
-					Verb:   dep.Verb,
-				})
-			}
-			b.verbConcretes[key] = instantiated
-			rule = instantiated
-			break
-		}
-	}
+	rule := b.findRuleForVerb(target, verb)
 	if rule == nil {
 		// Ensure a default rule exists so dep inheritance can propagate.
 		// Resolve populates concretes for inferred source targets.
@@ -610,36 +577,13 @@ func (b *Build) ResolveVerb(target, verb string) (*TargetNode, error) {
 	return n, nil
 }
 
-// findRule returns the rule for name, instantiating a pattern rule if needed.
+// findRule returns the rule for the bare target name, instantiating a pattern
+// rule if needed. Falls back to inferring a source-typed rule when nothing
+// matches, so real input files (e.g. `.c` sources) don't need declarations.
 func (b *Build) findRule(name string) (*parse.TargetRule, error) {
-	if r, ok := b.concretes[name]; ok {
+	if r := b.findRuleForVerb(name, ""); r != nil {
 		return r, nil
 	}
-	for _, pe := range b.patterns {
-		m := pe.re.FindStringSubmatch(name)
-		if m == nil {
-			continue
-		}
-		captures := m[1:]
-		rule := &parse.TargetRule{
-			Type:   pe.rule.Type,
-			Target: name,
-			Runner: pe.rule.Runner,
-			Body:   substituteCaptures(pe.rule.Body, captures),
-		}
-		for _, dep := range pe.rule.Deps {
-			rule.Deps = append(rule.Deps, parse.Dep{
-				Target: substituteCaptures(dep.Target, captures),
-				Verb:   dep.Verb,
-			})
-		}
-		b.concretes[name] = rule
-		return rule, nil
-	}
-	// No explicit or pattern rule: infer a source target so that real input files
-	// don't need to be declared. source targets have no clean verb body, so they
-	// are never deleted by `mmk clean`. Generate a bash function that delegates to
-	// __mmk_default_source, which fails with a clear message if the file is absent.
 	inferred := &parse.TargetRule{
 		Type:   "source",
 		Target: name,
@@ -647,6 +591,54 @@ func (b *Build) findRule(name string) (*parse.TargetRule, error) {
 	}
 	b.concretes[name] = inferred
 	return inferred, nil
+}
+
+// findRuleForVerb returns the cached or pattern-instantiated rule for the
+// [verb target] pair (verb="" means a bare lookup), or nil if no rule and no
+// pattern matches. Callers add their own fallback: bare lookups infer a
+// source-typed rule; verb lookups treat absence as inheritance from the
+// target's default rule.
+func (b *Build) findRuleForVerb(target, verb string) *parse.TargetRule {
+	if verb == "" {
+		if r, ok := b.concretes[target]; ok {
+			return r
+		}
+	} else {
+		if r, ok := b.verbConcretes[verbNodeKey{target, verb}]; ok {
+			return r
+		}
+	}
+	for _, pe := range b.patterns {
+		if pe.rule.Verb != verb {
+			continue
+		}
+		m := pe.re.FindStringSubmatch(target)
+		if m == nil {
+			continue
+		}
+		captures := m[1:]
+		instantiated := &parse.TargetRule{
+			Type:      pe.rule.Type,
+			Target:    target,
+			Verb:      verb,
+			Runner:    pe.rule.Runner,
+			HasDepSep: pe.rule.HasDepSep,
+			Body:      substituteCaptures(pe.rule.Body, captures),
+		}
+		for _, dep := range pe.rule.Deps {
+			instantiated.Deps = append(instantiated.Deps, parse.Dep{
+				Target: substituteCaptures(dep.Target, captures),
+				Verb:   dep.Verb,
+			})
+		}
+		if verb == "" {
+			b.concretes[target] = instantiated
+		} else {
+			b.verbConcretes[verbNodeKey{target, verb}] = instantiated
+		}
+		return instantiated
+	}
+	return nil
 }
 
 // substituteCaptures replaces $1..$9 in s with the corresponding capture group.

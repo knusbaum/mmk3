@@ -455,6 +455,21 @@ func TestPatternNoMatchInfersSource(t *testing.T) {
 	}
 }
 
+// A verb pattern rule must not be picked up by bare-target Resolve. Without
+// the guard in findRule, a target like main.c reached as a normal build dep
+// would match `[fmt '(.*\.[ch])']` and inherit its body, causing the verb to
+// fire during a regular (non-verb) build.
+func TestVerbPatternDoesNotApplyToBareResolve(t *testing.T) {
+	b := newBuild(t, `[fmt '(.*\.[ch])'] { clang-format -i $target; }`)
+	n, err := b.Resolve("main.c")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if n.rule.Type != "source" {
+		t.Errorf("expected inferred source type, got %q with body %q", n.rule.Type, n.rule.Body)
+	}
+}
+
 // --- generated script ---
 
 func TestGeneratedScriptContainsBuiltinFunctions(t *testing.T) {
