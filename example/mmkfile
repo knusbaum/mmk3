@@ -63,3 +63,17 @@ file '([0-9]+)' on buildimage:latest : $(( $1 - 1 )) $(( $1 - 2 )) {
 }
 
 #[clean '([0-9]+)'] : [delete $( seq 0 $1 )]
+
+base for x in [$(seq 1 5) $(seq 10 15)] exclude [x=11] : base_extra {
+    echo smallbase $x
+    sleep 1;
+}
+
+base_extra for x in [ $(seq 7 9) ] : [extra @ x=$x]
+
+
+
+extra for x in [$(seq 6 9) 11]{
+    echo bigbase $x
+    sleep 1;
+}

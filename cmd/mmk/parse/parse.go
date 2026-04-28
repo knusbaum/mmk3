@@ -62,6 +62,13 @@ type DefRunner struct {
 type Dep struct {
 	Target string
 	Verb   string
+	Combo  []Option // non-empty when dep addresses a specific matrix combo
+}
+
+// ForClause is one `for VAR in [expr]` clause in a matrix target rule.
+type ForClause struct {
+	Var  string // bash variable name (valid identifier)
+	Expr string // raw bash content inside [...], word-split at build time
 }
 
 // Option is a key=value annotation attached to a target rule's header.
@@ -85,6 +92,8 @@ type TargetRule struct {
 	AugmentDeps bool     // true if ':+' was used: deps inherit AND extend the default rule's deps (verb rules only)
 	Deps        []Dep    // may be nil
 	Options     []Option // key=value annotations from the rule header; preserves source order
+	ForClauses  []ForClause  // non-empty for matrix rules
+	Excludes    [][]Option   // combos to exclude; each sub-slice is a partial combo assignment
 	Body        string   // empty if no body (deps-only rule)
 	Description string   // joined `##`-prefixed comment lines immediately preceding this rule
 }
@@ -351,6 +360,42 @@ func (s *scanner) readQuotedInto(sb *strings.Builder, quote byte, allowBackslash
 		}
 		sb.WriteByte(s.advance())
 	}
+}
+
+// readBracketExpr reads the content between balanced '[' and ']', returning
+// the inner content (without the brackets). The opening '[' must be the next byte.
+func (s *scanner) readBracketExpr(openLine int) (string, error) {
+	s.advance() // consume '['
+	var sb strings.Builder
+	depth := 1
+	for depth > 0 {
+		b := s.peek()
+		switch b {
+		case 0:
+			return "", fmt.Errorf("line %d: unterminated '[' opened at line %d", s.line, openLine)
+		case '[':
+			depth++
+			sb.WriteByte(s.advance())
+		case ']':
+			depth--
+			if depth > 0 {
+				sb.WriteByte(s.advance())
+			} else {
+				s.advance() // consume closing ']'
+			}
+		case '"':
+			if err := s.readQuotedInto(&sb, '"', true); err != nil {
+				return "", err
+			}
+		case '\'':
+			if err := s.readQuotedInto(&sb, '\'', false); err != nil {
+				return "", err
+			}
+		default:
+			sb.WriteByte(s.advance())
+		}
+	}
+	return sb.String(), nil
 }
 
 // --- parser ---
@@ -893,11 +938,141 @@ func (p *parser) parseSubproject() (Directive, error) {
 	return &Subproject{Target: target, Runner: runner, Options: options}, nil
 }
 
+// parseForClause parses `VAR in [expr]` after the 'for' keyword has been consumed.
+func (p *parser) parseForClause() (ForClause, error) {
+	p.s.skipHorizontalSpace()
+	varName := p.s.readWord()
+	if varName == "" {
+		return ForClause{}, fmt.Errorf("line %d: expected variable name after 'for'", p.s.line)
+	}
+	if !isOptionKeyPrefix(varName) {
+		return ForClause{}, fmt.Errorf("line %d: %q is not a valid variable name after 'for'", p.s.line, varName)
+	}
+	p.s.skipHorizontalSpace()
+	in := p.s.readWord()
+	if in != "in" {
+		return ForClause{}, fmt.Errorf("line %d: expected 'in' after 'for %s', got %q", p.s.line, varName, in)
+	}
+	p.s.skipHorizontalSpace()
+	if p.s.peek() != '[' {
+		return ForClause{}, fmt.Errorf("line %d: expected '[' after 'for %s in'", p.s.line, varName)
+	}
+	openLine := p.s.line
+	expr, err := p.s.readBracketExpr(openLine)
+	if err != nil {
+		return ForClause{}, err
+	}
+	return ForClause{Var: varName, Expr: expr}, nil
+}
+
+// parseExcludeClause parses `[key=val key=val ...]` after the 'exclude' keyword has been consumed.
+func (p *parser) parseExcludeClause() ([]Option, error) {
+	p.s.skipHorizontalSpace()
+	if p.s.peek() != '[' {
+		return nil, fmt.Errorf("line %d: expected '[' after 'exclude'", p.s.line)
+	}
+	p.s.advance() // consume '['
+	var opts []Option
+	for {
+		p.s.skipHorizontalSpace()
+		b := p.s.peek()
+		if b == ']' {
+			p.s.advance()
+			break
+		}
+		if b == 0 || b == '\n' {
+			return nil, fmt.Errorf("line %d: unterminated exclude clause", p.s.line)
+		}
+		word := p.s.readWord()
+		if word == "" {
+			return nil, fmt.Errorf("line %d: expected key=value in exclude clause", p.s.line)
+		}
+		k, v, ok := parseOptionToken(word)
+		if !ok {
+			return nil, fmt.Errorf("line %d: expected key=value in exclude clause, got %q", p.s.line, word)
+		}
+		opts = append(opts, Option{Key: k, Value: v})
+	}
+	return opts, nil
+}
+
+// parseDepRef reads a '[...]' in a dep list, which may be:
+//
+//	[verb target]             existing verb dep
+//	[target]                  non-verb dep (target only)
+//	[target @ k=v ...]        combo-qualified non-verb dep
+//	[verb target @ k=v ...]   combo-qualified verb dep
+//
+// The opening '[' must be the current peek byte.
+func (p *parser) parseDepRef() (verb, target string, combo []Option, err error) {
+	openedAt := p.s.line
+	p.s.advance() // consume '['
+	p.s.skipHorizontalSpace()
+
+	first := p.s.readWord()
+	if first == "" {
+		err = fmt.Errorf("line %d: expected target or verb inside '[...]'", openedAt)
+		return
+	}
+	p.s.skipHorizontalSpace()
+
+	b := p.s.peek()
+	if b == ']' || b == '@' {
+		// Single-word: [target] or [target @ ...]
+		target = first
+	} else if b == 0 || b == '\n' {
+		err = fmt.Errorf("line %d: unterminated '[...]' dep reference", openedAt)
+		return
+	} else {
+		// Two-word: [verb target] or [verb target @ ...]
+		verb = first
+		var name string
+		name, err = p.parseName()
+		if err != nil {
+			return
+		}
+		target = name
+		p.s.skipHorizontalSpace()
+	}
+
+	if p.s.peek() == '@' {
+		p.s.advance() // consume '@'
+		for {
+			p.s.skipHorizontalSpace()
+			if p.s.peek() == ']' || p.s.peek() == 0 || p.s.peek() == '\n' {
+				break
+			}
+			word := p.s.readWord()
+			if word == "" {
+				err = fmt.Errorf("line %d: expected key=value after '@' in dep reference", p.s.line)
+				return
+			}
+			var k, v string
+			var ok bool
+			k, v, ok = parseOptionToken(word)
+			if !ok {
+				err = fmt.Errorf("line %d: expected key=value after '@', got %q", p.s.line, word)
+				return
+			}
+			combo = append(combo, Option{Key: k, Value: v})
+		}
+	}
+
+	if p.s.peek() != ']' {
+		err = fmt.Errorf("line %d: expected ']' in dep reference, got %q", p.s.line, p.s.peek())
+		return
+	}
+	p.s.advance()
+	return
+}
+
 func (p *parser) parseTargetRule() (*TargetRule, error) {
 	// Collect header tokens (words/strings/patterns) until the dep-separator ':',
 	// '{', '#', newline, or EOF. An embedded ':' within a name (e.g. "image:tag")
 	// is not a separator — colonIsSeparator disambiguates the two cases.
 	var header []headerToken
+	var forClauses []ForClause
+	var excludes [][]Option
 	for {
 		p.s.skipHorizontalSpace()
 		b := p.s.peek()
@@ -906,6 +1081,31 @@ func (p *parser) parseTargetRule() (*TargetRule, error) {
 		}
 		if b == ':' && p.s.colonIsSeparator() {
 			break
+		}
+		// Before calling parseHeaderToken, peek at the word to detect keywords.
+		if isWordByte(b) {
+			saved, savedLine := p.s.pos, p.s.line
+			word := p.s.readWord()
+			p.s.pos, p.s.line = saved, savedLine
+
+			if word == "for" {
+				p.s.readWord() // consume "for"
+				fc, fcErr := p.parseForClause()
+				if fcErr != nil {
+					return nil, fcErr
+				}
+				forClauses = append(forClauses, fc)
+				continue
+			}
+			if word == "exclude" {
+				p.s.readWord() // consume "exclude"
+				exc, excErr := p.parseExcludeClause()
+				if excErr != nil {
+					return nil, excErr
+				}
+				excludes = append(excludes, exc)
+				continue
+			}
 		}
 		tok, err := p.parseHeaderToken()
 		if err != nil {
@@ -925,7 +1125,7 @@ func (p *parser) parseTargetRule() (*TargetRule, error) {
 	if err != nil {
 		return nil, fmt.Errorf("line %d: %w", p.s.line, err)
 	}
-	rule := &TargetRule{Type: typ, Target: target, Pattern: pattern, Runner: runner, Verb: verb, Options: options}
+	rule := &TargetRule{Type: typ, Target: target, Pattern: pattern, Runner: runner, Verb: verb, Options: options, ForClauses: forClauses, Excludes: excludes}
 
 	// Optional deps after ':' (or ':+' for augment-inherit mode on verb rules).
 	p.s.skipHorizontalSpace()
@@ -946,11 +1146,11 @@ func (p *parser) parseTargetRule() (*TargetRule, error) {
 				break
 			}
 			if b == '[' {
-				dverb, dtarget, _, err := p.parseBracketed()
-				if err != nil {
-					return nil, err
+				dverb, dtarget, combo, dErr := p.parseDepRef()
+				if dErr != nil {
+					return nil, dErr
 				}
-				rule.Deps = append(rule.Deps, Dep{Target: dtarget, Verb: dverb})
+				rule.Deps = append(rule.Deps, Dep{Target: dtarget, Verb: dverb, Combo: combo})
 			} else {
 				name, err := p.parseName()
 				if err != nil {

@@ -841,6 +841,298 @@ func TestErrorLineNumberInHeader(t *testing.T) {
 	assertContains(t, err, "line 3")
 }
 
+// --- matrix: for clauses ---
+
+func TestMatrixSingleForClause(t *testing.T) {
+	f := mustParse(t, `build for os in [linux macos] { echo $os }`)
+	r := asRule(t, f.Directives[0])
+	expect(t, "Target", r.Target, "build")
+	if len(r.ForClauses) != 1 {
+		t.Fatalf("ForClauses: got %d, want 1", len(r.ForClauses))
+	}
+	if r.ForClauses[0].Var != "os" {
+		t.Errorf("ForClauses[0].Var: got %q, want %q", r.ForClauses[0].Var, "os")
+	}
+	if r.ForClauses[0].Expr != "linux macos" {
+		t.Errorf("ForClauses[0].Expr: got %q, want %q", r.ForClauses[0].Expr, "linux macos")
+	}
+	if r.Body == "" {
+		t.Error("expected non-empty body")
+	}
+}
+
+func TestMatrixMultipleForClauses(t *testing.T) {
+	f := mustParse(t, `build for os in [linux macos] for go in [1.20 1.21] : src { echo hi }`)
+	r := asRule(t, f.Directives[0])
+	if len(r.ForClauses) != 2 {
+		t.Fatalf("ForClauses: got %d, want 2", len(r.ForClauses))
+	}
+	if r.ForClauses[0].Var != "os" || r.ForClauses[0].Expr != "linux macos" {
+		t.Errorf("ForClauses[0]: got {%q %q}", r.ForClauses[0].Var, r.ForClauses[0].Expr)
+	}
+	if r.ForClauses[1].Var != "go" || r.ForClauses[1].Expr != "1.20 1.21" {
+		t.Errorf("ForClauses[1]: got {%q %q}", r.ForClauses[1].Var, r.ForClauses[1].Expr)
+	}
+	expectDeps(t, r.Deps, "src")
+}
+
+func TestMatrixForClauseWithType(t *testing.T) {
+	f := mustParse(t, `file build for os in [linux] : src { :; }`)
+	r := asRule(t, f.Directives[0])
+	expect(t, "Type", r.Type, "file")
+	expect(t, "Target", r.Target, "build")
+	if len(r.ForClauses) != 1 || r.ForClauses[0].Var != "os" {
+		t.Errorf("ForClauses: got %v", r.ForClauses)
+	}
+}
+
+func TestMatrixForClauseBeforeOn(t *testing.T) {
+	f := mustParse(t, `build for os in [linux macos] on myrunner : src { :; }`)
+	r := asRule(t, f.Directives[0])
+	expect(t, "Target", r.Target, "build")
+	expect(t, "Runner", r.Runner, "myrunner")
+	if len(r.ForClauses) != 1 || r.ForClauses[0].Var != "os" {
+		t.Fatalf("ForClauses: got %v", r.ForClauses)
+	}
+}
+
+func TestMatrixForClauseOnWithVar(t *testing.T) {
+	f := mustParse(t, `build for os in [linux macos] on runner-$os : src { :; }`)
+	r := asRule(t, f.Directives[0])
+	expect(t, "Runner", r.Runner, "runner-$os")
+	if len(r.ForClauses) != 1 {
+		t.Fatalf("ForClauses: got %d, want 1", len(r.ForClauses))
+	}
+}
+
+func TestMatrixForClauseKeywordsAsValues(t *testing.T) {
+	// 'on', 'in', 'for', 'exclude' must be usable as values inside [...]
+	f := mustParse(t, `build for word in [on in for exclude] { :; }`)
+	r := asRule(t, f.Directives[0])
+	if len(r.ForClauses) != 1 {
+		t.Fatalf("ForClauses: got %d, want 1", len(r.ForClauses))
+	}
+	if r.ForClauses[0].Expr != "on in for exclude" {
+		t.Errorf("Expr: got %q, want %q", r.ForClauses[0].Expr, "on in for exclude")
+	}
+}
+
+func TestMatrixForClauseWithBashVar(t *testing.T) {
+	f := mustParse(t, `build for os in [$PLATFORMS] { :; }`)
+	r := asRule(t, f.Directives[0])
+	if len(r.ForClauses) != 1 || r.ForClauses[0].Expr != "$PLATFORMS" {
+		t.Errorf("ForClauses[0].Expr: got %q, want %q", r.ForClauses[0].Expr, "$PLATFORMS")
+	}
+}
+
+func TestMatrixForClauseWithSubshell(t *testing.T) {
+	f := mustParse(t, `build for os in [$(cat platforms.txt)] { :; }`)
+	r := asRule(t, f.Directives[0])
+	if len(r.ForClauses) != 1 || r.ForClauses[0].Expr != "$(cat platforms.txt)" {
+		t.Errorf("ForClauses[0].Expr: got %q, want %q", r.ForClauses[0].Expr, "$(cat platforms.txt)")
+	}
+}
+
+func TestMatrixForClauseNestedBrackets(t *testing.T) {
+	// Nested [...] inside the expr must be balanced correctly.
+	f := mustParse(t, `build for os in [linux [extra]] { :; }`)
+	r := asRule(t, f.Directives[0])
+	if len(r.ForClauses) != 1 || r.ForClauses[0].Expr != "linux [extra]" {
+		t.Errorf("ForClauses[0].Expr: got %q, want %q", r.ForClauses[0].Expr, "linux [extra]")
+	}
+}
+
+// --- matrix: exclude clauses ---
+
+func TestMatrixExcludeSingleClause(t *testing.T) {
+	f := mustParse(t, `build for os in [linux macos] for go in [1.20 1.21] exclude [os=macos go=1.20] { :; }`)
+	r := asRule(t, f.Directives[0])
+	if len(r.Excludes) != 1 {
+		t.Fatalf("Excludes: got %d, want 1", len(r.Excludes))
+	}
+	exc := r.Excludes[0]
+	if len(exc) != 2 {
+		t.Fatalf("Excludes[0] len: got %d, want 2", len(exc))
+	}
+	if exc[0].Key != "os" || exc[0].Value != "macos" {
+		t.Errorf("Excludes[0][0]: got %v, want {os macos}", exc[0])
+	}
+	if exc[1].Key != "go" || exc[1].Value != "1.20" {
+		t.Errorf("Excludes[0][1]: got %v, want {go 1.20}", exc[1])
+	}
+}
+
+func TestMatrixExcludeMultipleClauses(t *testing.T) {
+	f := mustParse(t, `build for os in [linux macos] for go in [1.20 1.21] exclude [os=macos go=1.20] exclude [os=linux go=1.21] { :; }`)
+	r := asRule(t, f.Directives[0])
+	if len(r.Excludes) != 2 {
+		t.Fatalf("Excludes: got %d, want 2", len(r.Excludes))
+	}
+}
+
+func TestMatrixExcludePartialCombo(t *testing.T) {
+	// An exclude with fewer keys than the full combo is valid (partial match).
+	f := mustParse(t, `build for os in [linux macos] for go in [1.20 1.21] exclude [os=macos] { :; }`)
+	r := asRule(t, f.Directives[0])
+	if len(r.Excludes) != 1 || len(r.Excludes[0]) != 1 {
+		t.Fatalf("Excludes: got %v", r.Excludes)
+	}
+	if r.Excludes[0][0].Key != "os" || r.Excludes[0][0].Value != "macos" {
+		t.Errorf("Excludes[0][0]: got %v", r.Excludes[0][0])
+	}
+}
+
+// --- matrix: dep combo references ---
+
+func TestMatrixDepSingleWord(t *testing.T) {
+	// [target] in dep list: no verb, no combo — new valid form.
+	f := mustParse(t, `foo : [build]`)
+	r := asRule(t, f.Directives[0])
+	if len(r.Deps) != 1 {
+		t.Fatalf("Deps: got %d, want 1", len(r.Deps))
+	}
+	d := r.Deps[0]
+	if d.Target != "build" {
+		t.Errorf("Target: got %q, want %q", d.Target, "build")
+	}
+	if d.Verb != "" {
+		t.Errorf("Verb: got %q, want empty", d.Verb)
+	}
+	if len(d.Combo) != 0 {
+		t.Errorf("Combo: got %v, want empty", d.Combo)
+	}
+}
+
+func TestMatrixDepComboNoVerb(t *testing.T) {
+	f := mustParse(t, `foo : [build @ os=linux go=1.20]`)
+	r := asRule(t, f.Directives[0])
+	if len(r.Deps) != 1 {
+		t.Fatalf("Deps: got %d, want 1", len(r.Deps))
+	}
+	d := r.Deps[0]
+	if d.Target != "build" {
+		t.Errorf("Target: got %q, want %q", d.Target, "build")
+	}
+	if d.Verb != "" {
+		t.Errorf("Verb: got %q, want empty", d.Verb)
+	}
+	if len(d.Combo) != 2 {
+		t.Fatalf("Combo len: got %d, want 2", len(d.Combo))
+	}
+	if d.Combo[0].Key != "os" || d.Combo[0].Value != "linux" {
+		t.Errorf("Combo[0]: got %v, want {os linux}", d.Combo[0])
+	}
+	if d.Combo[1].Key != "go" || d.Combo[1].Value != "1.20" {
+		t.Errorf("Combo[1]: got %v, want {go 1.20}", d.Combo[1])
+	}
+}
+
+func TestMatrixDepComboWithVerb(t *testing.T) {
+	f := mustParse(t, `foo : [check build @ os=linux]`)
+	r := asRule(t, f.Directives[0])
+	if len(r.Deps) != 1 {
+		t.Fatalf("Deps: got %d, want 1", len(r.Deps))
+	}
+	d := r.Deps[0]
+	if d.Verb != "check" {
+		t.Errorf("Verb: got %q, want %q", d.Verb, "check")
+	}
+	if d.Target != "build" {
+		t.Errorf("Target: got %q, want %q", d.Target, "build")
+	}
+	if len(d.Combo) != 1 || d.Combo[0].Key != "os" || d.Combo[0].Value != "linux" {
+		t.Errorf("Combo: got %v, want [{os linux}]", d.Combo)
+	}
+}
+
+func TestMatrixDepMixedWithPlainDeps(t *testing.T) {
+	f := mustParse(t, `foo : [build @ os=linux] plain [check other] dep2`)
+	r := asRule(t, f.Directives[0])
+	if len(r.Deps) != 4 {
+		t.Fatalf("Deps: got %d, want 4", len(r.Deps))
+	}
+	if r.Deps[0].Target != "build" || len(r.Deps[0].Combo) != 1 {
+		t.Errorf("Deps[0]: got %+v", r.Deps[0])
+	}
+	if r.Deps[1].Target != "plain" || len(r.Deps[1].Combo) != 0 {
+		t.Errorf("Deps[1]: got %+v", r.Deps[1])
+	}
+	if r.Deps[2].Target != "other" || r.Deps[2].Verb != "check" {
+		t.Errorf("Deps[2]: got %+v", r.Deps[2])
+	}
+	if r.Deps[3].Target != "dep2" {
+		t.Errorf("Deps[3]: got %+v", r.Deps[3])
+	}
+}
+
+func TestMatrixMultipleForClausesWithVarOnClause(t *testing.T) {
+	// Two for clauses combined with 'on runner-$os' (var from first for).
+	f := mustParse(t, `build for os in [linux macos] for go in [1.20 1.21] on runner-$os : src { :; }`)
+	r := asRule(t, f.Directives[0])
+	if len(r.ForClauses) != 2 {
+		t.Fatalf("ForClauses: got %d, want 2", len(r.ForClauses))
+	}
+	if r.ForClauses[0].Var != "os" || r.ForClauses[0].Expr != "linux macos" {
+		t.Errorf("ForClauses[0]: got {%q %q}", r.ForClauses[0].Var, r.ForClauses[0].Expr)
+	}
+	if r.ForClauses[1].Var != "go" || r.ForClauses[1].Expr != "1.20 1.21" {
+		t.Errorf("ForClauses[1]: got {%q %q}", r.ForClauses[1].Var, r.ForClauses[1].Expr)
+	}
+	expect(t, "Runner", r.Runner, "runner-$os")
+}
+
+func TestMatrixDepComboThreeKeyVals(t *testing.T) {
+	// Three key=val pairs in a combo dep specifier.
+	f := mustParse(t, `foo : [build @ os=linux libc=musl go=1.21]`)
+	r := asRule(t, f.Directives[0])
+	if len(r.Deps) != 1 {
+		t.Fatalf("Deps: got %d, want 1", len(r.Deps))
+	}
+	d := r.Deps[0]
+	if d.Target != "build" {
+		t.Errorf("Target: got %q, want %q", d.Target, "build")
+	}
+	if len(d.Combo) != 3 {
+		t.Fatalf("Combo len: got %d, want 3", len(d.Combo))
+	}
+	if d.Combo[0].Key != "os" || d.Combo[0].Value != "linux" {
+		t.Errorf("Combo[0]: got %v", d.Combo[0])
+	}
+	if d.Combo[1].Key != "libc" || d.Combo[1].Value != "musl" {
+		t.Errorf("Combo[1]: got %v", d.Combo[1])
+	}
+	if d.Combo[2].Key != "go" || d.Combo[2].Value != "1.21" {
+		t.Errorf("Combo[2]: got %v", d.Combo[2])
+	}
+}
+
+// --- matrix: error cases ---
+
+func TestMatrixErrorForMissingVarName(t *testing.T) {
+	// 'in' gets consumed as the var name, then the parser can't find the 'in' keyword.
+	expectError(t, `build for in [linux] { :; }`, "'in'")
+}
+
+func TestMatrixErrorForMissingIn(t *testing.T) {
+	expectError(t, `build for os [linux] { :; }`, "'in'")
+}
+
+func TestMatrixErrorForMissingBracket(t *testing.T) {
+	expectError(t, `build for os in linux macos { :; }`, "'['")
+}
+
+func TestMatrixErrorExcludeMissingBracket(t *testing.T) {
+	expectError(t, `build for os in [linux] exclude os=linux { :; }`, "'['")
+}
+
+func TestMatrixErrorUnterminatedBracketExpr(t *testing.T) {
+	expectError(t, `build for os in [linux macos { :; }`, "unterminated")
+}
+
+func TestMatrixErrorExcludeNonKeyVal(t *testing.T) {
+	expectError(t, `build for os in [linux] exclude [linux] { :; }`, "key=value")
+}
+
 // --- helpers ---
 
 func mustParse(t *testing.T, src string) *File {

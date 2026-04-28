@@ -1532,6 +1532,343 @@ image myimage : {
 	}
 }
 
+// --- matrix expansion ---
+
+func TestMatrixExpansionCreatesCombos(t *testing.T) {
+	b := newBuild(t, `build for os in [linux macos] { echo $os }`)
+	// Aggregator replaces original.
+	if _, ok := b.concretes["build"]; !ok {
+		t.Fatal("expected aggregator concrete 'build'")
+	}
+	// Both combo targets registered.
+	linuxName := comboTargetName("build", matrixCombo{"os": "linux"})
+	macosName := comboTargetName("build", matrixCombo{"os": "macos"})
+	if _, ok := b.concretes[linuxName]; !ok {
+		t.Errorf("expected combo concrete %q", linuxName)
+	}
+	if _, ok := b.concretes[macosName]; !ok {
+		t.Errorf("expected combo concrete %q", macosName)
+	}
+}
+
+func TestMatrixCrossProduct(t *testing.T) {
+	b := newBuild(t, `build for os in [linux macos] for libc in [musl glibc] { :; }`)
+	want := []matrixCombo{
+		{"os": "linux", "libc": "musl"},
+		{"os": "linux", "libc": "glibc"},
+		{"os": "macos", "libc": "musl"},
+		{"os": "macos", "libc": "glibc"},
+	}
+	for _, combo := range want {
+		name := comboTargetName("build", combo)
+		if _, ok := b.concretes[name]; !ok {
+			t.Errorf("expected combo concrete %q", name)
+		}
+	}
+	info := b.matrixInfo["build"]
+	if info == nil {
+		t.Fatal("expected matrixInfo for 'build'")
+	}
+	if len(info.combos) != 4 {
+		t.Errorf("combos: got %d, want 4", len(info.combos))
+	}
+}
+
+func TestMatrixAggregatorDependsOnAllCombos(t *testing.T) {
+	b := newBuild(t, `build for os in [linux macos] for libc in [musl glibc] { :; }`)
+	agg, err := b.Resolve("build")
+	if err != nil {
+		t.Fatalf("Resolve aggregator: %v", err)
+	}
+	deps := agg.Dependencies()
+	if len(deps) != 4 {
+		t.Fatalf("aggregator deps: got %d, want 4: %v", len(deps), depTargets(deps))
+	}
+}
+
+func TestMatrixExclude(t *testing.T) {
+	b := newBuild(t, `build for os in [linux macos] for libc in [musl glibc] exclude [os=macos libc=musl] { :; }`)
+	// 4 combos minus 1 excluded = 3.
+	info := b.matrixInfo["build"]
+	if info == nil {
+		t.Fatal("expected matrixInfo")
+	}
+	if len(info.combos) != 3 {
+		t.Errorf("combos after exclude: got %d, want 3", len(info.combos))
+	}
+	excluded := comboTargetName("build", matrixCombo{"os": "macos", "libc": "musl"})
+	if _, ok := b.concretes[excluded]; ok {
+		t.Errorf("excluded combo %q should not be in concretes", excluded)
+	}
+}
+
+func TestMatrixExcludePartial(t *testing.T) {
+	// Partial exclude [os=macos] should drop both macos combos.
+	b := newBuild(t, `build for os in [linux macos] for libc in [musl glibc] exclude [os=macos] { :; }`)
+	info := b.matrixInfo["build"]
+	if len(info.combos) != 2 {
+		t.Errorf("combos after partial exclude: got %d, want 2", len(info.combos))
+	}
+}
+
+func TestMatrixVarsExportedToBody(t *testing.T) {
+	dir := t.TempDir()
+	out := dir + "/out.txt"
+	src := fmt.Sprintf(`build for os in [linux] for libc in [musl] {
+    printf '%%s %%s' "$os" "$libc" > %q
+}`, out)
+	b := newBuild(t, src)
+	name := comboTargetName("build", matrixCombo{"os": "linux", "libc": "musl"})
+	n, err := b.Resolve(name)
+	if err != nil {
+		t.Fatalf("Resolve combo: %v", err)
+	}
+	if err := n.Run(); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	if string(got) != "linux musl" {
+		t.Errorf("body output: got %q, want %q", string(got), "linux musl")
+	}
+}
+
+func TestMatrixPlainDepResolvesToAggregator(t *testing.T) {
+	// Plain dep on a matrix target resolves to the aggregator, regardless of
+	// whether the caller is also a matrix rule or what dimensions they share.
+	b := newBuild(t, `
+build for os in [linux macos] for libc in [musl glibc] { :; }
+test for os in [linux macos] : build { :; }
+`)
+	testLinux := comboTargetName("test", matrixCombo{"os": "linux"})
+	n, err := b.Resolve(testLinux)
+	if err != nil {
+		t.Fatalf("Resolve %q: %v", testLinux, err)
+	}
+	deps := n.Dependencies()
+	if len(deps) != 1 {
+		t.Fatalf("test[os=linux] deps: got %d, want 1 (aggregator): %v", len(deps), depTargets(deps))
+	}
+	if deps[0].target != "build" {
+		t.Errorf("dep: got %q, want %q", deps[0].target, "build")
+	}
+}
+
+func TestMatrixSingletonDep(t *testing.T) {
+	// A non-matrix dep from a matrix node should resolve to the singleton directly.
+	b := newBuild(t, `
+artifacts { :; }
+test for os in [linux macos] : artifacts { :; }
+`)
+	testLinux := comboTargetName("test", matrixCombo{"os": "linux"})
+	n, err := b.Resolve(testLinux)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	deps := n.Dependencies()
+	if len(deps) != 1 {
+		t.Fatalf("deps: got %d, want 1: %v", len(deps), depTargets(deps))
+	}
+	if deps[0].target != "artifacts" {
+		t.Errorf("dep target: got %q, want %q", deps[0].target, "artifacts")
+	}
+}
+
+func TestMatrixExplicitComboDep(t *testing.T) {
+	// [build @ os=linux libc=musl] resolves to exactly that one combo.
+	b := newBuild(t, `
+build for os in [linux macos] for libc in [musl glibc] { :; }
+foo : [build @ os=linux libc=musl] { :; }
+`)
+	n, err := b.Resolve("foo")
+	if err != nil {
+		t.Fatalf("Resolve foo: %v", err)
+	}
+	deps := n.Dependencies()
+	if len(deps) != 1 {
+		t.Fatalf("deps: got %d, want 1: %v", len(deps), depTargets(deps))
+	}
+	want := comboTargetName("build", matrixCombo{"os": "linux", "libc": "musl"})
+	if deps[0].target != want {
+		t.Errorf("dep: got %q, want %q", deps[0].target, want)
+	}
+}
+
+func TestMatrixExplicitComboDepZeroMatchErrors(t *testing.T) {
+	// Explicit combo dep with no matching combos should error, not silently add zero deps.
+	b := newBuild(t, `
+build for os in [linux macos] { :; }
+foo : [build @ os=windows] { :; }
+`)
+	n, err := b.Resolve("foo")
+	if err != nil {
+		t.Fatalf("Resolve foo: %v", err)
+	}
+	deps := n.Dependencies()
+	_ = deps
+	if n.resolveErr == nil {
+		t.Fatal("expected error when explicit combo dep matches no combos")
+	}
+}
+
+func TestMatrixExplicitComboDepDisjointRangeErrors(t *testing.T) {
+	// [extra @ x=$x] where the dep's x values and caller's x values are disjoint
+	// should error, not silently add zero deps.
+	b := newBuild(t, `
+extra for x in [6 7 8 9] { :; }
+base for x in [1 2 3] : [extra @ x=$x] { :; }
+`)
+	baseName := comboTargetName("base", matrixCombo{"x": "1"})
+	n, err := b.Resolve(baseName)
+	if err != nil {
+		t.Fatalf("Resolve %q: %v", baseName, err)
+	}
+	deps := n.Dependencies()
+	_ = deps
+	if n.resolveErr == nil {
+		t.Fatal("expected error when $x substitution matches no extra combos")
+	}
+}
+
+func TestMatrixRunnerVarSubstitution(t *testing.T) {
+	// on runner-$os should be substituted per combo.
+	b := newBuild(t, `
+image runner-linux skip_if=true :
+image runner-macos skip_if=true :
+build for os in [linux macos] on runner-$os { :; }
+`)
+	linuxName := comboTargetName("build", matrixCombo{"os": "linux"})
+	macosName := comboTargetName("build", matrixCombo{"os": "macos"})
+
+	linuxRule := b.concretes[linuxName]
+	if linuxRule == nil {
+		t.Fatalf("combo %q not found", linuxName)
+	}
+	if linuxRule.Runner != "runner-linux" {
+		t.Errorf("linux combo runner: got %q, want %q", linuxRule.Runner, "runner-linux")
+	}
+
+	macosRule := b.concretes[macosName]
+	if macosRule == nil {
+		t.Fatalf("combo %q not found", macosName)
+	}
+	if macosRule.Runner != "runner-macos" {
+		t.Errorf("macos combo runner: got %q, want %q", macosRule.Runner, "runner-macos")
+	}
+}
+
+func TestMatrixVerbInheritsMatrix(t *testing.T) {
+	// [clean build] on a matrix rule should apply to all combos.
+	b := newBuild(t, `
+build for os in [linux macos] { :; }
+[clean build] { rm -f $os }
+`)
+	// Resolving [clean build] should reach the aggregator, and verb deps
+	// should propagate to both combos.
+	n, err := b.ResolveVerb("build", "clean")
+	if err != nil {
+		t.Fatalf("ResolveVerb: %v", err)
+	}
+	deps := n.Dependencies()
+	if len(deps) != 2 {
+		t.Fatalf("[clean build] deps: got %d, want 2: %v", len(deps), depTargets(deps))
+	}
+}
+
+func TestMatrixBashExpansionInForExpr(t *testing.T) {
+	// Bash variable in for expr is evaluated at build time.
+	b := newBuild(t, `
+OSES="linux macos"
+build for os in [$OSES] { :; }
+`)
+	info := b.matrixInfo["build"]
+	if info == nil {
+		t.Fatal("expected matrixInfo")
+	}
+	if len(info.combos) != 2 {
+		t.Errorf("combos from bash expansion: got %d, want 2", len(info.combos))
+	}
+}
+
+func TestMatrixErrorOnPatternRule(t *testing.T) {
+	_, err := NewBuild([]byte(`'(.*)' for os in [linux] { :; }`))
+	if err == nil {
+		t.Fatal("expected error for matrix on pattern rule")
+	}
+}
+
+func TestMatrixErrorAllCombosExcluded(t *testing.T) {
+	_, err := NewBuild([]byte(`build for os in [linux] exclude [os=linux] { :; }`))
+	if err == nil {
+		t.Fatal("expected error when all combos are excluded")
+	}
+}
+
+func TestMatrixExplicitComboDepWithVarSubstitution(t *testing.T) {
+	// [build @ os=$os] from test[os=linux go=1.20] substitutes $os=linux and
+	// fans out over the unspecified libc dimension.
+	b := newBuild(t, `
+build for os in [linux macos] for libc in [musl glibc] { :; }
+test for os in [linux macos] for go in [1.20 1.21] : [build @ os=$os] { :; }
+`)
+	testLinuxGo120 := comboTargetName("test", matrixCombo{"os": "linux", "go": "1.20"})
+	n, err := b.Resolve(testLinuxGo120)
+	if err != nil {
+		t.Fatalf("Resolve %q: %v", testLinuxGo120, err)
+	}
+	deps := n.Dependencies()
+	if len(deps) != 2 {
+		t.Fatalf("test[os=linux go=1.20] deps: got %d, want 2: %v", len(deps), depTargets(deps))
+	}
+	linuxMusl := comboTargetName("build", matrixCombo{"os": "linux", "libc": "musl"})
+	linuxGlibc := comboTargetName("build", matrixCombo{"os": "linux", "libc": "glibc"})
+	got := depTargets(deps)
+	if !contains(got, linuxMusl) {
+		t.Errorf("expected dep %q in %v", linuxMusl, got)
+	}
+	if !contains(got, linuxGlibc) {
+		t.Errorf("expected dep %q in %v", linuxGlibc, got)
+	}
+}
+
+func TestMatrixExplicitComboDepPartialFanOut(t *testing.T) {
+	// [build @ os=linux] (literal, no $var) fans out over the unspecified libc
+	// dimension regardless of which combo the caller is in.
+	b := newBuild(t, `
+build for os in [linux macos] for libc in [musl glibc] { :; }
+foo : [build @ os=linux] { :; }
+`)
+	n, err := b.Resolve("foo")
+	if err != nil {
+		t.Fatalf("Resolve foo: %v", err)
+	}
+	deps := n.Dependencies()
+	if len(deps) != 2 {
+		t.Fatalf("foo deps: got %d, want 2: %v", len(deps), depTargets(deps))
+	}
+	linuxMusl := comboTargetName("build", matrixCombo{"os": "linux", "libc": "musl"})
+	linuxGlibc := comboTargetName("build", matrixCombo{"os": "linux", "libc": "glibc"})
+	got := depTargets(deps)
+	if !contains(got, linuxMusl) {
+		t.Errorf("expected dep %q in %v", linuxMusl, got)
+	}
+	if !contains(got, linuxGlibc) {
+		t.Errorf("expected dep %q in %v", linuxGlibc, got)
+	}
+}
+
+// contains reports whether slice contains s.
+func contains(slice []string, s string) bool {
+	for _, v := range slice {
+		if v == s {
+			return true
+		}
+	}
+	return false
+}
+
 func TestDefBodyVerbDuplicateError(t *testing.T) {
 	src := `
 deftype mytype {

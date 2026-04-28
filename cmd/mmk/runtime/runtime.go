@@ -49,6 +49,15 @@ type defVerbBodyKey struct {
 	verb     string
 }
 
+// matrixCombo is a set of variable assignments for one matrix combination.
+type matrixCombo map[string]string
+
+// matrixRuleInfo tracks the variables and combos for a matrix rule.
+type matrixRuleInfo struct {
+	vars   []string      // variable names in declaration order
+	combos []matrixCombo // valid combos after applying excludes
+}
+
 // subprojectInfo is what the runtime tracks about each `subproject` directive
 // after expansion: the target name (also the registered top-level target),
 // the runner clause to wrap delegations in, and the directory containing the
@@ -80,6 +89,8 @@ type Build struct {
 	defVerbBodies      map[defVerbBodyKey]bool
 	userDefBodyOptions map[defVerbBodyKey][]parse.Option // user defbody options keyed by (type, verb)
 	subprojects        map[string]*subprojectInfo        // subproject target → metadata for sub-path delegation
+	matrixInfo    map[string]*matrixRuleInfo // base target → matrix info (for aggregators and dep resolution)
+	matrixVars    map[string]matrixCombo     // internal combo target name → its variable assignments
 	genPath       string
 	genFile       *os.File
 
@@ -293,6 +304,8 @@ func NewBuild(src []byte) (*Build, error) {
 		defVerbBodies:      make(map[defVerbBodyKey]bool),
 		userDefBodyOptions: make(map[defVerbBodyKey][]parse.Option),
 		subprojects:        make(map[string]*subprojectInfo),
+		matrixInfo:         make(map[string]*matrixRuleInfo),
+		matrixVars:         make(map[string]matrixCombo),
 		runnerStates:       make(map[string]string),
 	}
 
@@ -363,6 +376,12 @@ func NewBuild(src []byte) (*Build, error) {
 	// and concrete-rule registration, so the rest of the build sees resolved
 	// names.
 	if err := b.expandRuleNames(f); err != nil {
+		b.genFile.Close()
+		os.Remove(b.genPath)
+		return nil, err
+	}
+
+	if err := b.expandMatrixRules(f); err != nil {
 		b.genFile.Close()
 		os.Remove(b.genPath)
 		return nil, err
@@ -792,12 +811,64 @@ func (n *TargetNode) Dependencies() []*TargetNode {
 	}
 
 	for _, dep := range n.rule.Deps {
+		// Explicit combo specifier: [target @ k=v ...], values may contain $var.
+		if len(dep.Combo) > 0 {
+			currentCombo := n.build.matrixVars[n.target]
+			constraints := make(matrixCombo, len(dep.Combo))
+			for _, opt := range dep.Combo {
+				constraints[opt.Key] = substituteMatrixVars(opt.Value, currentCombo)
+			}
+			var err error
+			if info, ok := n.build.matrixInfo[dep.Target]; ok {
+				// Fan-out over combos that satisfy all constraints.
+				preFanOut := len(n.deps)
+				for _, combo := range info.combos {
+					if !comboMatchesConstraints(combo, constraints) {
+						continue
+					}
+					internalName := comboTargetName(dep.Target, combo)
+					var depNode *TargetNode
+					if dep.Verb != "" {
+						depNode, err = n.build.ResolveVerb(internalName, dep.Verb)
+					} else {
+						depNode, err = n.build.Resolve(internalName)
+					}
+					if err != nil {
+						n.resolveErr = err
+						return n.deps
+					}
+					n.deps = append(n.deps, depNode)
+				}
+				if len(n.deps) == preFanOut {
+					n.resolveErr = fmt.Errorf("target %q: dep [%s @ %v] matched no combos", n.target, dep.Target, constraints)
+					return n.deps
+				}
+			} else {
+				// Non-matrix dep: resolve the exact combo-named target.
+				internalName := comboTargetName(dep.Target, constraints)
+				var depNode *TargetNode
+				if dep.Verb != "" {
+					depNode, err = n.build.ResolveVerb(internalName, dep.Verb)
+				} else {
+					depNode, err = n.build.Resolve(internalName)
+				}
+				if err != nil {
+					n.resolveErr = err
+					return n.deps
+				}
+				n.deps = append(n.deps, depNode)
+			}
+			continue
+		}
+
 		targets, err := n.build.expandDep(dep.Target)
 		if err != nil {
 			n.resolveErr = err
 			return n.deps
 		}
 		for _, target := range targets {
+			// Plain dep: resolve as-is. Matrix targets have an aggregator registered
+			// under the base name, so this naturally depends on all combos.
 			var depNode *TargetNode
 			if dep.Verb != "" {
 				depNode, err = n.build.ResolveVerb(target, dep.Verb)
@@ -840,12 +911,62 @@ func (n *TargetNode) Dependencies() []*TargetNode {
 func (n *TargetNode) verbDependencies() []*TargetNode {
 	if n.rule != nil && n.rule.HasDepSep {
 		for _, dep := range n.rule.Deps {
+			// Explicit combo specifier: [target @ k=v ...], values may contain $var.
+			if len(dep.Combo) > 0 {
+				currentCombo := n.build.matrixVars[n.target]
+				constraints := make(matrixCombo, len(dep.Combo))
+				for _, opt := range dep.Combo {
+					constraints[opt.Key] = substituteMatrixVars(opt.Value, currentCombo)
+				}
+				var err error
+				if info, ok := n.build.matrixInfo[dep.Target]; ok {
+					preFanOut := len(n.deps)
+					for _, combo := range info.combos {
+						if !comboMatchesConstraints(combo, constraints) {
+							continue
+						}
+						internalName := comboTargetName(dep.Target, combo)
+						var depNode *TargetNode
+						if dep.Verb != "" {
+							depNode, err = n.build.ResolveVerb(internalName, dep.Verb)
+						} else {
+							depNode, err = n.build.Resolve(internalName)
+						}
+						if err != nil {
+							n.resolveErr = err
+							return n.deps
+						}
+						n.deps = append(n.deps, depNode)
+					}
+					if len(n.deps) == preFanOut {
+						n.resolveErr = fmt.Errorf("target %q: dep [%s @ %v] matched no combos", n.target, dep.Target, constraints)
+						return n.deps
+					}
+				} else {
+					internalName := comboTargetName(dep.Target, constraints)
+					var depNode *TargetNode
+					if dep.Verb != "" {
+						depNode, err = n.build.ResolveVerb(internalName, dep.Verb)
+					} else {
+						depNode, err = n.build.Resolve(internalName)
+					}
+					if err != nil {
+						n.resolveErr = err
+						return n.deps
+					}
+					n.deps = append(n.deps, depNode)
+				}
+				continue
+			}
+
 			targets, err := n.build.expandDep(dep.Target)
 			if err != nil {
 				n.resolveErr = err
 				return n.deps
 			}
 			for _, target := range targets {
+				// Plain dep: resolve as-is. Matrix targets have an aggregator registered
+				// under the base name, so this naturally depends on all combos.
 				var depNode *TargetNode
 				if dep.Verb != "" {
 					depNode, err = n.build.ResolveVerb(target, dep.Verb)
@@ -1241,6 +1362,7 @@ func (n *TargetNode) runWithRunner(execute string) error {
 	// os/exec resolves duplicate keys by last-write-wins, so target shadows.
 	cmd.Env = appendRuleOptions(cmd.Env, runnerNode.rule)
 	cmd.Env = appendRuleOptions(cmd.Env, n.rule)
+	cmd.Env = appendMatrixVars(cmd.Env, n.build.matrixVars[n.target])
 	stdout, stderr := n.bodyWriters()
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
@@ -1382,6 +1504,220 @@ func (b *Build) expandRuleNames(f *parse.File) error {
 		}
 	}
 	return nil
+}
+
+// comboTargetName returns the internal DAG name for a specific matrix combo.
+// Keys are sorted alphabetically for determinism. Example: "build[go=1.20 os=linux]"
+func comboTargetName(base string, combo matrixCombo) string {
+	keys := make([]string, 0, len(combo))
+	for k := range combo {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var sb strings.Builder
+	sb.WriteString(base)
+	sb.WriteByte('[')
+	for i, k := range keys {
+		if i > 0 {
+			sb.WriteByte(' ')
+		}
+		sb.WriteString(k)
+		sb.WriteByte('=')
+		sb.WriteString(combo[k])
+	}
+	sb.WriteByte(']')
+	return sb.String()
+}
+
+// evalForExpr evaluates a bash expression from a ForClause by sourcing the
+// generated script and echoing the expression, then word-splitting the output.
+func (b *Build) evalForExpr(expr string) ([]string, error) {
+	cmd := exec.Command("bash", "-c", `. "$MMK_GENFILE"; echo `+expr)
+	cmd.Env = append(os.Environ(), "MMK_GENFILE="+b.genPath)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("eval for-expr %q: %w", expr, err)
+	}
+	vals := strings.Fields(string(out))
+	if len(vals) == 0 {
+		return nil, fmt.Errorf("for-expr %q expanded to empty list", expr)
+	}
+	return vals, nil
+}
+
+// substituteMatrixVars replaces $VAR references in s with values from combo.
+// Only substitutes variables present in combo; other $VAR references are left alone.
+func substituteMatrixVars(s string, combo matrixCombo) string {
+	for k, v := range combo {
+		s = strings.ReplaceAll(s, "$"+k, v)
+	}
+	return s
+}
+
+// expandMatrixRules processes all TargetRules with ForClauses, generating
+// synthetic combo rules and an aggregator rule for each.
+func (b *Build) expandMatrixRules(f *parse.File) error {
+	var toAppend []parse.Directive
+	// Track indices to replace in f.Directives (original matrix rules → aggregators)
+	type replacement struct {
+		idx  int
+		rule *parse.TargetRule
+	}
+	var replacements []replacement
+
+	for i, d := range f.Directives {
+		r, ok := d.(*parse.TargetRule)
+		if !ok || len(r.ForClauses) == 0 {
+			continue
+		}
+		if r.Pattern != "" {
+			return fmt.Errorf("matrix 'for' clauses are not supported on pattern rules")
+		}
+		if r.Verb != "" {
+			return fmt.Errorf("matrix 'for' clauses are not supported directly on verb rules; declare the matrix on the base rule")
+		}
+
+		// Evaluate each ForClause to get its values.
+		varNames := make([]string, len(r.ForClauses))
+		varValues := make([][]string, len(r.ForClauses))
+		for j, fc := range r.ForClauses {
+			vals, err := b.evalForExpr(fc.Expr)
+			if err != nil {
+				return fmt.Errorf("target %q: for %s: %w", r.Target, fc.Var, err)
+			}
+			varNames[j] = fc.Var
+			varValues[j] = vals
+		}
+
+		// Generate cross-product of all variable combinations.
+		allCombos := crossProduct(varNames, varValues)
+
+		// Apply excludes.
+		var validCombos []matrixCombo
+		for _, combo := range allCombos {
+			if !matchesAnyExclude(combo, r.Excludes) {
+				validCombos = append(validCombos, combo)
+			}
+		}
+		if len(validCombos) == 0 {
+			return fmt.Errorf("target %q: all matrix combinations excluded", r.Target)
+		}
+
+		// Store matrix metadata.
+		info := &matrixRuleInfo{vars: varNames, combos: validCombos}
+		b.matrixInfo[r.Target] = info
+
+		// Generate one synthetic TargetRule per combo.
+		aggDeps := make([]parse.Dep, 0, len(validCombos))
+		for _, combo := range validCombos {
+			name := comboTargetName(r.Target, combo)
+			b.matrixVars[name] = combo
+
+			// Substitute matrix vars in runner and deps.
+			runner := substituteMatrixVars(r.Runner, combo)
+
+			var deps []parse.Dep
+			for _, dep := range r.Deps {
+				deps = append(deps, parse.Dep{
+					Target: substituteMatrixVars(dep.Target, combo),
+					Verb:   dep.Verb,
+					Combo:  dep.Combo,
+				})
+			}
+
+			synth := &parse.TargetRule{
+				Type:        r.Type,
+				Target:      name,
+				Runner:      runner,
+				HasDepSep:   r.HasDepSep,
+				Options:     r.Options,
+				Body:        r.Body,
+				Description: r.Description,
+				Deps:        deps,
+			}
+			toAppend = append(toAppend, synth)
+			aggDeps = append(aggDeps, parse.Dep{Target: name})
+		}
+
+		// Build the aggregator rule (replaces the original).
+		agg := &parse.TargetRule{
+			Target:      r.Target,
+			HasDepSep:   true,
+			Deps:        aggDeps,
+			Description: r.Description,
+		}
+		replacements = append(replacements, replacement{idx: i, rule: agg})
+	}
+
+	// Apply replacements.
+	for _, rep := range replacements {
+		f.Directives[rep.idx] = rep.rule
+	}
+	// Append combo rules.
+	f.Directives = append(f.Directives, toAppend...)
+	return nil
+}
+
+// crossProduct generates the full cross-product of variable values.
+func crossProduct(varNames []string, varValues [][]string) []matrixCombo {
+	result := []matrixCombo{make(matrixCombo)}
+	for i, vals := range varValues {
+		var next []matrixCombo
+		for _, existing := range result {
+			for _, v := range vals {
+				combo := make(matrixCombo, len(existing)+1)
+				for k, val := range existing {
+					combo[k] = val
+				}
+				combo[varNames[i]] = v
+				next = append(next, combo)
+			}
+		}
+		result = next
+	}
+	return result
+}
+
+// matchesAnyExclude reports whether combo matches any of the exclude patterns.
+// A combo matches an exclude pattern if the combo's value for every key in the
+// pattern equals the pattern's value for that key.
+func matchesAnyExclude(combo matrixCombo, excludes [][]parse.Option) bool {
+	for _, exc := range excludes {
+		if matchesExclude(combo, exc) {
+			return true
+		}
+	}
+	return false
+}
+
+func matchesExclude(combo matrixCombo, exc []parse.Option) bool {
+	for _, opt := range exc {
+		if combo[opt.Key] != opt.Value {
+			return false
+		}
+	}
+	return true
+}
+
+// appendMatrixVars exports the matrix variable assignments for a combo node as
+// environment variables. Returns env unchanged when combo is nil (non-matrix node).
+func appendMatrixVars(env []string, combo matrixCombo) []string {
+	for k, v := range combo {
+		env = append(env, k+"="+v)
+	}
+	return env
+}
+
+// comboMatchesConstraints reports whether combo satisfies all constraints.
+// Every key in constraints must be present in combo with the same value.
+// Keys in combo not present in constraints are unconstrained (fan-out).
+func comboMatchesConstraints(combo, constraints matrixCombo) bool {
+	for k, v := range constraints {
+		if dv, ok := combo[k]; !ok || dv != v {
+			return false
+		}
+	}
+	return true
 }
 
 // expandSubprojects processes each `subproject` directive in f. For each, it
@@ -1628,6 +1964,7 @@ func (n *TargetNode) runBash(execute string, output bool) error {
 		c.Env = append(c.Env, "MMK_VERBOSE=1")
 	}
 	c.Env = appendRuleOptions(c.Env, n.rule)
+	c.Env = appendMatrixVars(c.Env, n.build.matrixVars[n.target])
 	if output {
 		stdout, stderr := n.bodyWriters()
 		c.Stdout = stdout

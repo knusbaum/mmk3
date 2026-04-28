@@ -39,6 +39,7 @@ func (b *Build) GraphTo(w io.Writer, target, verb string, full bool) error {
 	// First pass: collect all nodes reachable from root via regular deps.
 	// Order-only edges that point outside this set are dropped from the display.
 	inGraph := make(map[*TargetNode]bool)
+	var collectErr error
 	var collect func(*TargetNode)
 	collect = func(n *TargetNode) {
 		if inGraph[n] {
@@ -48,8 +49,14 @@ func (b *Build) GraphTo(w io.Writer, target, verb string, full bool) error {
 		for _, d := range n.Dependencies() {
 			collect(d)
 		}
+		if n.resolveErr != nil && collectErr == nil {
+			collectErr = n.resolveErr
+		}
 	}
 	collect(root)
+	if collectErr != nil {
+		return collectErr
+	}
 
 	gp := &graphPrinter{w: w, build: b, inGraph: inGraph, full: full, visited: map[string]bool{}}
 	gp.visited[nodeKey(root)] = true
