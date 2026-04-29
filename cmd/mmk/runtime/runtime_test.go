@@ -1885,3 +1885,257 @@ defbody mytype clean { false }
 		t.Errorf("error should mention duplicate: %v", err)
 	}
 }
+
+// --- group features ---
+
+func TestGroupFlatDep_NonMatrixMembers(t *testing.T) {
+	// A group with non-matrix members can be depended on as a flat dep.
+	src := `
+group mytests
+
+a into mytests :
+b into mytests :
+all : mytests
+`
+	b := newBuild(t, src)
+	// Group aggregator "mytests" should be registered.
+	if _, ok := b.concretes["mytests"]; !ok {
+		t.Fatalf("expected group aggregator 'mytests' in concretes; got %v", b.Targets())
+	}
+	n, err := b.Resolve("all")
+	if err != nil {
+		t.Fatalf("Resolve all: %v", err)
+	}
+	deps := n.Dependencies()
+	if len(deps) != 1 || deps[0].target != "mytests" {
+		t.Errorf("all deps: got %v, want [mytests]", depTargets(deps))
+	}
+	aggDeps := deps[0].Dependencies()
+	got := depTargets(aggDeps)
+	if !contains(got, "a") || !contains(got, "b") {
+		t.Errorf("mytests deps: got %v, want [a b]", got)
+	}
+}
+
+func TestGroupMatrixMembersRegistered(t *testing.T) {
+	// A matrix rule with `into` registers all its combos into the group.
+	src := `
+group all_builds
+
+build for os in [linux macos] into all_builds { :; }
+`
+	b := newBuild(t, src)
+	linuxName := comboTargetName("build", matrixCombo{"os": "linux"})
+	macosName := comboTargetName("build", matrixCombo{"os": "macos"})
+
+	gd := b.groups["all_builds"]
+	if gd == nil {
+		t.Fatal("expected group 'all_builds'")
+	}
+	memberNames := make([]string, len(gd.members))
+	for i, m := range gd.members {
+		memberNames[i] = m.internalName
+	}
+	if !contains(memberNames, linuxName) {
+		t.Errorf("expected linux combo %q in group members; got %v", linuxName, memberNames)
+	}
+	if !contains(memberNames, macosName) {
+		t.Errorf("expected macos combo %q in group members; got %v", macosName, memberNames)
+	}
+}
+
+func TestGroupConsumerNoForClauses(t *testing.T) {
+	// A consumer with only a group dep and no for clauses: one combo per group dim-tuple.
+	src := `
+group all_builds
+
+build for os in [linux macos] into all_builds { :; }
+test : [all_builds @ os] { :; }
+`
+	b := newBuild(t, src)
+	// "test" should have been expanded into test[os=linux] and test[os=macos].
+	linuxName := comboTargetName("test", matrixCombo{"os": "linux"})
+	macosName := comboTargetName("test", matrixCombo{"os": "macos"})
+	if _, ok := b.concretes[linuxName]; !ok {
+		t.Errorf("expected combo %q in concretes; got %v", linuxName, b.Targets())
+	}
+	if _, ok := b.concretes[macosName]; !ok {
+		t.Errorf("expected combo %q in concretes; got %v", macosName, b.Targets())
+	}
+	// Each consumer combo should depend on the build combo for the same os.
+	linuxBuild := comboTargetName("build", matrixCombo{"os": "linux"})
+	macosBuild := comboTargetName("build", matrixCombo{"os": "macos"})
+
+	testLinux, err := b.Resolve(linuxName)
+	if err != nil {
+		t.Fatalf("Resolve %q: %v", linuxName, err)
+	}
+	depsLinux := depTargets(testLinux.Dependencies())
+	if !contains(depsLinux, linuxBuild) {
+		t.Errorf("test[os=linux] should dep on build[os=linux]; got %v", depsLinux)
+	}
+
+	testMacos, err := b.Resolve(macosName)
+	if err != nil {
+		t.Fatalf("Resolve %q: %v", macosName, err)
+	}
+	depsMacos := depTargets(testMacos.Dependencies())
+	if !contains(depsMacos, macosBuild) {
+		t.Errorf("test[os=macos] should dep on build[os=macos]; got %v", depsMacos)
+	}
+}
+
+func TestGroupConsumerWithExplicitForAndGroupDims(t *testing.T) {
+	// Consumer has both for clauses and a group projection dep.
+	// Result should be cross-product of explicit combos × group dim-tuples.
+	src := `
+group all_builds
+
+build for os in [linux macos] into all_builds { :; }
+test for go in [1.20 1.21] : [all_builds @ os] { :; }
+`
+	b := newBuild(t, src)
+	// Expect 4 combos: (go=1.20,os=linux), (go=1.20,os=macos), (go=1.21,os=linux), (go=1.21,os=macos).
+	want := []matrixCombo{
+		{"go": "1.20", "os": "linux"},
+		{"go": "1.20", "os": "macos"},
+		{"go": "1.21", "os": "linux"},
+		{"go": "1.21", "os": "macos"},
+	}
+	for _, combo := range want {
+		name := comboTargetName("test", combo)
+		if _, ok := b.concretes[name]; !ok {
+			t.Errorf("expected combo %q in concretes; got %v", name, b.Targets())
+		}
+	}
+}
+
+func TestGroupProjectionOnOneDim_FanInForUnselectedDims(t *testing.T) {
+	// Group members have (os, libc) dims. Consumer projects on `os` only.
+	// Each test[os=X] should fan-in on ALL build members with os=X (both libc values).
+	src := `
+group all_builds
+
+build for os in [linux macos] for libc in [musl glibc] into all_builds { :; }
+test : [all_builds @ os] { :; }
+`
+	b := newBuild(t, src)
+
+	linuxTestName := comboTargetName("test", matrixCombo{"os": "linux"})
+	n, err := b.Resolve(linuxTestName)
+	if err != nil {
+		t.Fatalf("Resolve %q: %v", linuxTestName, err)
+	}
+	deps := depTargets(n.Dependencies())
+
+	linuxMusl := comboTargetName("build", matrixCombo{"os": "linux", "libc": "musl"})
+	linuxGlibc := comboTargetName("build", matrixCombo{"os": "linux", "libc": "glibc"})
+
+	if !contains(deps, linuxMusl) {
+		t.Errorf("test[os=linux] should dep on build[os=linux libc=musl]; got %v", deps)
+	}
+	if !contains(deps, linuxGlibc) {
+		t.Errorf("test[os=linux] should dep on build[os=linux libc=glibc]; got %v", deps)
+	}
+	// Should NOT contain macos combos.
+	macosMusl := comboTargetName("build", matrixCombo{"os": "macos", "libc": "musl"})
+	if contains(deps, macosMusl) {
+		t.Errorf("test[os=linux] should not dep on macos build; got %v", deps)
+	}
+}
+
+func TestGroupProjectionOnMultipleDims(t *testing.T) {
+	// Consumer projects on both os and libc: each consumer combo maps to exactly one member.
+	src := `
+group all_builds
+
+build for os in [linux macos] for libc in [musl glibc] into all_builds { :; }
+test : [all_builds @ os libc] { :; }
+`
+	b := newBuild(t, src)
+	// Expect 4 consumer combos, each depending on exactly one build combo.
+	want := []matrixCombo{
+		{"os": "linux", "libc": "musl"},
+		{"os": "linux", "libc": "glibc"},
+		{"os": "macos", "libc": "musl"},
+		{"os": "macos", "libc": "glibc"},
+	}
+	for _, combo := range want {
+		name := comboTargetName("test", combo)
+		n, err := b.Resolve(name)
+		if err != nil {
+			t.Fatalf("Resolve %q: %v", name, err)
+		}
+		deps := depTargets(n.Dependencies())
+		buildName := comboTargetName("build", combo)
+		if !contains(deps, buildName) {
+			t.Errorf("test%v should dep on build%v; got %v", combo, combo, deps)
+		}
+		if len(deps) != 1 {
+			t.Errorf("test%v should have exactly 1 dep; got %v", combo, deps)
+		}
+	}
+}
+
+func TestGroupUndeclaredGroupError(t *testing.T) {
+	src := `
+build into nosuchgroup :
+`
+	_, err := NewBuild([]byte(src))
+	if err == nil {
+		t.Fatal("expected error for into undeclared group")
+	}
+	if !strings.Contains(err.Error(), "nosuchgroup") {
+		t.Errorf("error should mention group name: %v", err)
+	}
+}
+
+func TestGroupProjectionUndeclaredGroupError(t *testing.T) {
+	src := `
+test : [nosuchgroup @ os]
+`
+	_, err := NewBuild([]byte(src))
+	if err == nil {
+		t.Fatal("expected error for projection dep on undeclared group")
+	}
+	if !strings.Contains(err.Error(), "nosuchgroup") {
+		t.Errorf("error should mention group name: %v", err)
+	}
+}
+
+func TestGroupAggregatorFlatDep(t *testing.T) {
+	// A plain dep on the group name resolves to the group aggregator naturally.
+	src := `
+group g
+
+a into g :
+b into g :
+consumer : g
+`
+	b := newBuild(t, src)
+	n, err := b.Resolve("consumer")
+	if err != nil {
+		t.Fatalf("Resolve consumer: %v", err)
+	}
+	deps := n.Dependencies()
+	if len(deps) != 1 || deps[0].target != "g" {
+		t.Errorf("consumer deps: got %v, want [g]", depTargets(deps))
+	}
+	// The group aggregator itself depends on both members.
+	aggDeps := depTargets(deps[0].Dependencies())
+	if !contains(aggDeps, "a") || !contains(aggDeps, "b") {
+		t.Errorf("group aggregator deps: got %v, want [a b]", aggDeps)
+	}
+}
+
+func TestGroupEmptyProjectionError(t *testing.T) {
+	// A group projection dep with no members should error during expansion.
+	src := `
+group empty_group
+test : [empty_group @ os] { :; }
+`
+	_, err := NewBuild([]byte(src))
+	if err == nil {
+		t.Fatal("expected error for group projection with empty group")
+	}
+}

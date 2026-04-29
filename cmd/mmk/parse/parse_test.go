@@ -1133,6 +1133,162 @@ func TestMatrixErrorExcludeNonKeyVal(t *testing.T) {
 	expectError(t, `build for os in [linux] exclude [linux] { :; }`, "key=value")
 }
 
+// --- group directives ---
+
+func TestGroupDirective(t *testing.T) {
+	f := mustParse(t, `group mygroup`)
+	if len(f.Directives) != 1 {
+		t.Fatalf("expected 1 directive, got %d", len(f.Directives))
+	}
+	g, ok := f.Directives[0].(*Group)
+	if !ok {
+		t.Fatalf("expected *Group, got %T", f.Directives[0])
+	}
+	expect(t, "Name", g.Name, "mygroup")
+}
+
+func TestGroupDirectiveWithDocstring(t *testing.T) {
+	src := `
+## All test cases.
+group tests
+`
+	f := mustParse(t, src)
+	g, ok := f.Directives[0].(*Group)
+	if !ok {
+		t.Fatalf("expected *Group, got %T", f.Directives[0])
+	}
+	expect(t, "Name", g.Name, "tests")
+	expect(t, "Description", g.Description, "All test cases.")
+}
+
+func TestGroupDirectiveMultiple(t *testing.T) {
+	f := mustParse(t, "group g1\ngroup g2\n")
+	if len(f.Directives) != 2 {
+		t.Fatalf("expected 2 directives, got %d", len(f.Directives))
+	}
+	g1, ok := f.Directives[0].(*Group)
+	if !ok {
+		t.Fatalf("directive 0: expected *Group, got %T", f.Directives[0])
+	}
+	g2, ok2 := f.Directives[1].(*Group)
+	if !ok2 {
+		t.Fatalf("directive 1: expected *Group, got %T", f.Directives[1])
+	}
+	expect(t, "g1.Name", g1.Name, "g1")
+	expect(t, "g2.Name", g2.Name, "g2")
+}
+
+// --- into clauses ---
+
+func TestIntoClause(t *testing.T) {
+	f := mustParse(t, `mytarget into mygroup :`)
+	r := asRule(t, f.Directives[0])
+	expect(t, "Target", r.Target, "mytarget")
+	if len(r.Groups) != 1 || r.Groups[0] != "mygroup" {
+		t.Errorf("Groups: got %v, want [mygroup]", r.Groups)
+	}
+}
+
+func TestIntoClauseMultiple(t *testing.T) {
+	f := mustParse(t, `mytarget into g1 into g2 :`)
+	r := asRule(t, f.Directives[0])
+	if len(r.Groups) != 2 {
+		t.Fatalf("Groups len: got %d, want 2", len(r.Groups))
+	}
+	if r.Groups[0] != "g1" || r.Groups[1] != "g2" {
+		t.Errorf("Groups: got %v, want [g1 g2]", r.Groups)
+	}
+}
+
+func TestIntoClauseWithForClauses(t *testing.T) {
+	f := mustParse(t, `build for os in [linux macos] into mygroup { :; }`)
+	r := asRule(t, f.Directives[0])
+	if len(r.ForClauses) != 1 || r.ForClauses[0].Var != "os" {
+		t.Fatalf("ForClauses: got %v", r.ForClauses)
+	}
+	if len(r.Groups) != 1 || r.Groups[0] != "mygroup" {
+		t.Errorf("Groups: got %v, want [mygroup]", r.Groups)
+	}
+}
+
+func TestIntoClauseWithBody(t *testing.T) {
+	f := mustParse(t, `mytarget into mygroup { echo hi }`)
+	r := asRule(t, f.Directives[0])
+	if len(r.Groups) != 1 || r.Groups[0] != "mygroup" {
+		t.Errorf("Groups: got %v, want [mygroup]", r.Groups)
+	}
+	if r.Body == "" {
+		t.Error("expected non-empty body")
+	}
+}
+
+// --- group projection deps ---
+
+func TestGroupProjectionDepSingleDim(t *testing.T) {
+	f := mustParse(t, `foo : [mygroup @ os]`)
+	r := asRule(t, f.Directives[0])
+	if len(r.Deps) != 1 {
+		t.Fatalf("Deps len: got %d, want 1", len(r.Deps))
+	}
+	d := r.Deps[0]
+	expect(t, "Target", d.Target, "mygroup")
+	if len(d.Combo) != 0 {
+		t.Errorf("Combo should be empty, got %v", d.Combo)
+	}
+	if len(d.GroupDims) != 1 || d.GroupDims[0] != "os" {
+		t.Errorf("GroupDims: got %v, want [os]", d.GroupDims)
+	}
+}
+
+func TestGroupProjectionDepMultipleDims(t *testing.T) {
+	f := mustParse(t, `foo : [mygroup @ os arch]`)
+	r := asRule(t, f.Directives[0])
+	if len(r.Deps) != 1 {
+		t.Fatalf("Deps len: got %d, want 1", len(r.Deps))
+	}
+	d := r.Deps[0]
+	expect(t, "Target", d.Target, "mygroup")
+	if len(d.GroupDims) != 2 || d.GroupDims[0] != "os" || d.GroupDims[1] != "arch" {
+		t.Errorf("GroupDims: got %v, want [os arch]", d.GroupDims)
+	}
+	if len(d.Combo) != 0 {
+		t.Errorf("Combo should be empty for group projection dep, got %v", d.Combo)
+	}
+}
+
+func TestGroupProjectionDepMixedWithPlainDeps(t *testing.T) {
+	f := mustParse(t, `foo : plain [mygroup @ os] other`)
+	r := asRule(t, f.Directives[0])
+	if len(r.Deps) != 3 {
+		t.Fatalf("Deps len: got %d, want 3", len(r.Deps))
+	}
+	if r.Deps[0].Target != "plain" || len(r.Deps[0].GroupDims) != 0 {
+		t.Errorf("Deps[0]: got %+v", r.Deps[0])
+	}
+	if r.Deps[1].Target != "mygroup" || len(r.Deps[1].GroupDims) != 1 || r.Deps[1].GroupDims[0] != "os" {
+		t.Errorf("Deps[1]: got %+v", r.Deps[1])
+	}
+	if r.Deps[2].Target != "other" || len(r.Deps[2].GroupDims) != 0 {
+		t.Errorf("Deps[2]: got %+v", r.Deps[2])
+	}
+}
+
+// Existing combo deps must still work (k=v form, not bare dim form).
+func TestComboDepStillWorksAfterGroupProjectionParsing(t *testing.T) {
+	f := mustParse(t, `foo : [build @ os=linux go=1.20]`)
+	r := asRule(t, f.Directives[0])
+	d := r.Deps[0]
+	if d.Target != "build" {
+		t.Errorf("Target: got %q, want %q", d.Target, "build")
+	}
+	if len(d.GroupDims) != 0 {
+		t.Errorf("GroupDims should be empty for k=v dep, got %v", d.GroupDims)
+	}
+	if len(d.Combo) != 2 {
+		t.Fatalf("Combo len: got %d, want 2", len(d.Combo))
+	}
+}
+
 // --- helpers ---
 
 func mustParse(t *testing.T, src string) *File {

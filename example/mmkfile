@@ -33,47 +33,31 @@ shell on runimage:latest tty=true : executable {
     PS1='(run shell) $ ' bash -i
 }
 
-file 0 {
-    sleep '0.1';
-    echo hello 0
-    echo 0 > 0
+
+# test_case for something in [ $SOME_INPUT_SET ] {
+#     # Run a test
+#     # Write output/$something
+# }
+
+# other_test_case for something in [ $SOME_OTHER_INPUT_SET ] {
+#     # run a test.
+#     # Write results to output/$something
+# }
+
+# pipeline for results in [ $SOME_INPUT_SET $SOME_OTHER_INPUT_SET ] : [test_case @ input=$something] [other_test_case @ input=$something]{
+#     # One pipeline instance per $input
+#     # Look at output/$input
+# }
+
+
+one for x in [ 1 2 3 4 ] {
+    echo $x
 }
 
-file 1 {
-    sleep '0.1';
-    echo hello 1
-    echo 1 > 1
+two for y in [ a b c d ] {
+    echo $y
 }
 
-file '([0-9]+)' on buildimage:latest : $(( $1 - 1 )) $(( $1 - 2 )) {
-    sleep '0.1';
-    echo "fib( $target ) = fib( ${dep[0]} - 1 ) + fib( ${dep[1]} - 2 )"
-    echo "fib( $target ) = `cat ${dep[0]}` + `cat ${dep[1]}`"
-    echo "fib( $target ) = $(( `cat ${dep[0]}` + `cat ${dep[1]}` ))"
-    echo $(( `cat ${dep[0]}` + `cat ${dep[1]}` )) > $target
-    
-}
-
-[clean '([0-9]+)'] : [delete $( seq 0 $1 )]
-
-[delete '([0-9]+)'] : {
-    sleep $(( $RANDOM % 5 ));
-    echo rm $target
-    rm -f $target
-}
-
-#[clean '([0-9]+)'] : [delete $( seq 0 $1 )]
-
-base for x in [$(seq 1 5) $(seq 10 15)] exclude [x=11] : base_extra {
-    echo smallbase $x
-    sleep 1;
-}
-
-base_extra for x in [ $(seq 7 9) ] : [extra @ x=$x]
-
-
-
-extra for x in [$(seq 6 9) 11]{
-    echo bigbase $x
-    sleep 1;
+downstream for x in [ 1 2 3 4 ] for y in [ a b c d ] : [one @ x=$x] [two @ y=$y] {
+    echo $x $y
 }

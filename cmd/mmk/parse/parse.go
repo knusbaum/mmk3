@@ -57,12 +57,25 @@ type DefRunner struct {
 	Body  string
 }
 
+// Group declares a named pool that targets can register into via `into <name>`.
+// Consumers can depend on the group to fan-in on all members (flat dep) or
+// create a matrix derived from group membership (projection dep).
+type Group struct {
+	Name        string
+	Description string
+}
+
+func (*Group) isDirective() {}
+
 // Dep is a single dependency in a target rule.
 // Verb is non-empty when the dep is a verb-qualified reference like [clean somedep].
+// When GroupDims is non-empty, Target is the group name and the dep is a group
+// projection dep; Combo must be empty in that case.
 type Dep struct {
-	Target string
-	Verb   string
-	Combo  []Option // non-empty when dep addresses a specific matrix combo
+	Target    string
+	Verb      string
+	Combo     []Option // non-empty when dep addresses a specific matrix combo
+	GroupDims []string // non-empty when dep is a group projection dep; Target is group name
 }
 
 // ForClause is one `for VAR in [expr]` clause in a matrix target rule.
@@ -94,6 +107,7 @@ type TargetRule struct {
 	Options     []Option // key=value annotations from the rule header; preserves source order
 	ForClauses  []ForClause  // non-empty for matrix rules
 	Excludes    [][]Option   // combos to exclude; each sub-slice is a partial combo assignment
+	Groups      []string // group names from `into` clauses
 	Body        string   // empty if no body (deps-only rule)
 	Description string   // joined `##`-prefixed comment lines immediately preceding this rule
 }
@@ -569,6 +583,8 @@ func (p *parser) parseFile() (*File, error) {
 				v.Description = doc
 			case *Subproject:
 				v.Description = doc
+			case *Group:
+				v.Description = doc
 			}
 		}
 		f.Directives = append(f.Directives, d)
@@ -586,7 +602,7 @@ func (p *parser) parseDirectiveOrPassthrough() (Directive, error) {
 	word := p.s.readWord()
 	p.s.pos, p.s.line = saved, savedLine
 
-	if word == "deftype" || word == "defrunner" || word == "defbody" || word == "subproject" {
+	if word == "deftype" || word == "defrunner" || word == "defbody" || word == "subproject" || word == "group" {
 		return p.parseDirective()
 	}
 
@@ -767,6 +783,8 @@ func (p *parser) parseDirective() (Directive, error) {
 		return p.parseDefBody()
 	case "subproject":
 		return p.parseSubproject()
+	case "group":
+		return p.parseGroup()
 	default:
 		return p.parseTargetRule()
 	}
@@ -938,6 +956,23 @@ func (p *parser) parseSubproject() (Directive, error) {
 	return &Subproject{Target: target, Runner: runner, Options: options}, nil
 }
 
+// parseGroup handles 'group <name>' directives at file level.
+// The group name is a bare word or double-quoted string. No body, no options.
+func (p *parser) parseGroup() (Directive, error) {
+	p.s.readWord() // consume "group"
+	name, err := p.parseName()
+	if err != nil {
+		return nil, fmt.Errorf("group: %w", err)
+	}
+	// No body, no options — just skip to end of line.
+	p.s.skipHorizontalSpace()
+	b := p.s.peek()
+	if b != 0 && b != '\n' && b != '#' {
+		return nil, fmt.Errorf("line %d: unexpected token after group %q", p.s.line, name)
+	}
+	return &Group{Name: name}, nil
+}
+
 // parseForClause parses `VAR in [expr]` after the 'for' keyword has been consumed.
 func (p *parser) parseForClause() (ForClause, error) {
 	p.s.skipHorizontalSpace()
@@ -1002,9 +1037,11 @@ func (p *parser) parseExcludeClause() ([]Option, error) {
 //	[target]                  non-verb dep (target only)
 //	[target @ k=v ...]        combo-qualified non-verb dep
 //	[verb target @ k=v ...]   combo-qualified verb dep
+//	[group @ dim ...]         group projection dep (bare dim names, no '=')
 //
 // The opening '[' must be the current peek byte.
-func (p *parser) parseDepRef() (verb, target string, combo []Option, err error) {
+// When groupDims is non-empty, the dep is a group projection dep and combo is nil.
+func (p *parser) parseDepRef() (verb, target string, combo []Option, groupDims []string, err error) {
 	openedAt := p.s.line
 	p.s.advance() // consume '['
 	p.s.skipHorizontalSpace()
@@ -1037,24 +1074,51 @@ func (p *parser) parseDepRef() (verb, target string, combo []Option, err error) 
 
 	if p.s.peek() == '@' {
 		p.s.advance() // consume '@'
-		for {
-			p.s.skipHorizontalSpace()
-			if p.s.peek() == ']' || p.s.peek() == 0 || p.s.peek() == '\n' {
-				break
+		p.s.skipHorizontalSpace()
+
+		// Peek at the first word after '@' to distinguish:
+		//   - k=v  → combo (existing) syntax
+		//   - bare → group projection (bare dim names)
+		savedPos, savedLine := p.s.pos, p.s.line
+		firstWord := p.s.readWord()
+		_, _, isKV := parseOptionToken(firstWord)
+		p.s.pos, p.s.line = savedPos, savedLine
+
+		if isKV || firstWord == "" {
+			// Existing k=v combo parsing.
+			for {
+				p.s.skipHorizontalSpace()
+				if p.s.peek() == ']' || p.s.peek() == 0 || p.s.peek() == '\n' {
+					break
+				}
+				word := p.s.readWord()
+				if word == "" {
+					err = fmt.Errorf("line %d: expected key=value after '@' in dep reference", p.s.line)
+					return
+				}
+				var k, v string
+				var ok bool
+				k, v, ok = parseOptionToken(word)
+				if !ok {
+					err = fmt.Errorf("line %d: expected key=value after '@', got %q", p.s.line, word)
+					return
+				}
+				combo = append(combo, Option{Key: k, Value: v})
 			}
-			word := p.s.readWord()
-			if word == "" {
-				err = fmt.Errorf("line %d: expected key=value after '@' in dep reference", p.s.line)
-				return
+		} else {
+			// Group projection: read bare dim names until ']'.
+			for {
+				p.s.skipHorizontalSpace()
+				if p.s.peek() == ']' || p.s.peek() == 0 || p.s.peek() == '\n' {
+					break
+				}
+				dim := p.s.readWord()
+				if dim == "" {
+					err = fmt.Errorf("line %d: expected dimension name after '@' in group dep", p.s.line)
+					return
+				}
+				groupDims = append(groupDims, dim)
 			}
-			var k, v string
-			var ok bool
-			k, v, ok = parseOptionToken(word)
-			if !ok {
-				err = fmt.Errorf("line %d: expected key=value after '@', got %q", p.s.line, word)
-				return
-			}
-			combo = append(combo, Option{Key: k, Value: v})
 		}
 	}
 
@@ -1073,6 +1137,7 @@ func (p *parser) parseTargetRule() (*TargetRule, error) {
 	var header []headerToken
 	var forClauses []ForClause
 	var excludes [][]Option
+	var groups []string
 	for {
 		p.s.skipHorizontalSpace()
 		b := p.s.peek()
@@ -1106,6 +1171,16 @@ func (p *parser) parseTargetRule() (*TargetRule, error) {
 				excludes = append(excludes, exc)
 				continue
 			}
+			if word == "into" {
+				p.s.readWord() // consume "into"
+				p.s.skipHorizontalSpace()
+				groupName, gnErr := p.parseName()
+				if gnErr != nil {
+					return nil, gnErr
+				}
+				groups = append(groups, groupName)
+				continue
+			}
 		}
 		tok, err := p.parseHeaderToken()
 		if err != nil {
@@ -1125,7 +1200,7 @@ func (p *parser) parseTargetRule() (*TargetRule, error) {
 	if err != nil {
 		return nil, fmt.Errorf("line %d: %w", p.s.line, err)
 	}
-	rule := &TargetRule{Type: typ, Target: target, Pattern: pattern, Runner: runner, Verb: verb, Options: options, ForClauses: forClauses, Excludes: excludes}
+	rule := &TargetRule{Type: typ, Target: target, Pattern: pattern, Runner: runner, Verb: verb, Options: options, ForClauses: forClauses, Excludes: excludes, Groups: groups}
 
 	// Optional deps after ':' (or ':+' for augment-inherit mode on verb rules).
 	p.s.skipHorizontalSpace()
@@ -1146,11 +1221,11 @@ func (p *parser) parseTargetRule() (*TargetRule, error) {
 				break
 			}
 			if b == '[' {
-				dverb, dtarget, combo, dErr := p.parseDepRef()
+				dverb, dtarget, combo, groupDims, dErr := p.parseDepRef()
 				if dErr != nil {
 					return nil, dErr
 				}
-				rule.Deps = append(rule.Deps, Dep{Target: dtarget, Verb: dverb, Combo: combo})
+				rule.Deps = append(rule.Deps, Dep{Target: dtarget, Verb: dverb, Combo: combo, GroupDims: groupDims})
 			} else {
 				name, err := p.parseName()
 				if err != nil {

@@ -58,6 +58,17 @@ type matrixRuleInfo struct {
 	combos []matrixCombo // valid combos after applying excludes
 }
 
+// groupMember is one registered member of a group.
+type groupMember struct {
+	internalName string      // concrete combo target name, e.g. "test_case[os=linux input=in1]"
+	combo        matrixCombo // full combo of this member; empty for non-matrix members
+}
+
+// groupData holds the registered members of a group.
+type groupData struct {
+	members []groupMember
+}
+
 // subprojectInfo is what the runtime tracks about each `subproject` directive
 // after expansion: the target name (also the registered top-level target),
 // the runner clause to wrap delegations in, and the directory containing the
@@ -89,9 +100,11 @@ type Build struct {
 	defVerbBodies      map[defVerbBodyKey]bool
 	userDefBodyOptions map[defVerbBodyKey][]parse.Option // user defbody options keyed by (type, verb)
 	subprojects        map[string]*subprojectInfo        // subproject target → metadata for sub-path delegation
-	matrixInfo    map[string]*matrixRuleInfo // base target → matrix info (for aggregators and dep resolution)
-	matrixVars    map[string]matrixCombo     // internal combo target name → its variable assignments
-	genPath       string
+	matrixInfo     map[string]*matrixRuleInfo // base target → matrix info (for aggregators and dep resolution)
+	matrixVars     map[string]matrixCombo     // internal combo target name → its variable assignments
+	declaredGroups map[string]bool            // group names from `group` directives
+	groups         map[string]*groupData      // populated during expansion
+	genPath        string
 	genFile       *os.File
 
 	runnerStatesMu sync.Mutex
@@ -306,6 +319,8 @@ func NewBuild(src []byte) (*Build, error) {
 		subprojects:        make(map[string]*subprojectInfo),
 		matrixInfo:         make(map[string]*matrixRuleInfo),
 		matrixVars:         make(map[string]matrixCombo),
+		declaredGroups:     make(map[string]bool),
+		groups:             make(map[string]*groupData),
 		runnerStates:       make(map[string]string),
 	}
 
@@ -381,10 +396,60 @@ func NewBuild(src []byte) (*Build, error) {
 		return nil, err
 	}
 
-	if err := b.expandMatrixRules(f); err != nil {
-		b.genFile.Close()
-		os.Remove(b.genPath)
-		return nil, err
+	// Collect declared groups from `group` directives.
+	for _, d := range f.Directives {
+		if g, ok := d.(*parse.Group); ok {
+			b.declaredGroups[g.Name] = true
+			b.groups[g.Name] = &groupData{}
+		}
+	}
+
+	// Check whether any group features are used.
+	hasGroupFeatures := b.hasGroupFeatures(f)
+
+	if !hasGroupFeatures {
+		// No group features: use the original single-pass expansion.
+		if err := b.expandMatrixRules(f); err != nil {
+			b.genFile.Close()
+			os.Remove(b.genPath)
+			return nil, err
+		}
+	} else {
+		// Multi-pass group expansion.
+		if err := b.validateGroups(f); err != nil {
+			b.genFile.Close()
+			os.Remove(b.genPath)
+			return nil, err
+		}
+		if err := b.expandExplicitMatrixRules(f); err != nil {
+			b.genFile.Close()
+			os.Remove(b.genPath)
+			return nil, err
+		}
+		// Fixed-point iteration for cascading groups.
+		const maxIter = 100
+		for iter := 0; iter < maxIter; iter++ {
+			prevMemberCount := b.totalGroupMembers()
+			b.registerGroupMembers(f)
+			if err := b.createGroupAggregators(f); err != nil {
+				b.genFile.Close()
+				os.Remove(b.genPath)
+				return nil, err
+			}
+			if err := b.expandGroupConsumers(f); err != nil {
+				b.genFile.Close()
+				os.Remove(b.genPath)
+				return nil, err
+			}
+			if b.totalGroupMembers() == prevMemberCount {
+				break
+			}
+			if iter == maxIter-1 {
+				b.genFile.Close()
+				os.Remove(b.genPath)
+				return nil, fmt.Errorf("group expansion did not converge after %d iterations", maxIter)
+			}
+		}
 	}
 
 	// Expand each `subproject` directive: read its sub-mmkfile, harvest verbs,
@@ -1654,6 +1719,529 @@ func (b *Build) expandMatrixRules(f *parse.File) error {
 		f.Directives[rep.idx] = rep.rule
 	}
 	// Append combo rules.
+	f.Directives = append(f.Directives, toAppend...)
+	return nil
+}
+
+// hasGroupFeatures reports whether f uses any group-related features:
+// declared groups, `into` clauses, or group projection deps.
+func (b *Build) hasGroupFeatures(f *parse.File) bool {
+	if len(b.declaredGroups) > 0 {
+		return true
+	}
+	for _, d := range f.Directives {
+		r, ok := d.(*parse.TargetRule)
+		if !ok {
+			continue
+		}
+		if len(r.Groups) > 0 {
+			return true
+		}
+		for _, dep := range r.Deps {
+			if len(dep.GroupDims) > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// totalGroupMembers returns the total number of members across all groups.
+// Used to detect fixed-point convergence.
+func (b *Build) totalGroupMembers() int {
+	n := 0
+	for _, gd := range b.groups {
+		n += len(gd.members)
+	}
+	return n
+}
+
+// validateGroups checks that all `into` references and group projection deps
+// name a declared group.
+func (b *Build) validateGroups(f *parse.File) error {
+	for _, d := range f.Directives {
+		r, ok := d.(*parse.TargetRule)
+		if !ok {
+			continue
+		}
+		for _, groupName := range r.Groups {
+			if !b.declaredGroups[groupName] {
+				return fmt.Errorf("target %q: `into %s`: group %q is not declared (add: group %s)", r.Target, groupName, groupName, groupName)
+			}
+		}
+		for _, dep := range r.Deps {
+			if len(dep.GroupDims) > 0 && !b.declaredGroups[dep.Target] {
+				return fmt.Errorf("target %q: dep [%s @ %s]: group %q is not declared", r.Target, dep.Target, strings.Join(dep.GroupDims, " "), dep.Target)
+			}
+		}
+	}
+	return nil
+}
+
+// expandExplicitMatrixRules is like expandMatrixRules but skips rules that
+// have any group projection deps (those are handled in expandGroupConsumers).
+// It also propagates the Groups field to the aggregator rule.
+func (b *Build) expandExplicitMatrixRules(f *parse.File) error {
+	var toAppend []parse.Directive
+	type replacement struct {
+		idx  int
+		rule *parse.TargetRule
+	}
+	var replacements []replacement
+
+	for i, d := range f.Directives {
+		r, ok := d.(*parse.TargetRule)
+		if !ok || len(r.ForClauses) == 0 {
+			continue
+		}
+		if r.Pattern != "" {
+			return fmt.Errorf("matrix 'for' clauses are not supported on pattern rules")
+		}
+		if r.Verb != "" {
+			return fmt.Errorf("matrix 'for' clauses are not supported directly on verb rules; declare the matrix on the base rule")
+		}
+
+		// Skip rules that have group projection deps — handled in expandGroupConsumers.
+		hasGroupDep := false
+		for _, dep := range r.Deps {
+			if len(dep.GroupDims) > 0 {
+				hasGroupDep = true
+				break
+			}
+		}
+		if hasGroupDep {
+			continue
+		}
+
+		varNames := make([]string, len(r.ForClauses))
+		varValues := make([][]string, len(r.ForClauses))
+		for j, fc := range r.ForClauses {
+			vals, err := b.evalForExpr(fc.Expr)
+			if err != nil {
+				return fmt.Errorf("target %q: for %s: %w", r.Target, fc.Var, err)
+			}
+			varNames[j] = fc.Var
+			varValues[j] = vals
+		}
+
+		allCombos := crossProduct(varNames, varValues)
+		var validCombos []matrixCombo
+		for _, combo := range allCombos {
+			if !matchesAnyExclude(combo, r.Excludes) {
+				validCombos = append(validCombos, combo)
+			}
+		}
+		if len(validCombos) == 0 {
+			return fmt.Errorf("target %q: all matrix combinations excluded", r.Target)
+		}
+
+		info := &matrixRuleInfo{vars: varNames, combos: validCombos}
+		b.matrixInfo[r.Target] = info
+
+		aggDeps := make([]parse.Dep, 0, len(validCombos))
+		for _, combo := range validCombos {
+			name := comboTargetName(r.Target, combo)
+			b.matrixVars[name] = combo
+
+			runner := substituteMatrixVars(r.Runner, combo)
+			var deps []parse.Dep
+			for _, dep := range r.Deps {
+				deps = append(deps, parse.Dep{
+					Target: substituteMatrixVars(dep.Target, combo),
+					Verb:   dep.Verb,
+					Combo:  dep.Combo,
+				})
+			}
+
+			synth := &parse.TargetRule{
+				Type:        r.Type,
+				Target:      name,
+				Runner:      runner,
+				HasDepSep:   r.HasDepSep,
+				Options:     r.Options,
+				Body:        r.Body,
+				Description: r.Description,
+				Deps:        deps,
+				// Do NOT propagate Groups to individual combo rules — groups are
+				// registered from the aggregator's Groups field in registerGroupMembers.
+			}
+			toAppend = append(toAppend, synth)
+			aggDeps = append(aggDeps, parse.Dep{Target: name})
+		}
+
+		// Aggregator retains Groups so registerGroupMembers can find them.
+		agg := &parse.TargetRule{
+			Target:      r.Target,
+			HasDepSep:   true,
+			Deps:        aggDeps,
+			Description: r.Description,
+			Groups:      r.Groups,
+		}
+		replacements = append(replacements, replacement{idx: i, rule: agg})
+	}
+
+	for _, rep := range replacements {
+		f.Directives[rep.idx] = rep.rule
+	}
+	f.Directives = append(f.Directives, toAppend...)
+	return nil
+}
+
+// registerGroupMembers scans f for TargetRules with Groups set and registers
+// their combo members (or themselves, if non-matrix) into those groups.
+func (b *Build) registerGroupMembers(f *parse.File) {
+	for _, d := range f.Directives {
+		r, ok := d.(*parse.TargetRule)
+		if !ok || len(r.Groups) == 0 {
+			continue
+		}
+		if info, ok := b.matrixInfo[r.Target]; ok {
+			// Matrix rule: register each combo.
+			for _, combo := range info.combos {
+				internalName := comboTargetName(r.Target, combo)
+				for _, groupName := range r.Groups {
+					gd := b.groups[groupName]
+					if gd == nil {
+						continue
+					}
+					// Avoid duplicates.
+					if !groupHasMember(gd, internalName) {
+						gd.members = append(gd.members, groupMember{
+							internalName: internalName,
+							combo:        combo,
+						})
+					}
+				}
+			}
+		} else {
+			// Non-matrix: register the target itself with empty combo.
+			for _, groupName := range r.Groups {
+				gd := b.groups[groupName]
+				if gd == nil {
+					continue
+				}
+				if !groupHasMember(gd, r.Target) {
+					gd.members = append(gd.members, groupMember{
+						internalName: r.Target,
+						combo:        matrixCombo{},
+					})
+				}
+			}
+		}
+	}
+}
+
+// groupHasMember reports whether gd already contains a member with the given internal name.
+func groupHasMember(gd *groupData, internalName string) bool {
+	for _, m := range gd.members {
+		if m.internalName == internalName {
+			return true
+		}
+	}
+	return false
+}
+
+// createGroupAggregators creates or updates a synthetic aggregator TargetRule
+// for each declared group that has at least one member.
+// It replaces any existing aggregator for the group in f.Directives, or appends
+// a new one if none exists.
+func (b *Build) createGroupAggregators(f *parse.File) error {
+	for groupName, gd := range b.groups {
+		if len(gd.members) == 0 {
+			continue
+		}
+		deps := make([]parse.Dep, len(gd.members))
+		for i, m := range gd.members {
+			deps[i] = parse.Dep{Target: m.internalName}
+		}
+		agg := &parse.TargetRule{
+			Target:    groupName,
+			HasDepSep: true,
+			Deps:      deps,
+		}
+		// Replace existing aggregator if present, or append new one.
+		replaced := false
+		for i, d := range f.Directives {
+			if r, ok := d.(*parse.TargetRule); ok && r.Target == groupName && r.HasDepSep && r.Body == "" && len(r.ForClauses) == 0 && len(r.Groups) == 0 {
+				f.Directives[i] = agg
+				replaced = true
+				break
+			}
+		}
+		if !replaced {
+			f.Directives = append(f.Directives, agg)
+		}
+	}
+	return nil
+}
+
+// expandGroupConsumers expands rules that have at least one group projection dep.
+// For each such rule, the group's members' dim-tuples are computed, cross-producted
+// with any explicit for-clause combos, and synthetic combo rules are generated.
+func (b *Build) expandGroupConsumers(f *parse.File) error {
+	var toAppend []parse.Directive
+	type replacement struct {
+		idx  int
+		rule *parse.TargetRule
+	}
+	var replacements []replacement
+
+	for i, d := range f.Directives {
+		r, ok := d.(*parse.TargetRule)
+		if !ok {
+			continue
+		}
+
+		// Check if any dep is a group projection dep.
+		hasGroupDep := false
+		for _, dep := range r.Deps {
+			if len(dep.GroupDims) > 0 {
+				hasGroupDep = true
+				break
+			}
+		}
+		if !hasGroupDep {
+			continue
+		}
+		if r.Pattern != "" {
+			return fmt.Errorf("group projection deps are not supported on pattern rules")
+		}
+		if r.Verb != "" {
+			return fmt.Errorf("group projection deps are not supported on verb rules")
+		}
+
+		// Compute explicit combos from ForClauses (may be empty → one "empty" combo).
+		var explicitCombos []matrixCombo
+		if len(r.ForClauses) > 0 {
+			varNames := make([]string, len(r.ForClauses))
+			varValues := make([][]string, len(r.ForClauses))
+			for j, fc := range r.ForClauses {
+				vals, err := b.evalForExpr(fc.Expr)
+				if err != nil {
+					return fmt.Errorf("target %q: for %s: %w", r.Target, fc.Var, err)
+				}
+				varNames[j] = fc.Var
+				varValues[j] = vals
+			}
+			allCombos := crossProduct(varNames, varValues)
+			for _, combo := range allCombos {
+				if !matchesAnyExclude(combo, r.Excludes) {
+					explicitCombos = append(explicitCombos, combo)
+				}
+			}
+			if len(explicitCombos) == 0 {
+				return fmt.Errorf("target %q: all matrix combinations excluded", r.Target)
+			}
+		} else {
+			explicitCombos = []matrixCombo{{}}
+		}
+
+		// For each group projection dep, pre-compute dim→members index.
+		type depEntry struct {
+			dims    []string
+			byKey   map[string][]string // sorted-key-repr → []internalName
+		}
+		depEntries := make([]depEntry, len(r.Deps))
+		for di, dep := range r.Deps {
+			if len(dep.GroupDims) == 0 {
+				continue
+			}
+			gd, ok := b.groups[dep.Target]
+			if !ok {
+				return fmt.Errorf("target %q: dep references unknown group %q", r.Target, dep.Target)
+			}
+			dims := dep.GroupDims
+			byKey := make(map[string][]string)
+			for _, m := range gd.members {
+				// Build key from the requested dims only.
+				dimVals := make(matrixCombo, len(dims))
+				allPresent := true
+				for _, d := range dims {
+					if v, has := m.combo[d]; has {
+						dimVals[d] = v
+					} else {
+						allPresent = false
+						break
+					}
+				}
+				if !allPresent {
+					// Non-matrix member (empty combo): if all requested dims are
+					// empty-string, include as a wildcard-match for dim-less groups.
+					if len(m.combo) == 0 {
+						key := comboTargetName("", matrixCombo{})
+						byKey[key] = append(byKey[key], m.internalName)
+					}
+					continue
+				}
+				key := comboTargetName("", dimVals)
+				byKey[key] = append(byKey[key], m.internalName)
+			}
+			depEntries[di] = depEntry{dims: dims, byKey: byKey}
+		}
+
+		// Collect all distinct group-dim combos across all group projection deps.
+		// These form the "group-derived" axis of the cross-product.
+		allGroupDims := make(map[string]bool)
+		for _, de := range depEntries {
+			for _, d := range de.dims {
+				allGroupDims[d] = true
+			}
+		}
+
+		// Build a deduplicated list of group-derived combos from the first group
+		// projection dep (or the union of all of them if dims overlap).
+		groupCombosSet := make(map[string]matrixCombo)
+		for _, de := range depEntries {
+			if de.dims == nil {
+				continue
+			}
+			for key, members := range de.byKey {
+				_ = members
+				if _, exists := groupCombosSet[key]; !exists {
+					// Reconstruct the combo from the key.
+					// We stored it as comboTargetName("", dimVals), parse it back.
+					// Actually, let's build the combo directly from the members.
+					// We'll iterate group members again to avoid re-parsing.
+					_ = key
+				}
+			}
+		}
+		// Simpler: iterate the group members directly to collect distinct dim-tuples.
+		groupCombosSet = make(map[string]matrixCombo)
+		groupCombosSlice := []matrixCombo{}
+		for di, dep := range r.Deps {
+			if len(dep.GroupDims) == 0 {
+				continue
+			}
+			gd := b.groups[dep.Target]
+			dims := depEntries[di].dims
+			for _, m := range gd.members {
+				dimVals := make(matrixCombo)
+				allPresent := true
+				for _, d := range dims {
+					if v, has := m.combo[d]; has {
+						dimVals[d] = v
+					} else {
+						allPresent = false
+						break
+					}
+				}
+				if !allPresent {
+					if len(m.combo) == 0 {
+						// Non-matrix member: dim tuple is empty.
+						key := comboTargetName("", matrixCombo{})
+						if _, exists := groupCombosSet[key]; !exists {
+							groupCombosSet[key] = matrixCombo{}
+							groupCombosSlice = append(groupCombosSlice, matrixCombo{})
+						}
+					}
+					continue
+				}
+				key := comboTargetName("", dimVals)
+				if _, exists := groupCombosSet[key]; !exists {
+					groupCombosSet[key] = dimVals
+					groupCombosSlice = append(groupCombosSlice, dimVals)
+				}
+			}
+		}
+
+		if len(groupCombosSlice) == 0 {
+			return fmt.Errorf("target %q: group projection produced no member combinations (is the group empty?)", r.Target)
+		}
+
+		// Cross-product: explicitCombos × groupCombosSlice.
+		allCombos := make([]matrixCombo, 0, len(explicitCombos)*len(groupCombosSlice))
+		for _, ec := range explicitCombos {
+			for _, gc := range groupCombosSlice {
+				combined := make(matrixCombo, len(ec)+len(gc))
+				for k, v := range ec {
+					combined[k] = v
+				}
+				for k, v := range gc {
+					combined[k] = v
+				}
+				allCombos = append(allCombos, combined)
+			}
+		}
+
+		// Generate synthetic rules, one per combined combo.
+		aggDeps := make([]parse.Dep, 0, len(allCombos))
+		for _, combo := range allCombos {
+			name := comboTargetName(r.Target, combo)
+
+			// Skip if already generated (idempotent for cascading).
+			if _, exists := b.matrixVars[name]; exists {
+				aggDeps = append(aggDeps, parse.Dep{Target: name})
+				continue
+			}
+
+			b.matrixVars[name] = combo
+
+			runner := substituteMatrixVars(r.Runner, combo)
+
+			// Build deps for this combo.
+			var deps []parse.Dep
+			for di, dep := range r.Deps {
+				if len(dep.GroupDims) == 0 {
+					// Regular dep: substitute matrix vars.
+					deps = append(deps, parse.Dep{
+						Target: substituteMatrixVars(dep.Target, combo),
+						Verb:   dep.Verb,
+						Combo:  dep.Combo,
+					})
+				} else {
+					// Group projection dep: resolve members matching this combo's group dims.
+					de := depEntries[di]
+					dimVals := make(matrixCombo, len(de.dims))
+					for _, d := range de.dims {
+						if v, has := combo[d]; has {
+							dimVals[d] = v
+						}
+					}
+					key := comboTargetName("", dimVals)
+					for _, memberName := range de.byKey[key] {
+						deps = append(deps, parse.Dep{Target: memberName})
+					}
+				}
+			}
+
+			synth := &parse.TargetRule{
+				Type:        r.Type,
+				Target:      name,
+				Runner:      runner,
+				HasDepSep:   r.HasDepSep || len(deps) > 0,
+				Options:     r.Options,
+				Body:        r.Body,
+				Description: r.Description,
+				Deps:        deps,
+				Groups:      r.Groups, // propagate group membership for cascading
+			}
+			toAppend = append(toAppend, synth)
+			aggDeps = append(aggDeps, parse.Dep{Target: name})
+		}
+
+		// Build the aggregator rule.
+		// Store matrix info for the base rule.
+		if len(r.ForClauses) > 0 || len(allCombos) > 1 || (len(allCombos) == 1 && len(allCombos[0]) > 0) {
+			// Only set matrixInfo if we generated multiple combos or the combo has dims.
+			combosForInfo := make([]matrixCombo, len(allCombos))
+			copy(combosForInfo, allCombos)
+			b.matrixInfo[r.Target] = &matrixRuleInfo{combos: combosForInfo}
+		}
+
+		agg := &parse.TargetRule{
+			Target:      r.Target,
+			HasDepSep:   true,
+			Deps:        aggDeps,
+			Description: r.Description,
+			Groups:      r.Groups,
+		}
+		replacements = append(replacements, replacement{idx: i, rule: agg})
+	}
+
+	for _, rep := range replacements {
+		f.Directives[rep.idx] = rep.rule
+	}
 	f.Directives = append(f.Directives, toAppend...)
 	return nil
 }
