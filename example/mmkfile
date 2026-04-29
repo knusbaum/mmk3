@@ -50,16 +50,25 @@ shell on runimage:latest tty=true : executable {
 # }
 
 # you could write this.
-one for x in [ 1 2 3 4 ] {
+file one for x in [ 1 2 3 4 ] {
+    sleep $x
     echo $x
+    touch "$target";
 }
 
-two for y in [ a b c d ] {
+file two for y in [ a b c d ] {
+    sleep 5
     echo $y
+    if [[ "$y" == "b" ]]; then
+	exit 1;
+    fi
+    touch "$target";
 }
 
-downstream for x in [ 1 2 3 4 ] for y in [ a b c d ] : [one @ x=$x] [two @ y=$y] {
+file downstream for x in [ 1 2 3 4 ] for y in [ a b c d ] : [one @ x=$x] [two @ y=$y] {
+    sleep $x
     echo $x $y
+    touch "$target";
 }
 
 
@@ -68,28 +77,42 @@ downstream for x in [ 1 2 3 4 ] for y in [ a b c d ] : [one @ x=$x] [two @ y=$y]
 
 group numbers
 
-g_one for test in [g_one] for x in [ 1 2 3 4 ] into numbers {
+file g_one for test in [g_one] for x in [ 1 2 3 4 ] into numbers on ubuntu:latest {
+    sleep $x
     echo $x
+    touch "$target";
 }
 
-g_two for test in [g_two] for x in [ 1 2 3 4 a b c d ] into numbers {
+file g_two for test in [g_two] for x in [ 1 2 3 4 a b c d ] into numbers {
+    sleep 5;
     echo $x
+    touch "$target";
 }
 
-g_downstream : [numbers @ test x ] {
+file g_downstream : [numbers @ test x ] {
     echo DEPS: "'$deps'"
     echo TEST: $test X: "'$x'"
+    touch "$target";
 }
 
+file 2base for i in [$(seq 1 5)] {
+    sleep $i;
+    echo 2base $i
+    touch "$target";
+}
 
 group numbers2
 
-one2 for i in [ $(seq 1 100) ] into numbers2 { echo OK }
-two2 for i in [ $(seq 1 100) ] into numbers2 { echo OK }
+file one2 for i in [ $(seq 1 5) ] into numbers2 : 2base { sleep $i; echo one2 $i; touch "$target"; }
+file two2 for i in [ $(seq 1 5) ] into numbers2 : 2base { sleep $i; echo two2 $i; touch "$target"; }
 
-consumer2 : [ numbers2 @ i ] {
+file consumer2 : [ numbers2 @ i ] {
     # can see both target name (`one`, `two`)
     # as well as $i.
+    sleep $i;
     echo CONSUMING: "$i $deps"
+    touch "$target";
 }
 
+
+many : consumer2 g_downstream downstream executable
