@@ -1,0 +1,17 @@
+{
+  "name": "mmk3",
+  "description": "Claude Code plugins for mmk3 — a make-like build tool with a bash-native DSL.",
+  "owner": {
+    "name": "Kyle Nusbaum"
+  },
+  "plugins": [
+    {
+      "name": "mmk",
+      "description": "Reference and idioms for writing mmkfiles. Auto-loads when an agent edits a file named mmkfile or Mmkfile.",
+      "source": "./plugins/mmk",
+      "homepage": "https://github.com/knusbaum/mmk3",
+      "repository": "https://github.com/knusbaum/mmk3",
+      "keywords": ["mmk", "build", "make", "mmkfile"]
+    }
+  ]
+}

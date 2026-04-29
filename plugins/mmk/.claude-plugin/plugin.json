@@ -1,0 +1,10 @@
+{
+  "name": "mmk",
+  "description": "Reference and idioms for writing mmkfiles, the build files used by the mmk CLI.",
+  "version": "0.1.0",
+  "author": {
+    "name": "Kyle Nusbaum"
+  },
+  "homepage": "https://github.com/knusbaum/mmk3",
+  "repository": "https://github.com/knusbaum/mmk3"
+}
