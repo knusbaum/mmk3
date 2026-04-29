@@ -68,14 +68,28 @@ downstream for x in [ 1 2 3 4 ] for y in [ a b c d ] : [one @ x=$x] [two @ y=$y]
 
 group numbers
 
-g_one for x in [ 1 2 3 4 ] into numbers {
+g_one for test in [g_one] for x in [ 1 2 3 4 ] into numbers {
     echo $x
 }
 
-g_two for y in [ a b c d ] into numbers {
-    echo $y
+g_two for test in [g_two] for x in [ 1 2 3 4 a b c d ] into numbers {
+    echo $x
 }
 
-g_downstream : [numbers @ y ] {
-    echo $x $y
+g_downstream : [numbers @ test x ] {
+    echo DEPS: "'$deps'"
+    echo TEST: $test X: "'$x'"
 }
+
+
+group numbers2
+
+one2 for i in [ $(seq 1 100) ] into numbers2 { echo OK }
+two2 for i in [ $(seq 1 100) ] into numbers2 { echo OK }
+
+consumer2 : [ numbers2 @ i ] {
+    # can see both target name (`one`, `two`)
+    # as well as $i.
+    echo CONSUMING: "$i $deps"
+}
+

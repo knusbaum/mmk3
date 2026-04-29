@@ -1576,17 +1576,24 @@ func (b *Build) expandRuleNames(f *parse.File) error {
 	return nil
 }
 
-// comboTargetName returns the internal DAG name for a specific matrix combo.
-// Keys are sorted alphabetically for determinism. Example: "build[go=1.20 os=linux]"
+// comboTargetName returns the DAG name for a specific matrix combo.
+// Keys are sorted alphabetically for determinism.
+// Non-empty combo: "[base @ k=v k2=v2]"   e.g. "[build @ go=1.20 os=linux]"
+// Empty combo:     base unchanged          (aggregator name, no suffix needed)
+// Empty base:      "[@ k=v]"              (internal lookup key only)
 func comboTargetName(base string, combo matrixCombo) string {
+	if len(combo) == 0 {
+		return base
+	}
 	keys := make([]string, 0, len(combo))
 	for k := range combo {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
 	var sb strings.Builder
-	sb.WriteString(base)
 	sb.WriteByte('[')
+	sb.WriteString(base)
+	sb.WriteString(" @ ")
 	for i, k := range keys {
 		if i > 0 {
 			sb.WriteByte(' ')
@@ -1594,6 +1601,32 @@ func comboTargetName(base string, combo matrixCombo) string {
 		sb.WriteString(k)
 		sb.WriteByte('=')
 		sb.WriteString(combo[k])
+	}
+	sb.WriteByte(']')
+	return sb.String()
+}
+
+// comboTemplateName returns the display name for a matrix aggregator in -list,
+// showing the dim names with blank values: "[base @ k= k2=]"
+func comboTemplateName(base string, info *matrixRuleInfo) string {
+	if len(info.combos) == 0 {
+		return base
+	}
+	keys := make([]string, 0, len(info.combos[0]))
+	for k := range info.combos[0] {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var sb strings.Builder
+	sb.WriteByte('[')
+	sb.WriteString(base)
+	sb.WriteString(" @ ")
+	for i, k := range keys {
+		if i > 0 {
+			sb.WriteByte(' ')
+		}
+		sb.WriteString(k)
+		sb.WriteByte('=')
 	}
 	sb.WriteByte(']')
 	return sb.String()
@@ -2716,16 +2749,36 @@ func (b *Build) PrintList(w io.Writer) {
 	}
 	all := make([]entry, 0, len(b.concretes))
 	for _, name := range b.Targets() {
+		// Individual combo instances are not directly addressed by users;
+		// they're represented by their aggregator's template name.
+		if b.matrixVars[name] != nil {
+			continue
+		}
 		r := b.concretes[name]
-		annot := annotateRule(r)
 		desc := ""
 		if r != nil {
 			desc = firstLine(r.Description)
 		}
+
+		var displayName, annot string
+		if info, ok := b.matrixInfo[name]; ok {
+			// Matrix aggregator: use dim template as display name; the
+			// template itself is already informative, so no dep annotation.
+			displayName = comboTemplateName(name, info)
+		} else if b.declaredGroups[name] {
+			// Group aggregator: suppress the long member dep list.
+			displayName = name
+			n := 0
+			if gd := b.groups[name]; gd != nil {
+				n = len(gd.members)
+			}
+			annot = fmt.Sprintf("(group, %d members)", n)
+		} else {
+			displayName = name
+			annot = annotateRule(r)
+		}
+
 		if subAnnot, ok := subRoots[name]; ok {
-			// Subproject root: the "subproject (path/mmkfile)" annotation
-			// adds structural info beyond what the runner clause alone says,
-			// so prefer it when no description is supplied.
 			if annot != "" {
 				annot = subAnnot + ", " + annot
 			} else {
@@ -2733,7 +2786,7 @@ func (b *Build) PrintList(w io.Writer) {
 			}
 			delete(subRoots, name)
 		}
-		all = append(all, entry{name, pickInfo(desc, annot)})
+		all = append(all, entry{displayName, pickInfo(desc, annot)})
 	}
 	// Sub-of-sub subproject roots (not in top-level concretes), and sub-targets.
 	for _, s := range subSummaries {

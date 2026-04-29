@@ -2183,10 +2183,13 @@ flat : g
 	if _, ok := b.concretes[macosName]; !ok {
 		t.Errorf("expected %q in concretes", macosName)
 	}
-	// plain_task (no `os` dim) must not have created a consumer[] instance.
-	emptyName := comboTargetName("consumer", matrixCombo{})
-	if _, ok := b.concretes[emptyName]; ok {
-		t.Errorf("consumer[] instance should not exist for plain_task member; got %q", emptyName)
+	// plain_task (no `os` dim) must not have added a spurious empty-dim combo to consumer.
+	info := b.matrixInfo["consumer"]
+	if info == nil {
+		t.Fatal("expected matrixInfo for consumer aggregator")
+	}
+	if len(info.combos) != 2 {
+		t.Errorf("consumer should have exactly 2 combos (linux, macos), got %d: %v", len(info.combos), info.combos)
 	}
 
 	// Flat dep includes plain_task via the aggregator.
