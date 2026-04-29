@@ -329,6 +329,25 @@ or referenced in a dep list as `[verb deptarget]`.
 [clean all] : [clean prog] [clean main.o] [clean util.o]
 ```
 
+`[verb target]` is a valid dep in **any** rule, not just in verb rules. Use
+it when the prerequisite is an action rather than an artifact:
+
+```bash
+# A plain (non-verb) rule that depends on a verb action.
+deploy : [verify all] artifact {
+    upload-tool artifact
+}
+
+# A verb rule whose deps mix verbs and plain targets.
+[teardown stack] : [teardown app-layer] auth-token {
+    teardown-tool stack
+}
+```
+
+Saying `deploy : [verify all]` is the right way to express "running deploy
+implies first running verify" when the prerequisite is a side-effecting
+action rather than something that produces a file you'd dep on directly.
+
 ### Dep inheritance for verb rules
 
 A verb rule's dep list defaults to **the target's default deps with the verb

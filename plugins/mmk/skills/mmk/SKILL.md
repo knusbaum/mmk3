@@ -57,6 +57,10 @@ group NAME
 # Combo dep on a matrix target
 <consumer> : [target @ k=v k=v]
 
+# Verb dep — depend on running [verb target] first. Valid in ANY rule's
+# deps, not just verb rules. Use when the prereq is an action, not an artifact.
+<consumer> : [verb target]
+
 # Passthrough
 ANY_OTHER_LINE                          # treated as raw bash
 ```
@@ -198,6 +202,11 @@ shipping.
   need the verb to run inside the runner, declare `[verb T] on R` explicitly.
 - To make a runner-verb fire after consumers automatically, give it
   `order=after-consumers` (only valid for types that have a `defrunner`).
+- **`[verb target]` is a valid dep in any rule's dep list, not just in
+  verb rules.** Use it when the prerequisite is an action rather than an
+  artifact (e.g., `deploy : [verify all] artifact { upload artifact }`).
+  The dep target's verb rule must exist or be inheritable from a defbody;
+  unknown verbs error at build time, not parse time.
 
 ### Matrix and groups
 
