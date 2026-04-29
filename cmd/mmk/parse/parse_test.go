@@ -1273,6 +1273,59 @@ func TestGroupProjectionDepMixedWithPlainDeps(t *testing.T) {
 	}
 }
 
+func TestIntoClauseWithForAndOn(t *testing.T) {
+	f := mustParse(t, `build for os in [linux macos] into mygroup on runner-$os { :; }`)
+	r := asRule(t, f.Directives[0])
+	expect(t, "Target", r.Target, "build")
+	expect(t, "Runner", r.Runner, "runner-$os")
+	if len(r.ForClauses) != 1 || r.ForClauses[0].Var != "os" {
+		t.Fatalf("ForClauses: got %v", r.ForClauses)
+	}
+	if len(r.Groups) != 1 || r.Groups[0] != "mygroup" {
+		t.Errorf("Groups: got %v, want [mygroup]", r.Groups)
+	}
+}
+
+func TestGroupDirectiveMissingNameError(t *testing.T) {
+	expectError(t, "group\n", "")
+}
+
+func TestIntoMissingNameError(t *testing.T) {
+	expectError(t, `mytarget into :`, "")
+}
+
+func TestGroupBracketFlatDepNotProjection(t *testing.T) {
+	// [groupname] with no @ is a plain bracket dep, not a group projection.
+	f := mustParse(t, `foo : [mygroup]`)
+	r := asRule(t, f.Directives[0])
+	if len(r.Deps) != 1 {
+		t.Fatalf("Deps len: got %d, want 1", len(r.Deps))
+	}
+	d := r.Deps[0]
+	expect(t, "Target", d.Target, "mygroup")
+	if len(d.GroupDims) != 0 {
+		t.Errorf("GroupDims should be empty for plain bracket dep, got %v", d.GroupDims)
+	}
+	if len(d.Combo) != 0 {
+		t.Errorf("Combo should be empty, got %v", d.Combo)
+	}
+}
+
+func TestGroupProjectionDepMultipleGroups(t *testing.T) {
+	// Two group projection deps in the same dep list.
+	f := mustParse(t, `foo : [g1 @ input] [g2 @ somevar]`)
+	r := asRule(t, f.Directives[0])
+	if len(r.Deps) != 2 {
+		t.Fatalf("Deps len: got %d, want 2", len(r.Deps))
+	}
+	if r.Deps[0].Target != "g1" || len(r.Deps[0].GroupDims) != 1 || r.Deps[0].GroupDims[0] != "input" {
+		t.Errorf("Deps[0]: got %+v", r.Deps[0])
+	}
+	if r.Deps[1].Target != "g2" || len(r.Deps[1].GroupDims) != 1 || r.Deps[1].GroupDims[0] != "somevar" {
+		t.Errorf("Deps[1]: got %+v", r.Deps[1])
+	}
+}
+
 // Existing combo deps must still work (k=v form, not bare dim form).
 func TestComboDepStillWorksAfterGroupProjectionParsing(t *testing.T) {
 	f := mustParse(t, `foo : [build @ os=linux go=1.20]`)

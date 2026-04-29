@@ -2139,3 +2139,170 @@ test : [empty_group @ os] { :; }
 		t.Fatal("expected error for group projection with empty group")
 	}
 }
+
+func TestGroupMembersWithoutRequestedDimExcluded(t *testing.T) {
+	// Members that don't have the projected dimension are silently excluded
+	// from projection consumers but still appear in the flat aggregator.
+	src := `
+group g
+
+build for os in [linux macos] into g { :; }
+plain_task into g :
+
+consumer : [g @ os] { :; }
+flat : g
+`
+	b := newBuild(t, src)
+
+	// Projection creates one instance per distinct os value.
+	linuxName := comboTargetName("consumer", matrixCombo{"os": "linux"})
+	macosName := comboTargetName("consumer", matrixCombo{"os": "macos"})
+	if _, ok := b.concretes[linuxName]; !ok {
+		t.Errorf("expected %q in concretes", linuxName)
+	}
+	if _, ok := b.concretes[macosName]; !ok {
+		t.Errorf("expected %q in concretes", macosName)
+	}
+	// plain_task (no `os` dim) must not have created a consumer[] instance.
+	emptyName := comboTargetName("consumer", matrixCombo{})
+	if _, ok := b.concretes[emptyName]; ok {
+		t.Errorf("consumer[] instance should not exist for plain_task member; got %q", emptyName)
+	}
+
+	// Flat dep includes plain_task via the aggregator.
+	flatNode, err := b.Resolve("flat")
+	if err != nil {
+		t.Fatalf("Resolve flat: %v", err)
+	}
+	aggDeps := depTargets(flatNode.Dependencies()[0].Dependencies())
+	if !contains(aggDeps, "plain_task") {
+		t.Errorf("flat group aggregator should include plain_task; got %v", aggDeps)
+	}
+}
+
+func TestGroupMultipleGroupProjectionDeps(t *testing.T) {
+	// Consumer depends on two different groups projected on different dims.
+	// Result is the cross-product of the two groups' dim values.
+	src := `
+group inputs
+group variants
+
+task_a for input in [in1 in2] into inputs { :; }
+task_b for variant in [v1 v2] into variants { :; }
+
+consumer for x in [x1] : [inputs @ input] [variants @ variant] { :; }
+`
+	b := newBuild(t, src)
+
+	// Should have 1 (x) × 2 (input) × 2 (variant) = 4 combos.
+	want := []matrixCombo{
+		{"x": "x1", "input": "in1", "variant": "v1"},
+		{"x": "x1", "input": "in1", "variant": "v2"},
+		{"x": "x1", "input": "in2", "variant": "v1"},
+		{"x": "x1", "input": "in2", "variant": "v2"},
+	}
+	for _, combo := range want {
+		name := comboTargetName("consumer", combo)
+		n, err := b.Resolve(name)
+		if err != nil {
+			t.Fatalf("Resolve %q: %v", name, err)
+		}
+		deps := depTargets(n.Dependencies())
+		inputName := comboTargetName("task_a", matrixCombo{"input": combo["input"]})
+		variantName := comboTargetName("task_b", matrixCombo{"variant": combo["variant"]})
+		if !contains(deps, inputName) {
+			t.Errorf("%v should dep on %q; got %v", combo, inputName, deps)
+		}
+		if !contains(deps, variantName) {
+			t.Errorf("%v should dep on %q; got %v", combo, variantName, deps)
+		}
+	}
+}
+
+func TestGroupCascading(t *testing.T) {
+	// stage1 members → group stage1
+	// stage2 consumer of stage1 → also member of group stage2
+	// stage3 consumer of stage2
+	src := `
+group stage1
+group stage2
+
+task for x in [a b] into stage1 { :; }
+agg into stage2 : [stage1 @ x] { :; }
+final : [stage2 @ x] { :; }
+`
+	b := newBuild(t, src)
+
+	// agg should be expanded: agg[x=a] and agg[x=b].
+	aggA := comboTargetName("agg", matrixCombo{"x": "a"})
+	aggB := comboTargetName("agg", matrixCombo{"x": "b"})
+	if _, ok := b.concretes[aggA]; !ok {
+		t.Errorf("expected %q in concretes", aggA)
+	}
+	if _, ok := b.concretes[aggB]; !ok {
+		t.Errorf("expected %q in concretes", aggB)
+	}
+
+	// final should also be expanded: final[x=a] and final[x=b].
+	finalA := comboTargetName("final", matrixCombo{"x": "a"})
+	finalB := comboTargetName("final", matrixCombo{"x": "b"})
+	if _, ok := b.concretes[finalA]; !ok {
+		t.Errorf("expected %q in concretes", finalA)
+	}
+	if _, ok := b.concretes[finalB]; !ok {
+		t.Errorf("expected %q in concretes", finalB)
+	}
+
+	// final[x=a] should dep on agg[x=a].
+	finalANode, err := b.Resolve(finalA)
+	if err != nil {
+		t.Fatalf("Resolve %q: %v", finalA, err)
+	}
+	deps := depTargets(finalANode.Dependencies())
+	if !contains(deps, aggA) {
+		t.Errorf("final[x=a] should dep on %q; got %v", aggA, deps)
+	}
+}
+
+func TestGroupBracketFlatDepResolvesToAggregator(t *testing.T) {
+	// consumer : [g] (bracket form, no @) is a plain dep on the group aggregator.
+	src := `
+group g
+
+a into g :
+b into g :
+consumer : [g]
+`
+	b := newBuild(t, src)
+	n, err := b.Resolve("consumer")
+	if err != nil {
+		t.Fatalf("Resolve consumer: %v", err)
+	}
+	deps := n.Dependencies()
+	if len(deps) != 1 || deps[0].target != "g" {
+		t.Errorf("consumer deps: got %v, want [g]", depTargets(deps))
+	}
+	aggDeps := depTargets(deps[0].Dependencies())
+	if !contains(aggDeps, "a") || !contains(aggDeps, "b") {
+		t.Errorf("group aggregator deps: got %v, want [a b]", aggDeps)
+	}
+}
+
+func TestGroupVerbAppliedToAggregator(t *testing.T) {
+	// [clean g] propagates to all group members via the aggregator's inherited verb deps.
+	src := `
+group g
+
+a into g :
+b into g :
+`
+	b := newBuild(t, src)
+	n, err := b.ResolveVerb("g", "clean")
+	if err != nil {
+		t.Fatalf("ResolveVerb g clean: %v", err)
+	}
+	deps := depTargets(n.Dependencies())
+	if !contains(deps, "a") || !contains(deps, "b") {
+		t.Errorf("[clean g] should propagate to members a and b; got %v", deps)
+	}
+}

@@ -450,6 +450,11 @@ func NewBuild(src []byte) (*Build, error) {
 				return nil, fmt.Errorf("group expansion did not converge after %d iterations", maxIter)
 			}
 		}
+		if err := b.validateGroupConsumersExpanded(f); err != nil {
+			b.genFile.Close()
+			os.Remove(b.genPath)
+			return nil, err
+		}
 	}
 
 	// Expand each `subproject` directive: read its sub-mmkfile, harvest verbs,
@@ -1976,8 +1981,11 @@ func (b *Build) createGroupAggregators(f *parse.File) error {
 }
 
 // expandGroupConsumers expands rules that have at least one group projection dep.
-// For each such rule, the group's members' dim-tuples are computed, cross-producted
-// with any explicit for-clause combos, and synthetic combo rules are generated.
+// For each such rule, each group dep contributes one axis of distinct dim-tuples;
+// all axes are cross-producted with any explicit for-clause combos.
+// Rules whose group deps are not yet populated are skipped (deferred to the next
+// fixed-point iteration). Use validateGroupConsumersExpanded after the loop to
+// error on any that remain unexpanded.
 func (b *Build) expandGroupConsumers(f *parse.File) error {
 	var toAppend []parse.Directive
 	type replacement struct {
@@ -2036,12 +2044,17 @@ func (b *Build) expandGroupConsumers(f *parse.File) error {
 			explicitCombos = []matrixCombo{{}}
 		}
 
-		// For each group projection dep, pre-compute dim→members index.
+		// For each group projection dep, build:
+		//   depEntries[di] — dim→members lookup index for dep resolution
+		//   groupAxes[N]   — one axis of distinct dim-tuples per group projection dep
+		// Members that lack any of the requested dims are silently excluded.
 		type depEntry struct {
-			dims    []string
-			byKey   map[string][]string // sorted-key-repr → []internalName
+			dims  []string
+			byKey map[string][]string // comboTargetName("", dimVals) → []internalName
 		}
 		depEntries := make([]depEntry, len(r.Deps))
+		var groupAxes [][]matrixCombo
+		skipRule := false
 		for di, dep := range r.Deps {
 			if len(dep.GroupDims) == 0 {
 				continue
@@ -2052,8 +2065,9 @@ func (b *Build) expandGroupConsumers(f *parse.File) error {
 			}
 			dims := dep.GroupDims
 			byKey := make(map[string][]string)
+			axisSet := make(map[string]matrixCombo)
+			var axisSlice []matrixCombo
 			for _, m := range gd.members {
-				// Build key from the requested dims only.
 				dimVals := make(matrixCombo, len(dims))
 				allPresent := true
 				for _, d := range dims {
@@ -2065,103 +2079,46 @@ func (b *Build) expandGroupConsumers(f *parse.File) error {
 					}
 				}
 				if !allPresent {
-					// Non-matrix member (empty combo): if all requested dims are
-					// empty-string, include as a wildcard-match for dim-less groups.
-					if len(m.combo) == 0 {
-						key := comboTargetName("", matrixCombo{})
-						byKey[key] = append(byKey[key], m.internalName)
-					}
+					// Member lacks one or more of the projected dims — silently exclude.
 					continue
 				}
 				key := comboTargetName("", dimVals)
 				byKey[key] = append(byKey[key], m.internalName)
+				if _, exists := axisSet[key]; !exists {
+					axisSet[key] = dimVals
+					axisSlice = append(axisSlice, dimVals)
+				}
 			}
 			depEntries[di] = depEntry{dims: dims, byKey: byKey}
+			if len(axisSlice) == 0 {
+				// Group has no qualifying members yet — defer to next iteration.
+				skipRule = true
+				break
+			}
+			groupAxes = append(groupAxes, axisSlice)
+		}
+		if skipRule {
+			continue
 		}
 
-		// Collect all distinct group-dim combos across all group projection deps.
-		// These form the "group-derived" axis of the cross-product.
-		allGroupDims := make(map[string]bool)
-		for _, de := range depEntries {
-			for _, d := range de.dims {
-				allGroupDims[d] = true
-			}
-		}
-
-		// Build a deduplicated list of group-derived combos from the first group
-		// projection dep (or the union of all of them if dims overlap).
-		groupCombosSet := make(map[string]matrixCombo)
-		for _, de := range depEntries {
-			if de.dims == nil {
-				continue
-			}
-			for key, members := range de.byKey {
-				_ = members
-				if _, exists := groupCombosSet[key]; !exists {
-					// Reconstruct the combo from the key.
-					// We stored it as comboTargetName("", dimVals), parse it back.
-					// Actually, let's build the combo directly from the members.
-					// We'll iterate group members again to avoid re-parsing.
-					_ = key
-				}
-			}
-		}
-		// Simpler: iterate the group members directly to collect distinct dim-tuples.
-		groupCombosSet = make(map[string]matrixCombo)
-		groupCombosSlice := []matrixCombo{}
-		for di, dep := range r.Deps {
-			if len(dep.GroupDims) == 0 {
-				continue
-			}
-			gd := b.groups[dep.Target]
-			dims := depEntries[di].dims
-			for _, m := range gd.members {
-				dimVals := make(matrixCombo)
-				allPresent := true
-				for _, d := range dims {
-					if v, has := m.combo[d]; has {
-						dimVals[d] = v
-					} else {
-						allPresent = false
-						break
+		// Cross-product: start with explicitCombos, then fold in each group axis.
+		allCombos := make([]matrixCombo, len(explicitCombos))
+		copy(allCombos, explicitCombos)
+		for _, axis := range groupAxes {
+			var next []matrixCombo
+			for _, base := range allCombos {
+				for _, ext := range axis {
+					merged := make(matrixCombo, len(base)+len(ext))
+					for k, v := range base {
+						merged[k] = v
 					}
-				}
-				if !allPresent {
-					if len(m.combo) == 0 {
-						// Non-matrix member: dim tuple is empty.
-						key := comboTargetName("", matrixCombo{})
-						if _, exists := groupCombosSet[key]; !exists {
-							groupCombosSet[key] = matrixCombo{}
-							groupCombosSlice = append(groupCombosSlice, matrixCombo{})
-						}
+					for k, v := range ext {
+						merged[k] = v
 					}
-					continue
-				}
-				key := comboTargetName("", dimVals)
-				if _, exists := groupCombosSet[key]; !exists {
-					groupCombosSet[key] = dimVals
-					groupCombosSlice = append(groupCombosSlice, dimVals)
+					next = append(next, merged)
 				}
 			}
-		}
-
-		if len(groupCombosSlice) == 0 {
-			return fmt.Errorf("target %q: group projection produced no member combinations (is the group empty?)", r.Target)
-		}
-
-		// Cross-product: explicitCombos × groupCombosSlice.
-		allCombos := make([]matrixCombo, 0, len(explicitCombos)*len(groupCombosSlice))
-		for _, ec := range explicitCombos {
-			for _, gc := range groupCombosSlice {
-				combined := make(matrixCombo, len(ec)+len(gc))
-				for k, v := range ec {
-					combined[k] = v
-				}
-				for k, v := range gc {
-					combined[k] = v
-				}
-				allCombos = append(allCombos, combined)
-			}
+			allCombos = next
 		}
 
 		// Generate synthetic rules, one per combined combo.
@@ -2243,6 +2200,24 @@ func (b *Build) expandGroupConsumers(f *parse.File) error {
 		f.Directives[rep.idx] = rep.rule
 	}
 	f.Directives = append(f.Directives, toAppend...)
+	return nil
+}
+
+// validateGroupConsumersExpanded checks that no rules still have unexpanded group
+// projection deps. Called after the fixed-point loop to catch groups that never
+// received any members.
+func (b *Build) validateGroupConsumersExpanded(f *parse.File) error {
+	for _, d := range f.Directives {
+		r, ok := d.(*parse.TargetRule)
+		if !ok {
+			continue
+		}
+		for _, dep := range r.Deps {
+			if len(dep.GroupDims) > 0 {
+				return fmt.Errorf("target %q: group projection produced no member combinations (is the group empty?)", r.Target)
+			}
+		}
+	}
 	return nil
 }
 
