@@ -114,17 +114,20 @@ file analyze for case in [cases] : [cases @ case] {
 ```
 
 ```bash
-# Custom freshness type for an artifact stored somewhere unusual.
+# Custom freshness type, parameterized via the `bucket` option.
+# Both the deftype (freshness check) and the defbody (upload) read $bucket,
+# so a single type definition serves any number of targets in any number of buckets.
 deftype s3_object {
-    aws s3api head-object --bucket mybucket --key "$target" \
-        --query 'LastModified' --output text 2>/dev/null || return 1
+    aws s3api head-object --bucket "$bucket" --key "$target" \
+        --query LastModified --output text 2>/dev/null || return 1
 }
 
 defbody s3_object {
-    s3-upload "$target"
+    aws s3 cp - "s3://$bucket/$target" < "${dep[0]}"
 }
 
-s3_object reports/2026/q1.csv : data/q1.csv
+s3_object reports/q1.csv  bucket=acme-prod : data/q1.csv
+s3_object dev/scratch.csv bucket=acme-dev  : data/scratch.csv
 ```
 
 ```bash
@@ -170,6 +173,12 @@ shipping.
 - Dep lists allow multi-word expansion (each word becomes a dep).
 - Passthroughs run **once** at parse time. They cannot reference per-target
   state like `$target`. Use them for static values and helper functions.
+- `key=value` options on a rule header are bash vars in **every body the
+  type contributes** — the target body, the type's `defbody`/`deftype`,
+  and any `defrunner` phases. A plain `key=value` inside `{ ... }` is only
+  visible to that one body. Use options when a `deftype` / `defbody` /
+  `defrunner` needs to read per-target config (their bodies run instead
+  of, or before, the target body and can't see its locals).
 
 ### Pattern rules
 

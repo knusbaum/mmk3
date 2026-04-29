@@ -185,26 +185,49 @@ target.
 
 ### Rule options (`key=value`)
 
-Any rule header may carry `key=value` annotations. Each option becomes a bash
-variable in scope of the rule's body:
+Options are how rules **parameterize a generic body**. They're most useful
+with `defbody`, `defrunner`, and `deftype` — a single shared body adapts to
+each target by reading the target's options as bash variables.
 
 ```bash
-file myartifact compress=gzip retries=3 : src {
-    for i in $(seq 1 $retries); do
-        produce | $compress > "$target" && break
-    done
+# A type with a generic body that reads `bucket` from each target.
+deftype s3_object {
+    aws s3api head-object --bucket "$bucket" --key "$target" \
+        --query LastModified --output text 2>/dev/null || return 1
 }
+
+defbody s3_object {
+    aws s3 cp - "s3://$bucket/$target" < "${dep[0]}"
+}
+
+# Each target shares the deftype/defbody pair above; they differ only in `bucket`.
+s3_object reports/q1.csv  bucket=acme-prod : data/q1.csv
+s3_object dev/scratch.csv bucket=acme-dev  : data/scratch.csv
 ```
 
-Options are scanned out wherever they appear in the header. Values may
-contain `:`, `/`, and `=`. For values with spaces, use quoted form:
+Options are visible in **every body that runs on behalf of a rule**: the
+target's own body, the type's `deftype` (freshness check), the type's
+`defbody` (when no body is set), and the runner's `defrunner` phases. A
+plain assignment inside the target body (`bucket=acme-prod` *inside* `{ ... }`)
+wouldn't reach the other phases — they run instead of, or before, the target
+body.
+
+When a target uses `on R`, both the runner's options and the target's
+options are in scope. On collision the **target's** value shadows the
+runner's; matrix variables (`for V in [...]`) shadow both.
+
+#### Syntax
+
+Options may appear anywhere in the rule header — before or after `on R`,
+interspersed with `for V in [...]` clauses, etc. Bare values are
+word-bounded; values with spaces use a quoted form:
 
 ```bash
 image winbuild platform=linux/amd64 forward_env="VERSION TAG" : Dockerfile
 ```
 
-Reserved option keys (would shadow `mmk`'s own variables): `target`, `deps`,
-and anything starting with `MMK_`.
+Values may contain `:`, `/`, `=`. Reserved keys (would shadow `mmk`'s own
+variables): `target`, `deps`, and anything starting with `MMK_`.
 
 ### Body environment
 
@@ -276,6 +299,11 @@ defbody my_artifact {
 
 Used when a typed target has no explicit body. Override any built-in by
 declaring your own `defbody` with the same name.
+
+A `defbody` becomes much more useful when the body reads per-target options
+as bash variables — that's how a single shared `defbody` serves many
+targets that differ in configuration. See [Rule options](#rule-options-keyvalue)
+for the worked example with `bucket=`.
 
 ### `defbody` for verbs
 
@@ -385,6 +413,12 @@ Lifecycle:
 Multiple targets sharing the same runner share one container.
 
 ### Built-in image runner options
+
+Among the built-in types (`file`, `source`, `image`), only `image` reads
+any options — the table below enumerates them. `file` and `source` ignore
+options entirely. To introduce options for your own targets, write a
+`deftype` / `defbody` / `defrunner` that references them as bash variables;
+see [Rule options](#rule-options-keyvalue) for an example.
 
 The built-in `image` runner honors these options on the image target *or*
 on consumer rules:
