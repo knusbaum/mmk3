@@ -22,11 +22,20 @@ func main() {
 	dagMGroup := flag.Bool("mgroup", false, "with -dag, collapse matrix combos sharing a base into one box")
 	full := flag.Bool("full", false, "with -graph, recurse into subprojects (one mmk subprocess per subproject)")
 	useTUI := flag.Bool("tui", false, "render the build as a live TUI tree with status updates")
+	installSkill := flag.Bool("install-skill", false, "install the mmk Claude Code skill via 'claude plugin' commands (Y/n prompt before running)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: mmk [-j N] [-v] [-dump] [-builtins] [-list] [-graph [-full]] [[verb] target]\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	if *installSkill {
+		if err := runInstallSkill(); err != nil {
+			fmt.Fprintf(os.Stderr, "mmk: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if *builtins {
 		if err := gen.PrintBuiltins(os.Stdout); err != nil {
