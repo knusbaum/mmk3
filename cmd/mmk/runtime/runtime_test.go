@@ -2129,7 +2129,6 @@ consumer : g
 }
 
 func TestGroupEmptyProjectionError(t *testing.T) {
-	// A group projection dep with no members should error during expansion.
 	src := `
 group empty_group
 test : [empty_group @ os] { :; }
@@ -2137,6 +2136,27 @@ test : [empty_group @ os] { :; }
 	_, err := NewBuild([]byte(src))
 	if err == nil {
 		t.Fatal("expected error for group projection with empty group")
+	}
+	if !strings.Contains(err.Error(), "no members") {
+		t.Errorf("error should say 'no members': %v", err)
+	}
+}
+
+func TestGroupDisjointDimsError(t *testing.T) {
+	// Members contribute x and y separately; [g @ x y] requires both on one member.
+	// Error should explain the situation and suggest projecting each dim separately.
+	src := `
+group g
+a for x in [1 2] into g { :; }
+b for y in [p q] into g { :; }
+consumer : [g @ x y] { :; }
+`
+	_, err := NewBuild([]byte(src))
+	if err == nil {
+		t.Fatal("expected error when no member has all projected dims")
+	}
+	if !strings.Contains(err.Error(), "[g @ x] [g @ y]") {
+		t.Errorf("error should suggest separate projections: %v", err)
 	}
 }
 

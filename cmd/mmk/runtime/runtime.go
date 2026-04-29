@@ -2213,9 +2213,43 @@ func (b *Build) validateGroupConsumersExpanded(f *parse.File) error {
 			continue
 		}
 		for _, dep := range r.Deps {
-			if len(dep.GroupDims) > 0 {
-				return fmt.Errorf("target %q: group projection produced no member combinations (is the group empty?)", r.Target)
+			if len(dep.GroupDims) == 0 {
+				continue
 			}
+			gd := b.groups[dep.Target]
+			dims := dep.GroupDims
+			dimStr := strings.Join(dims, " ")
+			if gd == nil || len(gd.members) == 0 {
+				return fmt.Errorf("target %q: [%s @ %s]: group %q has no members",
+					r.Target, dep.Target, dimStr, dep.Target)
+			}
+			// Group has members but none had all the requested dims together.
+			// Collect which dims actually appear in the group to help diagnose.
+			seenDims := make(map[string]bool)
+			for _, m := range gd.members {
+				for k := range m.combo {
+					seenDims[k] = true
+				}
+			}
+			missingDims := []string{}
+			for _, d := range dims {
+				if !seenDims[d] {
+					missingDims = append(missingDims, d)
+				}
+			}
+			if len(missingDims) > 0 {
+				return fmt.Errorf("target %q: [%s @ %s]: no member of group %q has dimension(s) %s",
+					r.Target, dep.Target, dimStr, dep.Target, strings.Join(missingDims, ", "))
+			}
+			// All dims exist in the group, but no single member has all of them.
+			// This is the "disjoint dims" case: producers contribute separate dims.
+			sep := make([]string, len(dims))
+			for i, d := range dims {
+				sep[i] = fmt.Sprintf("[%s @ %s]", dep.Target, d)
+			}
+			return fmt.Errorf("target %q: [%s @ %s]: no member of group %q has all dimensions %s together; "+
+				"if producers contribute these dimensions separately, project each dim individually: %s",
+				r.Target, dep.Target, dimStr, dep.Target, dimStr, strings.Join(sep, " "))
 		}
 	}
 	return nil
