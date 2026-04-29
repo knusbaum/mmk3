@@ -45,7 +45,13 @@ defrunner NAME { run-phase body }       # mandatory
 defrunner NAME setup { ... }            # optional; stdout = runner state
 defrunner NAME cleanup { ... }          # optional
 
-# Subproject delegation
+# Splice another mmkfile in at this point (same namespace, same DAG).
+# Path is bare word or double-quoted; relative to the including file.
+# $VAR / $(...) in the path are expanded against passthroughs above.
+include path/to/other.mmk
+include "path with spaces.mmk"
+
+# Subproject delegation (separate mmk process, isolated namespace).
 subproject NAME [on runner] [opt=val ...]
 
 # Group declaration / membership / projection
@@ -81,7 +87,8 @@ ANY_OTHER_LINE                          # treated as raw bash
 | Allow `mmk clean T` (or another verb) on a target type | `defbody TYPE clean { ... }` |
 | Add a one-off `clean`, `run`, etc. to a target | `[verb T] { ... }` |
 | Several producers feeding fan-out consumers without naming each producer | `group g`; `into g` on producers; `[g @ dim]` on consumer |
-| Delegate part of the build to a sub-directory mmkfile | `subproject NAME [path=DIR]` |
+| Split a growing mmkfile across files (same DAG, same namespace) | `include lib/foo.mmk` |
+| Delegate part of the build to a sub-directory mmkfile (separate DAG, isolated namespace) | `subproject NAME [path=DIR]` |
 
 ## Idioms
 
@@ -141,6 +148,16 @@ s3_object dev/scratch.csv bucket=acme-dev  : data/scratch.csv
 file prog on myimg : main.o util.o { ... }
 
 [clean prog] :+ [clean myimg]
+```
+
+```bash
+# Splitting a large mmkfile across files. Convention: name included files
+# with a .mmk extension (not enforced by the parser).
+# Lexical splice — same DAG, shared variables, cross-file deps work.
+include lib/build.mmk
+include lib/tests.mmk
+
+all : svc tests   # 'svc' is in lib/build.mmk, 'tests' is in lib/tests.mmk
 ```
 
 ## Pitfalls

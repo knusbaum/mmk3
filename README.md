@@ -642,6 +642,56 @@ The runtime resolves cascades to a fixed point.
 The group aggregator itself is addressable: `mmk g` builds every member;
 `mmk clean g` cleans every member.
 
+## Splitting an mmkfile (`include`)
+
+When an mmkfile gets large, split it across files and compose them with
+`include`:
+
+```bash
+# mmkfile
+include lib/build.mmk
+include lib/tests.mmk
+include ops/deploy.mmk
+
+all : svc tests
+```
+
+`include` is a parse-time lexical splice: the included file's directives
+are inserted in place of the directive, exactly as if you'd typed them
+inline. Result is **one** namespace, **one** DAG, **one** generated bash
+script — targets in `lib/build.mmk` can dep on targets in `lib/tests.mmk`,
+and variables defined in passthrough above an include are visible inside
+the included file.
+
+Properties:
+
+- **Path is relative to the including file.** `include lib/foo.mmk`
+  inside `sub/build.mmk` reads `sub/lib/foo.mmk`, not `./lib/foo.mmk`.
+- **Each absolute path is included at most once per build.** Re-includes
+  and cycles (A includes B, B includes A) are silent no-ops.
+- **Variable expansion is supported in the path.** `include $LIBDIR/foo.mmk`
+  works, evaluated against passthroughs that have appeared above the
+  directive (in this file or in earlier-included files).
+- **Both bare-word and quoted forms work.** Quote when the path has
+  spaces: `include "lib/with spaces.mmk"`.
+
+By convention, included files use the `.mmk` extension; the parser
+doesn't enforce it. `mmk -dump` prints the union of all directives and
+is the right tool to confirm the splice is what you expected.
+
+### `include` vs `subproject`
+
+`include` and `subproject` solve different problems. Pick the one whose
+behavior matches what you want:
+
+| | `include` | `subproject` |
+|---|---|---|
+| Number of mmk processes | One | One per subproject (parent shells out) |
+| Target namespace | Shared with parent | Isolated; reached via `<name>/<target>` |
+| Cross-file deps | Direct: `a : b` works across files | Through the subproject's name |
+| Variables from parent | Visible in included files | **Not** visible in subprojects |
+| Use when | Splitting one logical build | Composing genuinely separate builds |
+
 ## Subprojects
 
 A `subproject` directive delegates part of the build to a nested mmkfile:

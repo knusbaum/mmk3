@@ -144,12 +144,26 @@ type Subproject struct {
 	Description string // joined `##`-prefixed comment lines immediately preceding this directive
 }
 
+// Include is a parse-time directive that splices the directives from another
+// mmkfile in at this point. Path is the raw path as written in the source;
+// it may contain $VAR references that ParseFile resolves via bash, with
+// access to all passthroughs that appeared above the include.
+//
+// Path is resolved relative to the file containing the include directive.
+// Each absolute path is included at most once per ParseFile invocation —
+// duplicate includes (including cycles) are silent no-ops.
+type Include struct {
+	Path string
+	Line int
+}
+
 func (*DefType) isDirective()     {}
 func (*DefRunner) isDirective()   {}
 func (*DefBody) isDirective()     {}
 func (*TargetRule) isDirective()  {}
 func (*Passthrough) isDirective() {}
 func (*Subproject) isDirective()  {}
+func (*Include) isDirective()     {}
 
 // Parse parses src and returns the AST or an error.
 func Parse(src []byte) (*File, error) {
@@ -602,7 +616,7 @@ func (p *parser) parseDirectiveOrPassthrough() (Directive, error) {
 	word := p.s.readWord()
 	p.s.pos, p.s.line = saved, savedLine
 
-	if word == "deftype" || word == "defrunner" || word == "defbody" || word == "subproject" || word == "group" {
+	if word == "deftype" || word == "defrunner" || word == "defbody" || word == "subproject" || word == "group" || word == "include" {
 		return p.parseDirective()
 	}
 
@@ -785,6 +799,8 @@ func (p *parser) parseDirective() (Directive, error) {
 		return p.parseSubproject()
 	case "group":
 		return p.parseGroup()
+	case "include":
+		return p.parseInclude()
 	default:
 		return p.parseTargetRule()
 	}
@@ -954,6 +970,39 @@ func (p *parser) parseSubproject() (Directive, error) {
 		return nil, fmt.Errorf("line %d: unexpected token %q in subproject %q", p.s.line, word, target)
 	}
 	return &Subproject{Target: target, Runner: runner, Options: options}, nil
+}
+
+// parseInclude handles 'include <path>' directives. Path is a bare word
+// (any non-whitespace, non-`{`, non-`#` token) or a double-quoted string.
+// Variable references (`$VAR`, `$(...)`) inside the path are preserved
+// literally here; ResolveIncludes evaluates them at resolution time.
+func (p *parser) parseInclude() (Directive, error) {
+	startLine := p.s.line
+	p.s.readWord() // consume "include"
+	p.s.skipHorizontalSpace()
+	var path string
+	switch p.s.peek() {
+	case 0, '\n', '#':
+		return nil, fmt.Errorf("line %d: expected path after 'include'", p.s.line)
+	case '"':
+		s, err := p.s.readString()
+		if err != nil {
+			return nil, fmt.Errorf("include: %w", err)
+		}
+		path = s
+	case '\'':
+		return nil, fmt.Errorf("line %d: include path may not be single-quoted", p.s.line)
+	default:
+		path = p.s.readWord()
+		if path == "" {
+			return nil, fmt.Errorf("line %d: expected path after 'include'", p.s.line)
+		}
+	}
+	p.s.skipHorizontalSpace()
+	if b := p.s.peek(); b != 0 && b != '\n' && b != '#' {
+		return nil, fmt.Errorf("line %d: unexpected token after include %q", p.s.line, path)
+	}
+	return &Include{Path: path, Line: startLine}, nil
 }
 
 // parseGroup handles 'group <name>' directives at file level.

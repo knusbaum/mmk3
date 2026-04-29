@@ -45,13 +45,13 @@ func main() {
 		return
 	}
 
-	src, err := readMmkfile()
+	mmkfilePath, err := findMmkfile()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mmk: %v\n", err)
 		os.Exit(1)
 	}
 
-	b, err := runtime.NewBuild(src)
+	b, err := runtime.NewBuildFromFile(mmkfilePath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "mmk: %v\n", err)
 		os.Exit(1)
@@ -153,17 +153,15 @@ func main() {
 	}
 }
 
-// readMmkfile reads the mmkfile from the current directory.
+// findMmkfile returns the path to the mmkfile in the current directory.
 // It looks for Mmkfile first, then mmkfile.
-func readMmkfile() ([]byte, error) {
+func findMmkfile() (string, error) {
 	for _, name := range []string{"Mmkfile", "mmkfile"} {
-		data, err := os.ReadFile(name)
-		if err == nil {
-			return data, nil
-		}
-		if !os.IsNotExist(err) {
-			return nil, err
+		if _, err := os.Stat(name); err == nil {
+			return name, nil
+		} else if !os.IsNotExist(err) {
+			return "", err
 		}
 	}
-	return nil, fmt.Errorf("no Mmkfile or mmkfile found in current directory")
+	return "", fmt.Errorf("no Mmkfile or mmkfile found in current directory")
 }

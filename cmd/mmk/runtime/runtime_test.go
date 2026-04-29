@@ -2329,3 +2329,48 @@ b into g :
 		t.Errorf("[clean g] should propagate to members a and b; got %v", deps)
 	}
 }
+
+// --- include ---
+
+func TestNewBuildFromFile_IncludesArrive(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "lib.mmk"), []byte(`
+file from_lib : { :; }
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(dir, "mmkfile")
+	if err := os.WriteFile(root, []byte(`
+include lib.mmk
+
+all : from_lib
+`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := NewBuildFromFile(root)
+	if err != nil {
+		t.Fatalf("NewBuildFromFile: %v", err)
+	}
+	t.Cleanup(b.Close)
+
+	if !b.HasTarget("from_lib") {
+		t.Error("expected target 'from_lib' from included file")
+	}
+	if !b.HasTarget("all") {
+		t.Error("expected target 'all' from root file")
+	}
+}
+
+func TestNewBuild_RejectsUnresolvedInclude(t *testing.T) {
+	// NewBuild (the byte-based path) doesn't know what dir to resolve includes
+	// against. An Include directive that survives parsing must produce an
+	// error that points the caller at NewBuildFromFile.
+	_, err := NewBuild([]byte("include lib.mmk\n"))
+	if err == nil {
+		t.Fatal("expected error from NewBuild on unresolved include")
+	}
+	if !strings.Contains(err.Error(), "unresolved include") {
+		t.Errorf("error should mention 'unresolved include'; got: %v", err)
+	}
+}

@@ -298,12 +298,39 @@ func validateOrderOption(options []parse.Option, ctx, typeName string, validRunn
 	return nil
 }
 
-// NewBuild parses src, validates names, generates the initial bash script, and
-// returns a Build ready for Execute.
+// NewBuild parses src (without resolving include directives), validates
+// names, generates the initial bash script, and returns a Build ready for
+// Execute. Use NewBuildFromFile when you want include resolution; this
+// byte-based entry point exists for tests and for callers that have
+// already produced an mmkfile in memory.
 func NewBuild(src []byte) (*Build, error) {
 	f, err := parse.Parse(src)
 	if err != nil {
 		return nil, err
+	}
+	return newBuildFromAST(f)
+}
+
+// NewBuildFromFile reads the mmkfile at path, parses it (recursively
+// resolving any `include` directives relative to the file's directory),
+// and returns a Build ready for Execute.
+func NewBuildFromFile(path string) (*Build, error) {
+	f, err := parse.ParseFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return newBuildFromAST(f)
+}
+
+// newBuildFromAST is the shared implementation behind NewBuild and
+// NewBuildFromFile. It assumes any Include directives have already been
+// resolved (or were never present); an Include surviving to this point is
+// a programming error and produces an error here.
+func newBuildFromAST(f *parse.File) (*Build, error) {
+	for _, d := range f.Directives {
+		if inc, ok := d.(*parse.Include); ok {
+			return nil, fmt.Errorf("unresolved include %q at line %d (use NewBuildFromFile to resolve includes)", inc.Path, inc.Line)
+		}
 	}
 
 	b := &Build{
@@ -2477,15 +2504,15 @@ func (b *Build) ResolveSubpath(target, verb string) bool {
 	return true
 }
 
-// readSubMmkfile reads <path>/mmkfile or <path>/Mmkfile and returns the parsed AST.
+// readSubMmkfile reads <path>/mmkfile or <path>/Mmkfile and returns the
+// parsed AST with any `include` directives resolved relative to the
+// sub-mmkfile's directory.
 func readSubMmkfile(path string) (*parse.File, error) {
 	for _, name := range []string{"mmkfile", "Mmkfile"} {
 		p := filepath.Join(path, name)
-		data, err := os.ReadFile(p)
-		if err == nil {
-			return parse.Parse(data)
-		}
-		if !os.IsNotExist(err) {
+		if _, err := os.Stat(p); err == nil {
+			return parse.ParseFile(p)
+		} else if !os.IsNotExist(err) {
 			return nil, fmt.Errorf("read %s: %w", p, err)
 		}
 	}
