@@ -64,9 +64,12 @@ type groupMember struct {
 	combo        matrixCombo // full combo of this member; empty for non-matrix members
 }
 
-// groupData holds the registered members of a group.
+// groupData holds the registered members of a group, plus any description
+// from the original `group` directive's `##` docstring (so PrintList can
+// surface it on the synthetic group aggregator).
 type groupData struct {
-	members []groupMember
+	members     []groupMember
+	description string
 }
 
 // subprojectInfo is what the runtime tracks about each `subproject` directive
@@ -427,7 +430,7 @@ func newBuildFromAST(f *parse.File) (*Build, error) {
 	for _, d := range f.Directives {
 		if g, ok := d.(*parse.Group); ok {
 			b.declaredGroups[g.Name] = true
-			b.groups[g.Name] = &groupData{}
+			b.groups[g.Name] = &groupData{description: g.Description}
 		}
 	}
 
@@ -2020,9 +2023,10 @@ func (b *Build) createGroupAggregators(f *parse.File) error {
 			deps[i] = parse.Dep{Target: m.internalName}
 		}
 		agg := &parse.TargetRule{
-			Target:    groupName,
-			HasDepSep: true,
-			Deps:      deps,
+			Target:      groupName,
+			HasDepSep:   true,
+			Deps:        deps,
+			Description: gd.description,
 		}
 		// Replace existing aggregator if present, or append new one.
 		replaced := false
@@ -2437,10 +2441,11 @@ func (b *Build) expandSubprojects(f *parse.File) error {
 
 		// Default-build rule. Use HasDepSep=true to suppress verb dep-inheritance.
 		f.Directives = append(f.Directives, &parse.TargetRule{
-			Target:    sp.Target,
-			Runner:    sp.Runner,
-			HasDepSep: true,
-			Body:      fmt.Sprintf("\n\t(cd %q && mmk)\n", path),
+			Target:      sp.Target,
+			Runner:      sp.Runner,
+			HasDepSep:   true,
+			Body:        fmt.Sprintf("\n\t(cd %q && mmk)\n", path),
+			Description: sp.Description,
 		})
 
 		// One [verb target] rule per harvested verb.
@@ -2755,7 +2760,7 @@ func walkSubprojectTree(path, prefix string) []*subprojectSummary {
 // annotated as `subproject (<path>/mmkfile)`, and its child targets are
 // listed below it with full path-from-root prefixes. Recursion (subprojects
 // of subprojects) follows the same pattern.
-func (b *Build) PrintList(w io.Writer) {
+func (b *Build) PrintList(w io.Writer, all bool) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "Targets:")
 	subSummaries := b.walkSubprojects()
@@ -2767,14 +2772,22 @@ func (b *Build) PrintList(w io.Writer) {
 	// else the structural annotation (`on <runner>`, `type: ...`, `→ deps`).
 	// Falling back keeps the listing concise — annotation is only visible
 	// when the user hasn't supplied a more meaningful description.
-	type entry struct{ name, info string }
+	type entry struct {
+		name, info string
+		public     bool // visible by default; non-public hidden unless -all
+	}
 	pickInfo := func(desc, annot string) string {
 		if desc != "" {
 			return desc
 		}
 		return annot
 	}
-	all := make([]entry, 0, len(b.concretes))
+	// A target is "public" when it has a docstring or is the literal target
+	// `all` (always shown so users see what `mmk` with no args will do).
+	isPublic := func(name, desc string) bool {
+		return desc != "" || name == "all"
+	}
+	entries := make([]entry, 0, len(b.concretes))
 	for _, name := range b.Targets() {
 		// Individual combo instances are not directly addressed by users;
 		// they're represented by their aggregator's template name.
@@ -2813,51 +2826,138 @@ func (b *Build) PrintList(w io.Writer) {
 			}
 			delete(subRoots, name)
 		}
-		all = append(all, entry{displayName, pickInfo(desc, annot)})
+		entries = append(entries, entry{displayName, pickInfo(desc, annot), isPublic(name, desc)})
 	}
 	// Sub-of-sub subproject roots (not in top-level concretes), and sub-targets.
 	for _, s := range subSummaries {
 		if annot, ok := subRoots[s.prefix]; ok {
-			all = append(all, entry{name: s.prefix, info: annot})
+			// Sub-of-sub root: no Description tracked at this layer; mark
+			// non-public unless -all. Surfacing the sub-mmkfile via -list
+			// requires a docstring on the parent's `subproject` directive.
+			entries = append(entries, entry{s.prefix, annot, false})
 		}
 		for _, t := range s.targets {
-			all = append(all, entry{
-				name: s.prefix + "/" + t,
-				info: firstLine(s.targetDescriptions[t]),
+			desc := firstLine(s.targetDescriptions[t])
+			entries = append(entries, entry{
+				name:   s.prefix + "/" + t,
+				info:   desc,
+				public: desc != "",
 			})
 		}
 	}
-	sort.Slice(all, func(i, j int) bool { return all[i].name < all[j].name })
-	for _, e := range all {
+	sort.Slice(entries, func(i, j int) bool { return entries[i].name < entries[j].name })
+	hiddenTargets := 0
+	for _, e := range entries {
+		if !all && !e.public {
+			hiddenTargets++
+			continue
+		}
 		fmt.Fprintf(tw, "  %s\t%s\n", e.name, e.info)
 	}
 	tw.Flush()
 
-	patterns := b.Patterns()
-	if len(patterns) > 0 {
+	// Patterns: filter to docstring-having unless -all. Hide the whole
+	// section (header included) when there's nothing to show.
+	type patternEntry struct {
+		pattern, desc string
+		public        bool
+	}
+	var patterns []patternEntry
+	for _, pe := range b.patterns {
+		if pe.rule.Verb != "" {
+			continue // verb-pattern rules surface in the Verbs section, not here
+		}
+		desc := firstLine(pe.rule.Description)
+		patterns = append(patterns, patternEntry{
+			pattern: pe.rule.Pattern,
+			desc:    desc,
+			public:  desc != "",
+		})
+	}
+	sort.Slice(patterns, func(i, j int) bool { return patterns[i].pattern < patterns[j].pattern })
+	hiddenPatterns := 0
+	visiblePatterns := make([]patternEntry, 0, len(patterns))
+	for _, p := range patterns {
+		if !all && !p.public {
+			hiddenPatterns++
+			continue
+		}
+		visiblePatterns = append(visiblePatterns, p)
+	}
+	if len(visiblePatterns) > 0 {
 		fmt.Fprintln(w)
 		fmt.Fprintln(w, "Patterns:")
-		for _, p := range patterns {
-			fmt.Fprintf(w, "  '%s'\n", p)
+		ptw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+		for _, p := range visiblePatterns {
+			if p.desc != "" {
+				fmt.Fprintf(ptw, "  '%s'\t%s\n", p.pattern, p.desc)
+			} else {
+				fmt.Fprintf(ptw, "  '%s'\t\n", p.pattern)
+			}
 		}
+		ptw.Flush()
 	}
 
+	// Verbs: every verb is shown. Per-verb target list is filtered so it
+	// only shows what would also appear in the Targets section above
+	// (docstringed targets plus `all`). A trailing count tells the user
+	// how many internal targets the verb also applies to.
 	verbToTargets := b.verbToTargetsMap()
 	verbPatterns := b.verbToPatternsMap()
 	if len(verbToTargets) > 0 || len(verbPatterns) > 0 {
 		fmt.Fprintln(w)
 		fmt.Fprintln(w, "Verbs (run as `mmk <verb>` or `mmk <verb> <target>`):")
-		tw = tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+		vtw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 		for _, verb := range b.Verbs() {
-			parts := append([]string{}, verbToTargets[verb]...)
-			for _, p := range verbPatterns[verb] {
-				parts = append(parts, "'"+p+"'")
+			var visible []string
+			internal := 0
+			for _, t := range verbToTargets[verb] {
+				r := b.concretes[t]
+				desc := ""
+				if r != nil {
+					desc = r.Description
+				}
+				if all || isPublic(t, desc) {
+					visible = append(visible, t)
+				} else {
+					internal++
+				}
 			}
-			fmt.Fprintf(tw, "  %s\t%s\n", verb, strings.Join(parts, ", "))
+			for _, p := range verbPatterns[verb] {
+				visible = append(visible, "'"+p+"'")
+			}
+			line := strings.Join(visible, ", ")
+			if internal > 0 {
+				if line != "" {
+					line += " "
+				}
+				line += fmt.Sprintf("(+ %d internal targets. Use -all to see them.)", internal)
+			}
+			fmt.Fprintf(vtw, "  %s\t%s\n", verb, line)
 		}
-		tw.Flush()
+		vtw.Flush()
 	}
 
+	// Footer: tell users about -all when filtering hid anything.
+	if !all && (hiddenTargets > 0 || hiddenPatterns > 0) {
+		fmt.Fprintln(w)
+		switch {
+		case hiddenTargets > 0 && hiddenPatterns > 0:
+			fmt.Fprintf(w, "(%s and %s hidden — use -all to see them)\n", plural(hiddenTargets, "target"), plural(hiddenPatterns, "pattern"))
+		case hiddenTargets > 0:
+			fmt.Fprintf(w, "(%s hidden — use -all to see them)\n", plural(hiddenTargets, "target"))
+		default:
+			fmt.Fprintf(w, "(%s hidden — use -all to see them)\n", plural(hiddenPatterns, "pattern"))
+		}
+	}
+}
+
+// plural returns "<n> <singular>" or "<n> <singular>s".
+func plural(n int, singular string) string {
+	if n == 1 {
+		return fmt.Sprintf("%d %s", n, singular)
+	}
+	return fmt.Sprintf("%d %ss", n, singular)
 }
 
 

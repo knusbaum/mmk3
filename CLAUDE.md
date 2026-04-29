@@ -159,6 +159,22 @@ include lib/tests.mmk
 all : svc tests   # 'svc' is in lib/build.mmk, 'tests' is in lib/tests.mmk
 ```
 
+```bash
+# Docstrings double as a public/private marker for `mmk -list`. Add `##`
+# above the things a human is supposed to invoke; leave intermediates and
+# machinery undocumented and `mmk -list` will hide them.
+## The thing users build.
+file release : src.tar.gz {
+    publish "$target"
+}
+
+# This is internal: no docstring, hidden from `mmk -list` (still appears
+# in `mmk -list -all`).
+file src.tar.gz : {
+    tar czf "$target" src/
+}
+```
+
 ## Pitfalls
 
 These are real and have bitten users; check yourself against them before
@@ -250,7 +266,11 @@ shipping.
   "unknown verb" rather than "unknown target."
 - `mmk -dump` is the right tool for "did mmk parse what I expected?" — it
   prints the generated bash script.
-- `mmk -list` shows targets, patterns, and verbs with descriptions.
+- `mmk -list` shows user-facing targets (those with a `##` docstring,
+  plus `all`); pattern rules, matrix aggregators, image-runner targets,
+  and undocumented intermediate targets are hidden. `mmk -list -all`
+  shows everything. Add a `##` docstring above any target you want to
+  surface as a user entry point.
 - `mmk -graph` and `mmk -dag` show the dep graph.
 
 ## Body environment cheatsheet
@@ -322,8 +342,9 @@ What this gives the user:
 
 - `mmk -dump` — see the generated bash. If the script looks wrong, the
   mmkfile is wrong.
-- `mmk -list` — confirm every target, pattern, verb, and group you intended
-  to declare is registered.
+- `mmk -list` — confirm every user-facing target you intended is
+  registered. Use `-list -all` to see internal targets (pattern rules,
+  matrix aggregators, image runners, anything without a docstring).
 - `mmk -graph T` / `mmk -dag T` — confirm the dep tree matches what you
   expected.
 - `mmk -builtins` — see how `file` / `source` / `image` are implemented in

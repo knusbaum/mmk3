@@ -2374,3 +2374,192 @@ func TestNewBuild_RejectsUnresolvedInclude(t *testing.T) {
 		t.Errorf("error should mention 'unresolved include'; got: %v", err)
 	}
 }
+
+// --- PrintList: docstring-driven default vs -all ---
+
+func printListString(t *testing.T, b *Build, all bool) string {
+	t.Helper()
+	var buf strings.Builder
+	b.PrintList(&buf, all)
+	return buf.String()
+}
+
+func TestPrintList_DefaultHidesUndocumented(t *testing.T) {
+	b := newBuild(t, `
+all : public_thing
+
+## A target a user is meant to invoke.
+public_thing : { :; }
+
+internal_thing : { :; }
+`)
+	out := printListString(t, b, false)
+	if !strings.Contains(out, "public_thing") {
+		t.Errorf("default -list should include docstringed target; got:\n%s", out)
+	}
+	if !strings.Contains(out, "  all") {
+		t.Errorf("default -list should always include 'all'; got:\n%s", out)
+	}
+	if strings.Contains(out, "internal_thing") {
+		t.Errorf("default -list should NOT include undocumented target; got:\n%s", out)
+	}
+	if !strings.Contains(out, "1 target hidden") {
+		t.Errorf("expected '1 target hidden' footer; got:\n%s", out)
+	}
+}
+
+func TestPrintList_AllShowsEverything(t *testing.T) {
+	b := newBuild(t, `
+all : public_thing
+
+## A docstringed target.
+public_thing : { :; }
+
+internal_thing : { :; }
+`)
+	out := printListString(t, b, true)
+	for _, want := range []string{"public_thing", "internal_thing", "all"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("-all should include %q; got:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "hidden") {
+		t.Errorf("-all should not show a 'hidden' footer; got:\n%s", out)
+	}
+}
+
+func TestPrintList_AllAlwaysShownEvenWithoutDocstring(t *testing.T) {
+	b := newBuild(t, `
+all : foo
+foo : { :; }
+bar : { :; }
+`)
+	out := printListString(t, b, false)
+	if !strings.Contains(out, "  all") {
+		t.Errorf("'all' should always appear even without a docstring; got:\n%s", out)
+	}
+	// Without -all and with no docstrings on foo or bar, neither should
+	// appear as its own row. (foo IS expected to appear inside all's
+	// `→ foo` dep annotation, so we check row-prefix not substring.)
+	for _, line := range strings.Split(out, "\n") {
+		for _, hidden := range []string{"foo", "bar"} {
+			if strings.HasPrefix(line, "  "+hidden+" ") || strings.HasPrefix(line, "  "+hidden+"\t") {
+				t.Errorf("undocumented %q should be hidden as a row; got line: %q", hidden, line)
+			}
+		}
+	}
+}
+
+func TestPrintList_PatternsHiddenByDefault(t *testing.T) {
+	b := newBuild(t, `
+'(.*)\.o' : $1.c { cc -c $1.c -o $target; }
+
+## A docstringed target.
+foo : { :; }
+`)
+	out := printListString(t, b, false)
+	if strings.Contains(out, "Patterns:") {
+		t.Errorf("default -list should hide Patterns section when nothing is docstringed; got:\n%s", out)
+	}
+	if !strings.Contains(out, "1 pattern hidden") {
+		t.Errorf("expected '1 pattern hidden' footer; got:\n%s", out)
+	}
+}
+
+func TestPrintList_DocstringedPatternShowsByDefault(t *testing.T) {
+	b := newBuild(t, `
+## Build .o from .c.
+'(.*)\.o' : $1.c { cc -c $1.c -o $target; }
+
+## A docstringed target.
+foo : { :; }
+`)
+	out := printListString(t, b, false)
+	if !strings.Contains(out, "Patterns:") {
+		t.Errorf("docstringed pattern should surface the Patterns section; got:\n%s", out)
+	}
+	if !strings.Contains(out, "Build .o from .c.") {
+		t.Errorf("docstringed pattern's description should appear; got:\n%s", out)
+	}
+}
+
+func TestPrintList_VerbTargetsFiltered(t *testing.T) {
+	// `clean` applies to every file target via the built-in defbody. Only
+	// the docstringed target should appear; the rest are summarised.
+	b := newBuild(t, `
+## A user-facing artifact.
+file public_artifact : { :; }
+
+file internal_a : { :; }
+file internal_b : { :; }
+`)
+	out := printListString(t, b, false)
+
+	// Find the line for the clean verb.
+	var cleanLine string
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "clean") && strings.Contains(line, "internal targets") {
+			cleanLine = line
+			break
+		}
+		if strings.HasPrefix(strings.TrimSpace(line), "clean") {
+			cleanLine = line
+		}
+	}
+	if cleanLine == "" {
+		t.Fatalf("no line for verb 'clean' found in:\n%s", out)
+	}
+	if !strings.Contains(cleanLine, "public_artifact") {
+		t.Errorf("clean's verb line should list the docstringed target; got: %q", cleanLine)
+	}
+	if strings.Contains(cleanLine, "internal_a") || strings.Contains(cleanLine, "internal_b") {
+		t.Errorf("clean's verb line should not list internal targets; got: %q", cleanLine)
+	}
+	if !strings.Contains(cleanLine, "+ 2 internal targets") {
+		t.Errorf("clean's verb line should summarise '+ 2 internal targets'; got: %q", cleanLine)
+	}
+}
+
+func TestPrintList_VerbTargetsAllShowsEverything(t *testing.T) {
+	b := newBuild(t, `
+## docstringed.
+file public_artifact : { :; }
+
+file internal_a : { :; }
+`)
+	out := printListString(t, b, true)
+	for _, want := range []string{"public_artifact", "internal_a"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("-all should list %q; got:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "internal targets") {
+		t.Errorf("-all should not summarise internal targets; got:\n%s", out)
+	}
+}
+
+func TestPrintList_GroupHiddenWithoutDocstring(t *testing.T) {
+	b := newBuild(t, `
+group g
+foo into g : { :; }
+
+## docstringed.
+bar : { :; }
+`)
+	out := printListString(t, b, false)
+	if strings.Contains(out, "  g ") || strings.Contains(out, "  g\t") {
+		t.Errorf("undocumented group 'g' should be hidden by default; got:\n%s", out)
+	}
+}
+
+func TestPrintList_GroupShowsWithDocstring(t *testing.T) {
+	b := newBuild(t, `
+## A pool of test cases.
+group tests
+foo into tests : { :; }
+`)
+	out := printListString(t, b, false)
+	if !strings.Contains(out, "tests") || !strings.Contains(out, "A pool of test cases.") {
+		t.Errorf("docstringed group should appear with its description; got:\n%s", out)
+	}
+}

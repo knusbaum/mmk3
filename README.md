@@ -50,7 +50,7 @@ Then:
 mmk          # build the default target ('all')
 mmk hello    # build 'hello' specifically
 mmk clean    # clean verb on 'all' (deletes 'hello' via the built-in file/clean)
-mmk -list    # show all targets, patterns, and verbs
+mmk -list    # show user-facing targets (those with a ## docstring) plus 'all'
 mmk -graph   # print the dep tree for 'all'
 ```
 
@@ -104,7 +104,9 @@ What this gives you out of the box:
   verb), and removes the `build:1` Docker image (the built-in `image` clean
   verb), in the right order.
 - `mmk run` — builds `prog` and runs it.
-- `mmk -list` — shows all of the above.
+- `mmk -list` — shows targets you've documented with a `##` docstring,
+  plus `all`. Add `-all` to see everything (including pattern rules and
+  internal aggregators).
 
 The rest of this document describes each piece in turn.
 
@@ -258,6 +260,14 @@ group tests
 
 Multiple `##` lines concatenate (newline-separated). A regular `#` comment
 or any non-comment, non-blank line resets the pending docstring.
+
+Docstrings also act as a **public/private marker** for `mmk -list`:
+without `-all`, only docstringed targets (plus `all`) are listed.
+Skipping the docstring is how you say "this target is internal —
+necessary for the build, but I don't expect users to invoke it directly."
+Pattern rules, image-runner aggregators, intermediate `.o` files, etc.
+are typically left undocumented; user-facing entry points get a
+docstring.
 
 ## Types and freshness
 
@@ -737,7 +747,8 @@ mmk [flags] [[verb] target]
 |--------------|-------------|
 | `-j N`       | Parallelism. Default 0 = unlimited. |
 | `-v`         | Verbose: log each target as it runs or is skipped. Inherited by sub-mmk invocations via `MMK_VERBOSE=1`. |
-| `-list`      | List all targets, patterns, and verbs, with descriptions and structural annotations. |
+| `-list`      | List user-facing targets and verbs. By default, only targets with a `##` docstring are shown (plus `all`); use with `-all` to show everything. |
+| `-list -all` | With `-list`, also show internal/undocumented targets, plus pattern rules and matrix/group/runner aggregators. |
 | `-graph`     | Print the dependency tree (text) for the chosen target+verb. |
 | `-graph -full` | Recurse into subprojects (one mmk subprocess per subproject) and splice their graphs. |
 | `-dag`       | Render the dependency graph as a top-down boxes-and-arrows diagram. |
