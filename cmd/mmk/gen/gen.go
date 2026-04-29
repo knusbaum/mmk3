@@ -407,6 +407,8 @@ func Generate(w io.Writer, f *parse.File, frozen []string) error {
 			continue // target bodies are passed via MMK_EXECUTE at execution time
 		case *parse.Subproject:
 			continue // subproject directives are expanded at runtime into TargetRules
+		case *parse.Group:
+			continue // group declarations have no bash representation
 		}
 
 		body = NormalizeBody(body)
