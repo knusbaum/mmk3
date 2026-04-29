@@ -8,6 +8,7 @@ import (
 	"github.com/knusbaum/mmk3/cmd/mmk/gen"
 	"github.com/knusbaum/mmk3/cmd/mmk/runtime"
 	"github.com/knusbaum/mmk3/cmd/mmk/tui"
+	"github.com/knusbaum/mmk3/cmd/mmk/tui/dagview"
 )
 
 func main() {
@@ -17,6 +18,8 @@ func main() {
 	builtins := flag.Bool("builtins", false, "print built-in type definitions as mmk syntax and exit")
 	list := flag.Bool("list", false, "list available targets and verbs, then exit")
 	graph := flag.Bool("graph", false, "print dependency tree for target and exit")
+	dagGraph := flag.Bool("dag", false, "print dependency DAG (boxes + arrows) for target and exit")
+	dagMGroup := flag.Bool("mgroup", false, "with -dag, collapse matrix combos sharing a base into one box")
 	full := flag.Bool("full", false, "with -graph, recurse into subprojects (one mmk subprocess per subproject)")
 	useTUI := flag.Bool("tui", false, "render the build as a live TUI tree with status updates")
 	flag.Usage = func() {
@@ -102,6 +105,28 @@ func main() {
 			fmt.Fprintf(os.Stderr, "mmk: %v\n", err)
 			os.Exit(1)
 		}
+		return
+	}
+
+	if *dagGraph {
+		var root *runtime.TargetNode
+		var err error
+		if verb == "" {
+			root, err = b.Resolve(target)
+		} else {
+			root, err = b.ResolveVerb(target, verb)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "mmk: %v\n", err)
+			os.Exit(1)
+		}
+		res := dagview.View(root, nil, dagview.Options{
+			UseUnicode:  true,
+			GroupMatrix: *dagMGroup,
+		})
+		// Render entire drawing without ANSI; mmk -dag is intended for
+		// piping/scrollback. Add color back when we have a -color flag.
+		fmt.Print(res.Render(0, 0, res.W(), res.H(), false))
 		return
 	}
 

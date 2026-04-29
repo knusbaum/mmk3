@@ -23,6 +23,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/knusbaum/mmk3/cmd/mmk/runtime"
+	"github.com/knusbaum/mmk3/cmd/mmk/tui/dagview"
 	"github.com/knusbaum/mmk3/dag"
 )
 
@@ -362,6 +363,21 @@ type model struct {
 	width, height int
 	buildErr      error
 	buildDone     bool
+
+	// graphView is the experimental top-down DAG view, toggled with 'g'.
+	graphView bool
+	// dagX, dagY are pan offsets (in cells) into the rendered DAG. Only
+	// meaningful when graphView is true. Clamped against the cached
+	// drawing's size whenever it changes.
+	dagX, dagY int
+	// dagResult caches the rendered DAG between ticks so panning doesn't
+	// re-run layout, and so key handlers can clamp offsets against the
+	// drawing size without recomputing it.
+	dagResult  *dagview.Result
+	dagW, dagH int
+	// dagGroupMatrix flips matrix-base grouping in the DAG view (toggled
+	// with 'm'). Off by default; turn on for huge matrix fan-outs.
+	dagGroupMatrix bool
 }
 
 func initialModel(t treeData, ring *logRing, b *runtime.Build) model {
@@ -406,8 +422,49 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		if m.graphView {
+			m.clampDagOffsets()
+		}
 	case tea.KeyMsg:
-		switch msg.String() {
+		key := msg.String()
+		if m.graphView {
+			// Viewport panning. Steps are coarse (5 cols / 2 rows) because the
+			// drawing has lots of whitespace; finer steps feel sluggish.
+			const hStep, vStep = 5, 2
+			panned := true
+			switch key {
+			case "left", "h":
+				m.dagX -= hStep
+			case "right", "l":
+				m.dagX += hStep
+			case "up", "k":
+				m.dagY -= vStep
+			case "down", "j":
+				m.dagY += vStep
+			case "home", "0":
+				m.dagX = 0
+			case "pgup":
+				m.dagY -= 10
+			case "pgdown":
+				m.dagY += 10
+			case "m":
+				m.dagGroupMatrix = !m.dagGroupMatrix
+				m.refreshDag()
+				return m, nil
+			default:
+				panned = false
+			}
+			if panned {
+				m.clampDagOffsets()
+				return m, nil
+			}
+		}
+		switch key {
+		case "g":
+			m.graphView = !m.graphView
+			if m.graphView {
+				m.refreshDag()
+			}
 		case "q", "esc":
 			if m.buildDone {
 				return m, tea.Quit
@@ -443,6 +500,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.statuses[msg.key] = statusDone
 		}
 	case tickMsg:
+		if m.graphView {
+			m.refreshDag()
+		}
 		if m.buildDone {
 			return m, nil
 		}
@@ -450,6 +510,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case buildDoneMsg:
 		m.buildDone = true
 		m.buildErr = msg.err
+		// Refresh the cached DAG drawing one last time so the post-exit
+		// dump reflects the final statuses. The tick-driven refresh runs
+		// every 80ms; if the last finishMsg arrived between ticks and
+		// buildDoneMsg arrived right after, the cache would otherwise
+		// still show the pre-final state.
+		if m.graphView {
+			m.refreshDag()
+		}
 		return m, tea.Quit
 	}
 	return m, nil
@@ -500,17 +568,21 @@ func (m model) render(final bool) string {
 		b.WriteString("\n")
 	}
 
-	// Tree.
-	rootIcon, rootStyle := iconAndStyle(m.statuses[m.tree.rootKey])
-	fmt.Fprintf(&b, "%s %s\n", rootIcon, rootStyle.Render(m.tree.rootLabel))
-	for _, ln := range m.tree.lines {
-		if len(ln.groupKeys) > 0 {
-			icon, label := m.renderGroup(ln)
-			fmt.Fprintf(&b, "%s%s %s\n", ln.prefix, icon, label)
-			continue
+	if m.graphView {
+		b.WriteString(m.renderDagWindow())
+	} else {
+		// Tree.
+		rootIcon, rootStyle := iconAndStyle(m.statuses[m.tree.rootKey])
+		fmt.Fprintf(&b, "%s %s\n", rootIcon, rootStyle.Render(m.tree.rootLabel))
+		for _, ln := range m.tree.lines {
+			if len(ln.groupKeys) > 0 {
+				icon, label := m.renderGroup(ln)
+				fmt.Fprintf(&b, "%s%s %s\n", ln.prefix, icon, label)
+				continue
+			}
+			icon, st := iconAndStyle(m.statuses[ln.key])
+			fmt.Fprintf(&b, "%s%s %s\n", ln.prefix, icon, st.Render(ln.label))
 		}
-		icon, st := iconAndStyle(m.statuses[ln.key])
-		fmt.Fprintf(&b, "%s%s %s\n", ln.prefix, icon, st.Render(ln.label))
 	}
 
 	// Log panel: last N lines that fit. Skip on the scrollback final dump —
@@ -621,6 +693,117 @@ func (m model) renderGroup(ln treeLine) (string, string) {
 		parts = append(parts, pendingStyle.Render(fmt.Sprintf("○%d", pending)))
 	}
 	return icon, strings.Join(parts, " ")
+}
+
+// renderDagWindow returns the visible portion of the cached drawing,
+// cropped to dagX/dagY + viewport size, plus a footer line showing scroll
+// position so the user knows there's more to pan to.
+func (m *model) renderDagWindow() string {
+	if m.dagResult == nil || m.dagW == 0 {
+		return "(empty graph)\n"
+	}
+	visW, visH := m.dagVisibleSize()
+	if visW < 1 || visH < 1 {
+		return ""
+	}
+	// Reserve one row for the footer; let dagview render the rest.
+	gridH := max(visH-1, 1)
+	var sb strings.Builder
+	sb.WriteString(m.dagResult.Render(m.dagX, m.dagY, visW, gridH, true))
+	matrixState := "off"
+	if m.dagGroupMatrix {
+		matrixState = "on"
+	}
+	if m.dagW > visW || m.dagH > gridH {
+		fmt.Fprintf(&sb, "[%d,%d / %dx%d  arrows/hjkl pan · m matrix-group:%s · g tree]",
+			m.dagX, m.dagY, m.dagW, m.dagH, matrixState)
+	} else {
+		fmt.Fprintf(&sb, "[m matrix-group:%s · g tree]", matrixState)
+	}
+	sb.WriteByte('\n')
+	return sb.String()
+}
+
+// refreshDag re-renders the DAG into the model's cache. Cheap enough at
+// 80ms cadence for typical graphs; we'll add invalidation triggers (status
+// changes only, not every tick) if this ever shows up in profiles.
+func (m *model) refreshDag() {
+	if m.tree.rootNode == nil {
+		m.dagResult = nil
+		m.dagW, m.dagH = 0, 0
+		return
+	}
+	res := dagview.View(m.tree.rootNode, m.dagStatusOf, dagview.Options{
+		UseUnicode:  true,
+		GroupMatrix: m.dagGroupMatrix,
+	})
+	m.dagResult = res
+	m.dagW = res.W()
+	m.dagH = res.H()
+	m.clampDagOffsets()
+}
+
+// clampDagOffsets pulls dagX/dagY back into the legal range given the
+// current drawing size and last known terminal size.
+func (m *model) clampDagOffsets() {
+	visW, visH := m.dagVisibleSize()
+	maxX := max(m.dagW-visW, 0)
+	maxY := max(m.dagH-visH, 0)
+	if m.dagX < 0 {
+		m.dagX = 0
+	}
+	if m.dagX > maxX {
+		m.dagX = maxX
+	}
+	if m.dagY < 0 {
+		m.dagY = 0
+	}
+	if m.dagY > maxY {
+		m.dagY = maxY
+	}
+}
+
+// dagVisibleSize returns the (width, height) cells available for the DAG
+// viewport. Reserves rows for the log panel + footer + cancel banner.
+func (m *model) dagVisibleSize() (int, int) {
+	w := m.width
+	if w <= 0 {
+		w = 80
+	}
+	h := m.height
+	if h <= 0 {
+		h = 24
+	}
+	logRows := 8
+	if m.height > 0 {
+		logRows = max(4, m.height/4)
+	}
+	// Reserved rows: 1 (header info) + logRows + 2 (── log ──, blank) + 1
+	// (footer hint). Conservative; better to clip log than the graph.
+	reserved := logRows + 4
+	if h-reserved < 5 {
+		reserved = h - 5
+	}
+	if reserved < 0 {
+		reserved = 0
+	}
+	return w, h - reserved
+}
+
+// dagStatusOf adapts the model's status map to dagview.StatusFn. The dagview
+// package owns its own enum to avoid importing this package's internals.
+func (m model) dagStatusOf(target, verb string) dagview.Status {
+	switch m.statuses[nodeKey(target, verb)] {
+	case statusRunning:
+		return dagview.StatusRunning
+	case statusDone:
+		return dagview.StatusDone
+	case statusSkipped:
+		return dagview.StatusSkipped
+	case statusFailed:
+		return dagview.StatusFailed
+	}
+	return dagview.StatusPending
 }
 
 func iconAndStyle(s status) (string, lipgloss.Style) {
