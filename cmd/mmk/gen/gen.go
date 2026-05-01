@@ -142,7 +142,7 @@ const skipIfCheck = `	__mmk_skip_check() {
 		case "$skip_if" in
 			"")    return 1 ;;
 			auto)  [ -f /.dockerenv ] || [ -f /run/.containerenv ] \
-					|| [ -n "$KUBERNETES_SERVICE_HOST" ] \
+					|| [ -n "${KUBERNETES_SERVICE_HOST:-}" ] \
 					|| grep -qE 'docker|containerd' /proc/1/cgroup 2>/dev/null ;;
 			*)     eval "$skip_if" ;;
 		esac

@@ -1441,7 +1441,7 @@ func isAllDigits(s string) bool {
 // after the function call would be too late; setting it before would trace the
 // eval boundary itself, which is mmk infrastructure the user doesn't care about.
 func wrapExecute(body string) string {
-	return `__mmk_exec() { [ -n "$MMK_VERBOSE" ] && set -x;` + body + "}; __mmk_exec"
+	return `__mmk_exec() { [ -n "${MMK_VERBOSE:-}" ] && set -x;` + body + "}; __mmk_exec"
 }
 
 // nonVerbBody returns the bash body for a non-verb node: the explicit body, a
