@@ -532,6 +532,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case buildDoneMsg:
 		m.buildDone = true
 		m.buildErr = msg.err
+		// Refresh the cached DAG drawing one last time so the post-exit
+		// dump reflects the final statuses. The tick-driven refresh runs
+		// every 80ms; if the last finishMsg arrived between ticks and
+		// buildDoneMsg arrived right after, the cache would otherwise
+		// still show the pre-final state.
+		if m.graphView {
+			m.refreshDag()
+		}
 		return m, tea.Quit
 	}
 	return m, nil
