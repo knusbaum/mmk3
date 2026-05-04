@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"syscall"
 
 	"github.com/knusbaum/mmk3/cmd/mmk/gen"
 	"github.com/knusbaum/mmk3/cmd/mmk/runtime"
@@ -12,6 +13,7 @@ import (
 )
 
 func main() {
+	raiseOpenFileLimit()
 	j := flag.Int("j", 100, "parallelism (0 = unlimited)")
 	v := flag.Bool("v", false, "verbose: log each target as it runs or is skipped")
 	dump := flag.Bool("dump", false, "print generated shell script and exit")
@@ -151,6 +153,19 @@ func main() {
 	if err := b.Execute(target, verb, *j); err != nil {
 		fmt.Fprintf(os.Stderr, "mmk: %v\n", err)
 		os.Exit(1)
+	}
+}
+
+// raiseOpenFileLimit raises the soft open-file limit to the hard limit.
+// Best-effort: errors are silently ignored.
+func raiseOpenFileLimit() {
+	var rl syscall.Rlimit
+	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rl); err != nil {
+		return
+	}
+	if rl.Cur < rl.Max {
+		rl.Cur = rl.Max
+		syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rl) //nolint — best-effort
 	}
 }
 
