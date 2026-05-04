@@ -118,17 +118,28 @@ type Build struct {
 	// to interrupt in-flight bash subprocesses. A node already past the
 	// IsCancelled check at entry continues until its bash returns or is signaled.
 	cancelled     atomic.Bool
+	cancelCh      chan struct{} // closed once by cancelOnce when Cancel is called
+	cancelOnce    sync.Once
 	runningCmdsMu sync.Mutex
 	runningCmds   map[*exec.Cmd]struct{}
 }
 
 // Cancel marks the build as cancelled. Subsequent calls to TargetNode.Run
-// return ErrCancelled before spawning a new subprocess. In-flight bash
-// processes are not affected; use SignalAll to terminate them.
-func (b *Build) Cancel() { b.cancelled.Store(true) }
+// return ErrCancelled before spawning a new subprocess. Goroutines blocked
+// waiting for a semaphore slot are unblocked immediately via CancelCh.
+// In-flight bash processes are not affected; use SignalAll to terminate them.
+func (b *Build) Cancel() {
+	b.cancelled.Store(true)
+	b.cancelOnce.Do(func() { close(b.cancelCh) })
+}
 
 // IsCancelled reports whether Cancel has been called.
 func (b *Build) IsCancelled() bool { return b.cancelled.Load() }
+
+// CancelCh returns a channel that is closed when Cancel is called. It can be
+// passed to dag.Execute so that goroutines blocked on the parallelism semaphore
+// are unblocked immediately rather than draining one slot at a time.
+func (b *Build) CancelCh() <-chan struct{} { return b.cancelCh }
 
 // SignalAll sends sig to the process group of every currently-running task
 // subprocess. Each cmd is launched with Setpgid so the signal reaches bash
@@ -352,6 +363,7 @@ func newBuildFromAST(f *parse.File) (*Build, error) {
 		declaredGroups:     make(map[string]bool),
 		groups:             make(map[string]*groupData),
 		runnerStates: make(map[string]string),
+		cancelCh:     make(chan struct{}),
 	}
 
 	// Populate runnerDefs from built-in definitions.
@@ -686,7 +698,7 @@ func (b *Build) Execute(target, verb string, parallelism int) error {
 		return err
 	}
 	if !b.Verbose {
-		return dag.Execute(root, parallelism)
+		return dag.Execute(root, parallelism, b.cancelCh)
 	}
 	hooks := dag.Hooks[*TargetNode]{
 		OnRun: func(n *TargetNode) {
@@ -705,7 +717,7 @@ func (b *Build) Execute(target, verb string, parallelism int) error {
 			fmt.Printf("skipping: %s (up to date)\n", n.target)
 		},
 	}
-	return dag.Execute(root, parallelism, hooks)
+	return dag.Execute(root, parallelism, b.cancelCh, hooks)
 }
 
 // Resolve returns (creating if necessary) the TargetNode for the named target.
@@ -856,6 +868,10 @@ type TargetNode struct {
 	deps      []*TargetNode
 	depsBuilt bool
 	resolveErr error
+
+	dateOnce sync.Once
+	dateVal  time.Time
+	dateErr  error
 }
 
 // Target returns the target name for this node.
@@ -1251,6 +1267,13 @@ func (b *Build) effectiveVerbOption(target, verb, key string) string {
 //   - user-defined (deftype): runs __mmk_type_<name>, parses stdout as a
 //     timestamp (epoch seconds or RFC3339); non-zero exit returns zero time.
 func (n *TargetNode) Date() (time.Time, error) {
+	n.dateOnce.Do(func() {
+		n.dateVal, n.dateErr = n.computeDate()
+	})
+	return n.dateVal, n.dateErr
+}
+
+func (n *TargetNode) computeDate() (time.Time, error) {
 	if n.kind == kindRunner {
 		// Runner nodes are pure setup. Zero time means they never look
 		// "newer" than artifacts that depend on them.
@@ -1271,6 +1294,9 @@ func (n *TargetNode) Date() (time.Time, error) {
 // Verb nodes always need to run (they are imperative actions, not artifacts).
 // Returns an error if a date check fails (e.g. bash failed to spawn).
 func (n *TargetNode) NeedsRun() (bool, error) {
+	if n.build.IsCancelled() {
+		return false, ErrCancelled
+	}
 	if n.verb != "" {
 		return true, nil
 	}
@@ -1413,6 +1439,9 @@ func (n *TargetNode) executeScript() (string, bool) {
 func (n *TargetNode) Run() error {
 	if n.resolveErr != nil {
 		return n.resolveErr
+	}
+	if n.build.IsCancelled() {
+		return ErrCancelled
 	}
 	if n.kind == kindRunner {
 		return n.runnerSetup()

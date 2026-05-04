@@ -659,6 +659,25 @@ func TestErrorOnUnknownType(t *testing.T) {
 	}
 }
 
+// TestCancelledBuildNoBodyNode verifies that Run() on a no-body node returns
+// ErrCancelled when the build has been cancelled. Before the fix, Run() returned
+// nil immediately after executeScript() reported no body, skipping the
+// IsCancelled check entirely — so cancellation silently fell through chains of
+// bodyless aggregator nodes (e.g. `all : dep1 dep2`).
+func TestCancelledBuildNoBodyNode(t *testing.T) {
+	// `all` has no body — executeScript returns ("", false).
+	b := newBuild(t, `all : dep`)
+	n, err := b.Resolve("all")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	b.Cancel()
+	err = n.Run()
+	if err != ErrCancelled {
+		t.Errorf("Run on cancelled build: got %v, want ErrCancelled", err)
+	}
+}
+
 func TestExecuteRunsDeps(t *testing.T) {
 	src := `
 all : dep

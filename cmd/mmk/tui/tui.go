@@ -13,6 +13,7 @@ package tui
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -54,16 +55,29 @@ func Run(b *runtime.Build, target, verb string, parallelism int) error {
 
 	// Drive the build from a goroutine. Hooks publish events to the program.
 	hooks := dag.Hooks[*runtime.TargetNode]{
-		OnRun:  func(n *runtime.TargetNode) { prog.Send(runMsg{key: nodeKey(n.Target(), n.Verb())}) },
-		OnSkip: func(n *runtime.TargetNode) { prog.Send(skipMsg{key: nodeKey(n.Target(), n.Verb())}) },
+		OnRun: func(n *runtime.TargetNode) {
+			if b.IsCancelled() {
+				return
+			}
+			prog.Send(runMsg{key: nodeKey(n.Target(), n.Verb())})
+		},
+		OnSkip: func(n *runtime.TargetNode) {
+			if b.IsCancelled() {
+				return
+			}
+			prog.Send(skipMsg{key: nodeKey(n.Target(), n.Verb())})
+		},
 		OnFinish: func(n *runtime.TargetNode, err error) {
+			if isCancelledErr(err) {
+				return
+			}
 			out := caps.take(nodeKey(n.Target(), n.Verb()))
 			prog.Send(finishMsg{key: nodeKey(n.Target(), n.Verb()), target: n.Target(), verb: n.Verb(), err: err, output: out})
 		},
 	}
 
 	go func() {
-		err := dag.Execute(root, parallelism, hooks)
+		err := dag.Execute(root, parallelism, b.CancelCh(), hooks)
 		prog.Send(buildDoneMsg{err: err})
 	}()
 
@@ -339,6 +353,7 @@ const (
 	statusDone
 	statusSkipped
 	statusFailed
+	statusCancelled
 )
 
 type failure struct {
@@ -491,13 +506,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.statuses[msg.key] = statusSkipped
 	case finishMsg:
 		if msg.err != nil {
-			m.statuses[msg.key] = statusFailed
-			m.failures = append(m.failures, failure{
-				target: msg.target,
-				verb:   msg.verb,
-				err:    msg.err,
-				output: msg.output,
-			})
+			if isCancelledErr(msg.err) {
+				// Nodes aborted by cancellation are not real failures.
+				m.statuses[msg.key] = statusCancelled
+			} else {
+				m.statuses[msg.key] = statusFailed
+				m.failures = append(m.failures, failure{
+					target: msg.target,
+					verb:   msg.verb,
+					err:    msg.err,
+					output: msg.output,
+				})
+			}
 		} else {
 			m.statuses[msg.key] = statusDone
 		}
@@ -512,14 +532,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case buildDoneMsg:
 		m.buildDone = true
 		m.buildErr = msg.err
-		// Refresh the cached DAG drawing one last time so the post-exit
-		// dump reflects the final statuses. The tick-driven refresh runs
-		// every 80ms; if the last finishMsg arrived between ticks and
-		// buildDoneMsg arrived right after, the cache would otherwise
-		// still show the pre-final state.
-		if m.graphView {
-			m.refreshDag()
-		}
 		return m, tea.Quit
 	}
 	return m, nil
@@ -648,7 +660,7 @@ func failureLabel(f failure) string {
 // over running wins over pending wins over done/skipped — and the label
 // appends counts for each non-zero state.
 func (m model) renderGroup(ln treeLine) (string, string) {
-	var pending, running, done, skipped, failed int
+	var pending, running, done, skipped, failed, cancelled int
 	for _, k := range ln.groupKeys {
 		switch m.statuses[k] {
 		case statusRunning:
@@ -659,6 +671,8 @@ func (m model) renderGroup(ln treeLine) (string, string) {
 			skipped++
 		case statusFailed:
 			failed++
+		case statusCancelled:
+			cancelled++
 		default:
 			pending++
 		}
@@ -690,6 +704,9 @@ func (m model) renderGroup(ln treeLine) (string, string) {
 	}
 	if skipped > 0 {
 		parts = append(parts, skippedStyle.Render(fmt.Sprintf("≡%d", skipped)))
+	}
+	if cancelled > 0 {
+		parts = append(parts, pendingStyle.Render(fmt.Sprintf("∅%d", cancelled)))
 	}
 	if pending > 0 {
 		parts = append(parts, pendingStyle.Render(fmt.Sprintf("○%d", pending)))
@@ -818,7 +835,17 @@ func iconAndStyle(s status) (string, lipgloss.Style) {
 		return skippedStyle.Render("≡"), skippedStyle
 	case statusFailed:
 		return failedStyle.Render("✗"), failedStyle
+	case statusCancelled:
+		return pendingStyle.Render("∅"), pendingStyle
 	default:
 		return pendingStyle.Render("○"), pendingStyle
 	}
+}
+
+// isCancelledErr reports whether err is a cancellation signal from either the
+// dag semaphore (dag.ErrCancelled) or a TargetNode's Run/NeedsRun early-exit
+// (runtime.ErrCancelled). Cancelled nodes are not real failures and should not
+// appear in the failure summary.
+func isCancelledErr(err error) bool {
+	return errors.Is(err, dag.ErrCancelled) || errors.Is(err, runtime.ErrCancelled)
 }

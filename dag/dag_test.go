@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // testNode is a simple in-memory Node for testing.
@@ -34,7 +35,7 @@ func TestLinearChain(t *testing.T) {
 	b := node("b", true, a)
 	c := node("c", true, b)
 
-	if err := Execute(c, 0); err != nil {
+	if err := Execute(c, 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	for _, n := range []*testNode{a, b, c} {
@@ -48,7 +49,7 @@ func TestSkipsWhenNeedsRunFalse(t *testing.T) {
 	a := node("a", false)
 	b := node("b", false, a)
 
-	if err := Execute(b, 0); err != nil {
+	if err := Execute(b, 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	if a.runCount.Load() != 0 {
@@ -65,7 +66,7 @@ func TestNoCascadeWhenNeedsRunFalse(t *testing.T) {
 	a := node("a", true)
 	b := node("b", false, a)
 
-	if err := Execute(b, 0); err != nil {
+	if err := Execute(b, 0, nil); err != nil {
 		t.Fatal(err)
 	}
 	if a.runCount.Load() != 1 {
@@ -83,7 +84,7 @@ func TestDiamondDedup(t *testing.T) {
 	c := node("c", true, a)
 	d := node("d", true, b, c)
 
-	if err := Execute(d, 4); err != nil {
+	if err := Execute(d, 4, nil); err != nil {
 		t.Fatal(err)
 	}
 	if a.runCount.Load() != 1 {
@@ -97,7 +98,7 @@ func TestFailurePropagates(t *testing.T) {
 	a.runErr = boom
 	b := node("b", true, a)
 
-	err := Execute(b, 0)
+	err := Execute(b, 0, nil)
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -115,7 +116,7 @@ func TestCycleDetection(t *testing.T) {
 	// create a cycle: a depends on b
 	a.deps = []*testNode{b}
 
-	err := Execute(a, 0)
+	err := Execute(a, 0, nil)
 	if err == nil {
 		t.Fatal("expected cycle error")
 	}
@@ -135,7 +136,7 @@ func TestOrderOnlyEdgeIgnoredWhenTargetNotInGraph(t *testing.T) {
 	if _, ok := g.steps[any(consumer)]; ok {
 		t.Error("consumer should not be in the DAG when only image is the root")
 	}
-	if err := g.Run(0); err != nil {
+	if err := g.Run(0, nil); err != nil {
 		t.Fatal(err)
 	}
 	if image.runCount.Load() != 1 {
@@ -163,7 +164,7 @@ func TestOrderOnlyEdgeAppliedWhenTargetInGraph(t *testing.T) {
 			mu.Unlock()
 		},
 	}
-	if err := Execute(all, 1, hooks); err != nil {
+	if err := Execute(all, 1, nil, hooks); err != nil {
 		t.Fatal(err)
 	}
 	// Order should be: consumer, image, all (or consumer, image at minimum).
@@ -197,6 +198,37 @@ func TestOrderOnlyCycleDetected(t *testing.T) {
 	}
 }
 
+// TestSemaphoreCancelDrain verifies that closing the done channel unblocks all
+// goroutines waiting on the semaphore immediately, instead of forcing them to
+// drain one slot at a time. Without the done channel on Semaphore, a graph with
+// N>>parallelism nodes would take O(N/parallelism) slot-release cycles to drain
+// after cancellation — with 10000 nodes and parallelism=1, that's 10000 rounds.
+func TestSemaphoreCancelDrain(t *testing.T) {
+	const N = 10000
+	done := make(chan struct{})
+	close(done) // already cancelled before execution starts
+
+	root := node("root", true)
+	for range N {
+		root.deps = append(root.deps, node("dep", true))
+	}
+
+	// With parallelism=1 and a pre-closed done channel, all pending goroutines
+	// should abort via the done path rather than waiting for N sequential slots.
+	// The test enforces a tight deadline to catch the O(N) regression.
+	start := time.Now()
+	err := Execute(root, 1, done)
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected cancellation error, got nil")
+	}
+	// O(N/parallelism) drain would take >> 100ms for N=10000; fast path is <10ms.
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("cancellation took %v; expected fast drain via done channel", elapsed)
+	}
+}
+
 func TestParallelism(t *testing.T) {
 	// Wide fan-in: many independent nodes all feeding one root.
 	root := node("root", true)
@@ -206,7 +238,7 @@ func TestParallelism(t *testing.T) {
 		root.deps = append(root.deps, dep)
 	}
 
-	if err := Execute(root, 4); err != nil {
+	if err := Execute(root, 4, nil); err != nil {
 		t.Fatal(err)
 	}
 	if root.runCount.Load() != 1 {

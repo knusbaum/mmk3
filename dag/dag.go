@@ -26,19 +26,39 @@ type Orderer[T any] interface {
 }
 
 type Semaphore struct {
-	c chan struct{}
+	c    chan struct{}
+	done <-chan struct{} // nil = never cancel
 }
 
-func NewSemaphore(n int) *Semaphore {
+func NewSemaphore(n int, done <-chan struct{}) *Semaphore {
 	c := make(chan struct{}, n)
 	for range n {
 		c <- struct{}{}
 	}
-	return &Semaphore{c: c}
+	return &Semaphore{c: c, done: done}
 }
 
-func (s *Semaphore) wait()   { <-s.c }
+// wait acquires a slot. Returns true if a slot was acquired, false if the
+// done channel closed before a slot was available. The caller must not call
+// signal() when wait() returns false.
+func (s *Semaphore) wait() bool {
+	if s.done == nil {
+		<-s.c
+		return true
+	}
+	select {
+	case <-s.c:
+		return true
+	case <-s.done:
+		return false
+	}
+}
+
 func (s *Semaphore) signal() { s.c <- struct{}{} }
+
+// ErrCancelled is returned when a node is not run because the graph's done
+// channel was closed before it could acquire a parallelism slot.
+var ErrCancelled = errors.New("build cancelled")
 
 // Hooks carries optional callbacks fired at key points during execution.
 // All fields are optional; nil means no-op.
@@ -85,7 +105,13 @@ func (s *step[T]) run(sem *Semaphore, h *Hooks[T]) {
 	// matrix expansions of thousands of nodes will then race fd / fork
 	// limits and silently produce wrong staleness answers.
 	if sem != nil {
-		sem.wait()
+		if !sem.wait() {
+			s.status = ErrCancelled
+			if h != nil && h.OnFinish != nil {
+				h.OnFinish(s.n, ErrCancelled)
+			}
+			return
+		}
 		defer sem.signal()
 	}
 
@@ -213,8 +239,10 @@ func detectCycle[T Node[T]](steps map[any]*step[T]) error {
 }
 
 // Run executes all nodes in the graph. parallelism <= 0 means unlimited.
-// An optional Hooks value may be passed to observe execution events.
-func (g *Graph[T]) Run(parallelism int, hooks ...Hooks[T]) error {
+// done, if non-nil, is closed to abort pending nodes before they acquire a
+// parallelism slot; already-running nodes are unaffected (use an external
+// signal for those). An optional Hooks value may be passed to observe events.
+func (g *Graph[T]) Run(parallelism int, done <-chan struct{}, hooks ...Hooks[T]) error {
 	if g.root == nil {
 		return nil
 	}
@@ -224,7 +252,7 @@ func (g *Graph[T]) Run(parallelism int, hooks ...Hooks[T]) error {
 	}
 	var sem *Semaphore
 	if parallelism > 0 {
-		sem = NewSemaphore(parallelism)
+		sem = NewSemaphore(parallelism, done)
 	}
 	var wg sync.WaitGroup
 	for _, st := range g.steps {
@@ -240,12 +268,13 @@ func (g *Graph[T]) Run(parallelism int, hooks ...Hooks[T]) error {
 
 // Execute builds and runs the DAG rooted at root.
 // It is a convenience wrapper around Build + Run.
-func Execute[T Node[T]](root T, parallelism int, hooks ...Hooks[T]) error {
+// done may be nil; see Graph.Run for semantics.
+func Execute[T Node[T]](root T, parallelism int, done <-chan struct{}, hooks ...Hooks[T]) error {
 	g, err := Build(root)
 	if err != nil {
 		return err
 	}
-	return g.Run(parallelism, hooks...)
+	return g.Run(parallelism, done, hooks...)
 }
 
 func buildGraph[T Node[T]](steps map[any]*step[T], chain []any, n T) (*step[T], error) {
