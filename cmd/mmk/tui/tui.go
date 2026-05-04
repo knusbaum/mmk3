@@ -386,6 +386,8 @@ func initialModel(t treeData, ring *logRing, b *runtime.Build) model {
 		statuses: map[string]status{},
 		ring:     ring,
 		build:    b,
+		graphView: true,
+		dagGroupMatrix: true,
 	}
 	m.statuses[t.rootKey] = statusPending
 	for _, ln := range t.lines {

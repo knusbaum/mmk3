@@ -12,7 +12,7 @@ import (
 )
 
 func main() {
-	j := flag.Int("j", 0, "parallelism (0 = unlimited)")
+	j := flag.Int("j", 100, "parallelism (0 = unlimited)")
 	v := flag.Bool("v", false, "verbose: log each target as it runs or is skipped")
 	dump := flag.Bool("dump", false, "print generated shell script and exit")
 	builtins := flag.Bool("builtins", false, "print built-in type definitions as mmk syntax and exit")
