@@ -19,7 +19,7 @@ type testNode struct {
 
 func (n *testNode) Dependencies() []*testNode      { return n.deps }
 func (n *testNode) OrderDependencies() []*testNode { return n.orderDeps }
-func (n *testNode) NeedsRun() bool                 { return n.needsRun }
+func (n *testNode) NeedsRun() (bool, error)         { return n.needsRun, nil }
 func (n *testNode) Run() error {
 	n.runCount.Add(1)
 	return n.runErr

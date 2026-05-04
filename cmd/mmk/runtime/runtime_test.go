@@ -489,7 +489,11 @@ func TestGeneratedScriptContainsBuiltinFunctions(t *testing.T) {
 func TestNeedsRunTrueWithNoType(t *testing.T) {
 	b := newBuild(t, `all :`)
 	n, _ := b.Resolve("all")
-	if !n.NeedsRun() {
+	needsRun, err := n.NeedsRun()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !needsRun {
 		t.Error("phony target (no type) should always NeedsRun")
 	}
 }
@@ -534,7 +538,11 @@ func TestNeedsRunFileUpToDate(t *testing.T) {
 	b := newBuild(t, src)
 	n, _ := b.Resolve(tgt)
 	n.Dependencies()
-	if n.NeedsRun() {
+	needsRun, err := n.NeedsRun()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if needsRun {
 		t.Error("expected NeedsRun() == false when target is newer than dep")
 	}
 }
@@ -551,7 +559,11 @@ func TestNeedsRunFileStale(t *testing.T) {
 	b := newBuild(t, src)
 	n, _ := b.Resolve(tgt)
 	n.Dependencies()
-	if !n.NeedsRun() {
+	needsRun, err := n.NeedsRun()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !needsRun {
 		t.Error("expected NeedsRun() == true when dep is newer than target")
 	}
 }
@@ -566,7 +578,11 @@ func TestNeedsRunFileMissing(t *testing.T) {
 	b := newBuild(t, src)
 	n, _ := b.Resolve(tgt)
 	n.Dependencies()
-	if !n.NeedsRun() {
+	needsRun, err := n.NeedsRun()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !needsRun {
 		t.Error("expected NeedsRun() == true when target file doesn't exist")
 	}
 }
@@ -584,7 +600,10 @@ mytype mytarget :
 	b := newBuild(t, src)
 	n, _ := b.Resolve("mytarget")
 	n.Dependencies()
-	got := n.Date()
+	got, err := n.Date()
+	if err != nil {
+		t.Fatal(err)
+	}
 	want := time.Unix(epoch, 0)
 	if !got.Equal(want) {
 		t.Errorf("Date(): got %v, want %v", got, want)
@@ -602,7 +621,10 @@ mytype mytarget :
 	b := newBuild(t, src)
 	n, _ := b.Resolve("mytarget")
 	n.Dependencies()
-	got := n.Date()
+	got, err := n.Date()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !got.Equal(ts) {
 		t.Errorf("Date(): got %v, want %v", got, ts)
 	}
@@ -618,7 +640,11 @@ mytype mytarget :
 	b := newBuild(t, src)
 	n, _ := b.Resolve("mytarget")
 	n.Dependencies()
-	if !n.NeedsRun() {
+	needsRun, err := n.NeedsRun()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !needsRun {
 		t.Error("deftype with non-zero exit should cause NeedsRun() == true")
 	}
 }
@@ -796,8 +822,12 @@ file a on buildimage :
 	if len(rnDeps) != 1 || rnDeps[0].target != "buildimage" {
 		t.Errorf("runner node deps: got %v, want [buildimage]", depTargets(rnDeps))
 	}
-	if !rn.Date().IsZero() {
-		t.Errorf("runner node Date() should be zero, got %v", rn.Date())
+	rnDate, err := rn.Date()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rnDate.IsZero() {
+		t.Errorf("runner node Date() should be zero, got %v", rnDate)
 	}
 }
 
@@ -923,7 +953,11 @@ func TestVerbNeedsRunAlwaysTrue(t *testing.T) {
 	b := newBuild(t, `all :`)
 	n, _ := b.ResolveVerb("all", "clean")
 	n.Dependencies()
-	if !n.NeedsRun() {
+	needsRun, err := n.NeedsRun()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !needsRun {
 		t.Error("verb node NeedsRun should always be true")
 	}
 }

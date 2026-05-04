@@ -9,7 +9,7 @@ import (
 
 type Node[T any] interface {
 	Dependencies() []T
-	NeedsRun() bool
+	NeedsRun() (bool, error)
 	Run() error
 }
 
@@ -78,16 +78,30 @@ func (s *step[T]) run(sem *Semaphore, h *Hooks[T]) {
 		}
 	}
 
-	if !s.n.NeedsRun() {
+	// Acquire the parallelism slot before NeedsRun, not just before Run.
+	// NeedsRun for user-defined types can be arbitrarily expensive
+	// (forking bash to call a deftype function, hitting docker, etc).
+	// Without this gate, all N nodes can call NeedsRun concurrently —
+	// matrix expansions of thousands of nodes will then race fd / fork
+	// limits and silently produce wrong staleness answers.
+	if sem != nil {
+		sem.wait()
+		defer sem.signal()
+	}
+
+	needsRun, err := s.n.NeedsRun()
+	if err != nil {
+		s.status = err
+		if h != nil && h.OnFinish != nil {
+			h.OnFinish(s.n, err)
+		}
+		return
+	}
+	if !needsRun {
 		if h != nil && h.OnSkip != nil {
 			h.OnSkip(s.n)
 		}
 		return
-	}
-
-	if sem != nil {
-		sem.wait()
-		defer sem.signal()
 	}
 
 	if h != nil && h.OnRun != nil {

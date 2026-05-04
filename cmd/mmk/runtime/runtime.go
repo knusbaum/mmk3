@@ -108,7 +108,7 @@ type Build struct {
 	declaredGroups map[string]bool            // group names from `group` directives
 	groups         map[string]*groupData      // populated during expansion
 	genPath        string
-	genFile       *os.File
+	genFile        *os.File
 
 	runnerStatesMu sync.Mutex
 	runnerStates   map[string]string // runner target name → state from setup stdout
@@ -351,7 +351,7 @@ func newBuildFromAST(f *parse.File) (*Build, error) {
 		matrixVars:         make(map[string]matrixCombo),
 		declaredGroups:     make(map[string]bool),
 		groups:             make(map[string]*groupData),
-		runnerStates:       make(map[string]string),
+		runnerStates: make(map[string]string),
 	}
 
 	// Populate runnerDefs from built-in definitions.
@@ -1250,61 +1250,70 @@ func (b *Build) effectiveVerbOption(target, verb, key string) string {
 //   - image: returns the docker image's creation time, or zero if not found.
 //   - user-defined (deftype): runs __mmk_type_<name>, parses stdout as a
 //     timestamp (epoch seconds or RFC3339); non-zero exit returns zero time.
-func (n *TargetNode) Date() time.Time {
+func (n *TargetNode) Date() (time.Time, error) {
 	if n.kind == kindRunner {
-		// Runner nodes are pure setup. Returning zero time means they never
-		// look "newer" than artifacts that depend on them.
-		return time.Time{}
+		// Runner nodes are pure setup. Zero time means they never look
+		// "newer" than artifacts that depend on them.
+		return time.Time{}, nil
 	}
 	switch n.rule.Type {
 	case "":
-		return time.Now()
-	default: // all typed targets run their deftype bash function
-		t, err := n.userTypeDate()
-		if err != nil {
-			return time.Time{}
-		}
-		return t
+		return time.Now(), nil
+	default:
+		return n.userTypeDate()
 	}
 }
 
-// NeedsRun returns true if the target needs to run.
+// NeedsRun reports whether the target needs to run.
 // Phony targets (no type) always need to run.
 // Typed targets compare their own Date() against each dependency's Date();
 // if the artifact doesn't exist (zero Date) or any dep is newer, they run.
 // Verb nodes always need to run (they are imperative actions, not artifacts).
-func (n *TargetNode) NeedsRun() bool {
+// Returns an error if a date check fails (e.g. bash failed to spawn).
+func (n *TargetNode) NeedsRun() (bool, error) {
 	if n.verb != "" {
-		return true
+		return true, nil
 	}
 	if n.kind == kindRunner {
 		// Runner nodes run setup at most once per build per runner target.
 		n.build.runnerStatesMu.Lock()
 		_, started := n.build.runnerStates[n.runnerFor.target]
 		n.build.runnerStatesMu.Unlock()
-		return !started
+		return !started, nil
 	}
 	if n.rule.Type == "" {
-		return true
+		return true, nil
 	}
-	myDate := n.Date()
+	myDate, err := n.Date()
+	if err != nil {
+		return false, fmt.Errorf("date check for %q: %w", n.target, err)
+	}
 	if myDate.IsZero() {
-		return true // artifact doesn't exist yet
+		return true, nil // artifact doesn't exist yet
 	}
 	for _, dep := range n.deps {
-		if dep.Date().After(myDate) {
-			return true
+		depDate, err := dep.Date()
+		if err != nil {
+			return false, fmt.Errorf("date check for dep %q of %q: %w", dep.target, n.target, err)
+		}
+		if depDate.After(myDate) {
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }
 
 // userTypeDate runs the deftype bash function for this node's type and parses
 // its stdout as a timestamp (epoch seconds or RFC3339/RFC3339Nano).
-// Non-zero exit is treated as "artifact doesn't exist" and returns an error.
+// Non-zero exit means the artifact is absent (returns zero time, nil error).
+// Failure to spawn bash or parse output is a real error.
 func (n *TargetNode) userTypeDate() (time.Time, error) {
 	out, err := n.runBashOutput(gen.TypeFunc(n.rule.Type))
 	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			return time.Time{}, nil // non-zero exit = artifact absent
+		}
 		return time.Time{}, err
 	}
 	return parseTimestamp(strings.TrimSpace(out))
@@ -1382,11 +1391,14 @@ func (n *TargetNode) verbBody() string {
 }
 
 // executeScript returns a self-contained bash snippet for MMK_EXECUTE and
-// whether there is anything to run. Non-verb nodes always have a snippet (at
-// minimum a no-op). Verb nodes return (_, false) when there is no body.
+// whether there is anything to run. Returns (_, false) when there is no body.
 func (n *TargetNode) executeScript() (string, bool) {
 	if n.verb == "" {
-		return wrapExecute(gen.NormalizeBody(n.nonVerbBody())), true
+		body := n.nonVerbBody()
+		if body == "" {
+			return "", false
+		}
+		return wrapExecute(gen.NormalizeBody(body)), true
 	}
 	body := n.verbBody()
 	if body == "" {
@@ -2608,7 +2620,18 @@ func (n *TargetNode) runBash(execute string, output bool) error {
 	if n.build.IsCancelled() {
 		return ErrCancelled
 	}
-	script := `. "$MMK_GENFILE"; target="$MMK_TARGET"; deps="$MMK_DEPS"; read -ra dep <<< "$deps"; eval "$MMK_EXECUTE"`
+	depsFile, err := writeDepsFile(n.explicitDepNames())
+	if err != nil {
+		return err
+	}
+	defer os.Remove(depsFile)
+	// MMK_DEPS is populated from the deps file for any user body that
+	// reads it directly, and exported so subshells in user bodies see it
+	// (matching the pre-file behaviour where MMK_DEPS was inherited via
+	// execve env). The file detour exists because Linux execve has a
+	// per-string limit (~128 KiB on MAX_ARG_STRLEN) that matrix
+	// aggregators can blow past via the env vector.
+	script := `. "$MMK_GENFILE"; target="$MMK_TARGET"; MMK_DEPS="$(cat "$MMK_DEPSFILE")"; export MMK_DEPS; deps="$MMK_DEPS"; read -ra dep <<< "$deps"; eval "$MMK_EXECUTE"`
 	c := exec.Command("bash", "-c", script)
 	// See runWithRunner: Setpgid only under TUI so SignalAll-based cancellation
 	// can target the subprocess's PG. Interactive mode shares mmk's PG so
@@ -2619,7 +2642,7 @@ func (n *TargetNode) runBash(execute string, output bool) error {
 	c.Env = append(os.Environ(),
 		"MMK_GENFILE="+n.build.genPath,
 		"MMK_TARGET="+n.target,
-		"MMK_DEPS="+strings.Join(n.explicitDepNames(), " "),
+		"MMK_DEPSFILE="+depsFile,
 		"MMK_EXECUTE="+execute,
 	)
 	if n.build.Verbose {
@@ -2643,6 +2666,28 @@ func (n *TargetNode) runBash(execute string, output bool) error {
 	n.build.registerCmd(c)
 	defer n.build.unregisterCmd(c)
 	return c.Run()
+}
+
+// writeDepsFile writes the joined dep names to a temp file and returns its
+// path. Callers must os.Remove the path when done. We pass deps via file
+// (not env) because Linux's execve has a per-string limit (MAX_ARG_STRLEN,
+// ~128 KiB) and matrix aggregators can produce dep lists much larger than
+// that.
+func writeDepsFile(names []string) (string, error) {
+	f, err := os.CreateTemp("", "mmk-deps-*")
+	if err != nil {
+		return "", fmt.Errorf("mmk: create deps file: %w", err)
+	}
+	if _, err := f.WriteString(strings.Join(names, " ")); err != nil {
+		f.Close()
+		os.Remove(f.Name())
+		return "", fmt.Errorf("mmk: write deps file: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(f.Name())
+		return "", fmt.Errorf("mmk: close deps file: %w", err)
+	}
+	return f.Name(), nil
 }
 
 // bodyWriters returns the (stdout, stderr) writers for this node's body
