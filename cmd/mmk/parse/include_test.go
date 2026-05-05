@@ -259,6 +259,55 @@ func TestParseFile_PassthroughVisibleAcrossIncludes(t *testing.T) {
 	}
 }
 
+// --- embedded stdlib ---
+
+func TestParseFile_EmbeddedStdlibFound(t *testing.T) {
+	// With no MMK_LIB_PATH and no on-disk lib next to the binary, an
+	// `include go.mmk` should still resolve via the embedded stdlib.
+	t.Setenv("MMK_LIB_PATH", "")
+	dir := t.TempDir()
+	root := writeFile(t, dir, "mmkfile", "include go.mmk\n")
+	f, err := ParseFile(root)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	// go.mmk defines several DefBody directives (e.g. `defbody go_module`).
+	// Confirm at least one of them landed in the resolved file.
+	found := false
+	for _, d := range f.Directives {
+		if db, ok := d.(*DefBody); ok && db.Type == "go_module" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("expected go_module defbody from embedded go.mmk; got nothing")
+	}
+}
+
+func TestParseFile_LibPathOverridesEmbedded(t *testing.T) {
+	// A user-supplied MMK_LIB_PATH entry should win over the embedded copy.
+	libDir := t.TempDir()
+	writeFile(t, libDir, "go.mmk", "marker_from_override : { :; }\n")
+	dir := t.TempDir()
+	root := writeFile(t, dir, "mmkfile", "include go.mmk\n")
+
+	t.Setenv("MMK_LIB_PATH", libDir)
+	f, err := ParseFile(root)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	found := false
+	for _, d := range f.Directives {
+		if r, ok := d.(*TargetRule); ok && r.Target == "marker_from_override" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("MMK_LIB_PATH override should have won; got %v", directiveTargets(f))
+	}
+}
+
 // --- include search path (MMK_LIB_PATH) ---
 
 func TestParseFile_LibSearchPath_FindsBareInclude(t *testing.T) {

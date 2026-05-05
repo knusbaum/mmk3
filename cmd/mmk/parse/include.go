@@ -6,6 +6,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/knusbaum/mmk3/lib"
 )
 
 // ParseFile reads path, parses it, and recursively resolves any `include`
@@ -168,7 +170,9 @@ func resolveLibInclude(name, localPath string) (string, error) {
 }
 
 // libIncludeDirs returns the search directories for bare-name includes, in
-// order. Empty entries from MMK_LIB_PATH are skipped.
+// order. Empty entries from MMK_LIB_PATH are skipped. The embedded stdlib
+// (extracted lazily to a temp dir on first call) is always last, so user-set
+// paths and on-disk distributions can override the bundled files.
 func libIncludeDirs() []string {
 	var dirs []string
 	if env := os.Getenv("MMK_LIB_PATH"); env != "" {
@@ -182,6 +186,9 @@ func libIncludeDirs() []string {
 		exeDir := filepath.Dir(exe)
 		dirs = append(dirs, filepath.Join(exeDir, "..", "lib", "mmk"))
 		dirs = append(dirs, filepath.Join(exeDir, "lib"))
+	}
+	if embedDir, err := lib.Dir(); err == nil && embedDir != "" {
+		dirs = append(dirs, embedDir)
 	}
 	return dirs
 }
