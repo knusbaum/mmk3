@@ -2858,6 +2858,16 @@ func (n *TargetNode) runBash(execute string, output bool) error {
 	if n.build.Verbose {
 		c.Env = append(c.Env, "MMK_VERBOSE=1")
 	}
+	// Verb nodes inherit the default rule's options before any verb-rule
+	// options are layered on. This means a target's `key=value` options
+	// (e.g. `c_library libio source=./libio :`) are visible to every verb
+	// body that runs against the target — clean, test, install, etc. — not
+	// just the build body. Verb-rule options take precedence on collision.
+	if n.verb != "" {
+		if defaultRule := n.build.concretes[n.target]; defaultRule != nil {
+			c.Env = appendRuleOptions(c.Env, defaultRule)
+		}
+	}
 	c.Env = appendRuleOptions(c.Env, n.rule)
 	c.Env = appendMatrixVars(c.Env, n.build.matrixVars[n.target])
 	if output {

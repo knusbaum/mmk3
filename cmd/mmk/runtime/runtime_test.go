@@ -2262,6 +2262,88 @@ c_library mylib.a : {
 	}
 }
 
+// --- verb body sees default rule's options ---
+
+func TestVerbBodyInheritsDefaultRuleOptions_InheritedVerb(t *testing.T) {
+	// A verb body that inherits from a defbody (no explicit verb rule)
+	// should see the target rule's options.
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.txt")
+	src := fmt.Sprintf(`
+deftype mytype { return 1; }
+defbody mytype { :; }
+defbody mytype clean {
+    printf '%%s' "$myopt" > %q
+}
+
+mytype mytarget myopt=hello :
+`, out)
+	b := newBuild(t, src)
+	n, err := b.ResolveVerb("mytarget", "clean")
+	if err != nil {
+		t.Fatalf("ResolveVerb: %v", err)
+	}
+	if err := runForTest(n); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got, _ := os.ReadFile(out)
+	if string(got) != "hello" {
+		t.Errorf("verb body should see myopt=hello; got %q", got)
+	}
+}
+
+func TestVerbBodyInheritsDefaultRuleOptions_ExplicitVerbRule(t *testing.T) {
+	// A verb body with an explicit `[verb target]` rule should also see the
+	// target rule's options (not just the verb rule's own).
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.txt")
+	src := fmt.Sprintf(`
+deftype mytype { return 1; }
+defbody mytype { :; }
+
+mytype mytarget myopt=fromtarget :
+
+[clean mytarget] {
+    printf '%%s' "$myopt" > %q
+}
+`, out)
+	b := newBuild(t, src)
+	n, _ := b.ResolveVerb("mytarget", "clean")
+	if err := runForTest(n); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got, _ := os.ReadFile(out)
+	if string(got) != "fromtarget" {
+		t.Errorf("explicit verb body should see target's myopt; got %q", got)
+	}
+}
+
+func TestVerbBodyInheritsDefaultRuleOptions_VerbRuleOverrides(t *testing.T) {
+	// When both the target rule and the verb rule define the same key, the
+	// verb rule wins (more specific).
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.txt")
+	src := fmt.Sprintf(`
+deftype mytype { return 1; }
+defbody mytype { :; }
+
+mytype mytarget myopt=fromtarget :
+
+[clean mytarget] myopt=fromverb {
+    printf '%%s' "$myopt" > %q
+}
+`, out)
+	b := newBuild(t, src)
+	n, _ := b.ResolveVerb("mytarget", "clean")
+	if err := runForTest(n); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got, _ := os.ReadFile(out)
+	if string(got) != "fromverb" {
+		t.Errorf("verb-rule option should win; got %q", got)
+	}
+}
+
 func TestDefBodyDepClauseRejectsVerbForm(t *testing.T) {
 	// Verb-specific defbody dep clauses are parsed but not yet honored at
 	// runtime. Reject up front so users don't write something silently broken.
