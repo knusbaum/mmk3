@@ -59,9 +59,9 @@ file one for x in [ 1 2 3 4 ] {
 file two for y in [ a b c d ] {
     sleep 5
     echo $y
-    if [[ "$y" == "b" ]]; then
-	exit 1;
-    fi
+    #if [[ "$y" == "b" ]]; then
+	#exit 1;
+    #fi
     touch "$target";
 }
 
@@ -72,7 +72,7 @@ file downstream for x in [ 1 2 3 4 ] for y in [ a b c d ] : [one @ x=$x] [two @ 
 }
 
 
-## but with groups, you can write it more succinctly, and don't need to duplicate lists of variables:
+# but with groups, you can write it more succinctly, and don't need to duplicate lists of variables:
 
 
 group numbers
@@ -116,3 +116,44 @@ file consumer2 : [ numbers2 @ i ] {
 
 
 many : consumer2 g_downstream downstream executable
+
+file top {
+    echo building $target
+    sleep 1;
+    touch "$target";
+}
+
+file other for i in [ $(seq 1 100) ] for j in [ $(seq 1 100) ] : top {  touch "$target"; } #echo "OTHER(${i}:${j})"; }
+file other2 for i in [ $(seq 1 100) ] for j in [ $(seq 1 100) ] : [other @ i=$i j=$j] {  touch "$target"; } #echo "OTHER2(${i}:${j})"; }
+
+file intermediate for i in [ $(seq 1 100) ] for j in [ $(seq 1 100) ] : top {  touch "$target"; } #echo "INTERMEDIATE(${i}:${j})"; }
+file intermediate2 for i in [ $(seq 1 100) ] for j in [ $(seq 1 100) ] : [intermediate @ i=$i j=$j] {  touch "$target"; } #echo "INTERMEDIATE2(${i}:${j})";  }
+
+file out for j in [ $(seq 1 100) ] : [intermediate2 @ j=$j] [other2 @ j=$j] {
+    echo building $target "(" $deps ")"
+    sleep 1;
+    touch "$target";
+}
+
+
+
+file outdir {
+    mkdir outdir
+}
+
+[clean outdir] {
+    rm -Rf outdir
+}
+
+file 'outdir/([a-zA-Z0-9]*)_([0-9]*)_([0-9]*)\.out' : outdir {
+     touch "$target"
+     echo OUTDIR "'$1'" "'$2'" "'$3'"
+     if [[ "$3" == 10 ]]; then
+	echo "FAILURE TO COUNT TO 10"
+	#exit 1;
+     fi;
+}
+
+outs for i in [ $(seq 1 100) ] for j in [ $(seq 1 1000) ] : outdir/out_$i_$j.out
+
+dooutdir : outs

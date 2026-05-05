@@ -53,26 +53,27 @@ func Run(b *runtime.Build, target, verb string, parallelism int) error {
 	m := initialModel(tree, ring, b)
 	prog := tea.NewProgram(m, tea.WithAltScreen())
 
-	// Drive the build from a goroutine. Hooks publish events to the program.
+	// Drive the build from a goroutine. Hooks update node state directly;
+	// only failures push a message through the event loop.
 	hooks := dag.Hooks[*runtime.TargetNode]{
 		OnRun: func(n *runtime.TargetNode) {
-			if b.IsCancelled() {
-				return
-			}
-			prog.Send(runMsg{key: nodeKey(n.Target(), n.Verb())})
+			n.SetState(runtime.NodeRunning)
 		},
 		OnSkip: func(n *runtime.TargetNode) {
-			if b.IsCancelled() {
-				return
-			}
-			prog.Send(skipMsg{key: nodeKey(n.Target(), n.Verb())})
+			n.SetState(runtime.NodeSkipped)
 		},
 		OnFinish: func(n *runtime.TargetNode, err error) {
 			if isCancelledErr(err) {
+				n.SetState(runtime.NodeCancelled)
 				return
 			}
-			out := caps.take(nodeKey(n.Target(), n.Verb()))
-			prog.Send(finishMsg{key: nodeKey(n.Target(), n.Verb()), target: n.Target(), verb: n.Verb(), err: err, output: out})
+			if err != nil {
+				n.SetState(runtime.NodeFailed)
+				out := caps.take(nodeKey(n.Target(), n.Verb()))
+				prog.Send(failureMsg{target: n.Target(), verb: n.Verb(), err: err, output: out})
+				return
+			}
+			n.SetState(runtime.NodeDone)
 		},
 	}
 
@@ -365,7 +366,6 @@ type failure struct {
 
 type model struct {
 	tree     treeData
-	statuses map[string]status
 	ring     *logRing
 	failures []failure
 	build    *runtime.Build
@@ -396,33 +396,23 @@ type model struct {
 }
 
 func initialModel(t treeData, ring *logRing, b *runtime.Build) model {
-	m := model{
-		tree:     t,
-		statuses: map[string]status{},
-		ring:     ring,
-		build:    b,
-		graphView: true,
+	return model{
+		tree:           t,
+		ring:           ring,
+		build:          b,
+		graphView:      true,
 		dagGroupMatrix: true,
 	}
-	m.statuses[t.rootKey] = statusPending
-	for _, ln := range t.lines {
-		if ln.key != "" {
-			m.statuses[ln.key] = statusPending
-		}
-		for _, gk := range ln.groupKeys {
-			m.statuses[gk] = statusPending
-		}
-	}
-	return m
 }
 
 // Messages from the build goroutine.
+// Only failures and build completion are pushed through the event loop;
+// routine state changes (running, skipped, done) are written directly to
+// TargetNode.SetState and read by dagStatusOf on each tick.
 
-type runMsg struct{ key string }
-type skipMsg struct{ key string }
-type finishMsg struct {
-	key, target, verb, output string
-	err                       error
+type failureMsg struct {
+	target, verb, output string
+	err                  error
 }
 type buildDoneMsg struct{ err error }
 type tickMsg struct{}
@@ -500,27 +490,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.build.SignalAll(syscall.SIGKILL)
 			}
 		}
-	case runMsg:
-		m.statuses[msg.key] = statusRunning
-	case skipMsg:
-		m.statuses[msg.key] = statusSkipped
-	case finishMsg:
-		if msg.err != nil {
-			if isCancelledErr(msg.err) {
-				// Nodes aborted by cancellation are not real failures.
-				m.statuses[msg.key] = statusCancelled
-			} else {
-				m.statuses[msg.key] = statusFailed
-				m.failures = append(m.failures, failure{
-					target: msg.target,
-					verb:   msg.verb,
-					err:    msg.err,
-					output: msg.output,
-				})
-			}
-		} else {
-			m.statuses[msg.key] = statusDone
-		}
+	case failureMsg:
+		m.failures = append(m.failures, failure{
+			target: msg.target,
+			verb:   msg.verb,
+			err:    msg.err,
+			output: msg.output,
+		})
 	case tickMsg:
 		if m.graphView {
 			m.refreshDag()
@@ -533,10 +509,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.buildDone = true
 		m.buildErr = msg.err
 		// Refresh the cached DAG drawing one last time so the post-exit
-		// dump reflects the final statuses. The tick-driven refresh runs
-		// every 80ms; if the last finishMsg arrived between ticks and
-		// buildDoneMsg arrived right after, the cache would otherwise
-		// still show the pre-final state.
+		// dump reflects the final statuses. Node states are set directly
+		// by the hooks, so they're already up to date at this point.
 		if m.graphView {
 			m.refreshDag()
 		}
@@ -594,7 +568,7 @@ func (m model) render(final bool) string {
 		b.WriteString(m.renderDagWindow())
 	} else {
 		// Tree.
-		rootIcon, rootStyle := iconAndStyle(m.statuses[m.tree.rootKey])
+		rootIcon, rootStyle := iconAndStyle(m.nodeStatus(m.tree.rootKey))
 		fmt.Fprintf(&b, "%s %s\n", rootIcon, rootStyle.Render(m.tree.rootLabel))
 		for _, ln := range m.tree.lines {
 			if len(ln.groupKeys) > 0 {
@@ -602,7 +576,7 @@ func (m model) render(final bool) string {
 				fmt.Fprintf(&b, "%s%s %s\n", ln.prefix, icon, label)
 				continue
 			}
-			icon, st := iconAndStyle(m.statuses[ln.key])
+			icon, st := iconAndStyle(m.nodeStatus(ln.key))
 			fmt.Fprintf(&b, "%s%s %s\n", ln.prefix, icon, st.Render(ln.label))
 		}
 	}
@@ -670,7 +644,7 @@ func failureLabel(f failure) string {
 func (m model) renderGroup(ln treeLine) (string, string) {
 	var pending, running, done, skipped, failed, cancelled int
 	for _, k := range ln.groupKeys {
-		switch m.statuses[k] {
+		switch m.nodeStatus(k) {
 		case statusRunning:
 			running++
 		case statusDone:
@@ -817,17 +791,53 @@ func (m *model) dagVisibleSize() (int, int) {
 	return w, h - reserved
 }
 
-// dagStatusOf adapts the model's status map to dagview.StatusFn. The dagview
-// package owns its own enum to avoid importing this package's internals.
+// splitNodeKey reverses nodeKey: "verb\x00target" → (target, verb).
+func splitNodeKey(key string) (target, verb string) {
+	i := strings.IndexByte(key, '\x00')
+	if i < 0 {
+		return key, ""
+	}
+	return key[i+1:], key[:i]
+}
+
+// nodeStatus returns the TUI status for a node looked up by composite key.
+func (m model) nodeStatus(key string) status {
+	tgt, verb := splitNodeKey(key)
+	n := m.build.NodeFor(tgt, verb)
+	if n == nil {
+		return statusPending
+	}
+	switch n.State() {
+	case runtime.NodeRunning:
+		return statusRunning
+	case runtime.NodeDone:
+		return statusDone
+	case runtime.NodeSkipped:
+		return statusSkipped
+	case runtime.NodeFailed:
+		return statusFailed
+	case runtime.NodeCancelled:
+		return statusCancelled
+	default:
+		return statusPending
+	}
+}
+
+// dagStatusOf adapts node state to dagview.StatusFn. The dagview package owns
+// its own enum to avoid importing this package's internals.
 func (m model) dagStatusOf(target, verb string) dagview.Status {
-	switch m.statuses[nodeKey(target, verb)] {
-	case statusRunning:
+	n := m.build.NodeFor(target, verb)
+	if n == nil {
+		return dagview.StatusPending
+	}
+	switch n.State() {
+	case runtime.NodeRunning:
 		return dagview.StatusRunning
-	case statusDone:
+	case runtime.NodeDone:
 		return dagview.StatusDone
-	case statusSkipped:
+	case runtime.NodeSkipped:
 		return dagview.StatusSkipped
-	case statusFailed:
+	case runtime.NodeFailed:
 		return dagview.StatusFailed
 	}
 	return dagview.StatusPending

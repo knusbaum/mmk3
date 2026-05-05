@@ -594,6 +594,16 @@ func (b *Build) runnerNode(runnerTarget *TargetNode) *TargetNode {
 // GenPath returns the path of the generated bash script.
 func (b *Build) GenPath() string { return b.genPath }
 
+// NodeFor returns the TargetNode for the given target and verb, or nil if it
+// has not been resolved. Safe to call from any goroutine once the graph is
+// built (the maps are not modified during execution).
+func (b *Build) NodeFor(target, verb string) *TargetNode {
+	if verb == "" {
+		return b.nodes[target]
+	}
+	return b.verbNodes[verbNodeKey{target, verb}]
+}
+
 // HasVerb reports whether the given verb is defined anywhere visible from
 // this Build — top-level verb rules, verb patterns, defbody verbs, or any
 // (recursively reachable) subproject's verb set. Used to distinguish a typo
@@ -858,6 +868,19 @@ const (
 // model a user-declared target. Synthetic nodes (runner setup) use kindRunner
 // and dispatch on `kind` inside the Date/NeedsRun/Run methods.
 // When verb is non-empty the node represents a verb rule (e.g. [clean executable]).
+// NodeState is the live execution state of a TargetNode. The TUI reads this
+// directly on each tick rather than receiving per-node push events.
+type NodeState int32
+
+const (
+	NodePending   NodeState = iota
+	NodeRunning
+	NodeSkipped
+	NodeDone
+	NodeFailed
+	NodeCancelled
+)
+
 type TargetNode struct {
 	build     *Build
 	target    string
@@ -872,6 +895,8 @@ type TargetNode struct {
 	dateOnce sync.Once
 	dateVal  time.Time
 	dateErr  error
+
+	nodeState atomic.Int32 // NodeState; read by TUI via State()
 }
 
 // Target returns the target name for this node.
@@ -880,11 +905,26 @@ func (n *TargetNode) Target() string { return n.target }
 // Verb returns the verb name for this node, or "" for a non-verb node.
 func (n *TargetNode) Verb() string { return n.verb }
 
+// State returns the current execution state of this node. Safe to call from
+// any goroutine; updated atomically by the DAG worker.
+func (n *TargetNode) State() NodeState { return NodeState(n.nodeState.Load()) }
+
+// SetState updates the node's execution state. Called from TUI hooks so the
+// TUI tick can read state directly without going through the event loop.
+func (n *TargetNode) SetState(s NodeState) { n.nodeState.Store(int32(s)) }
+
 // SourcePattern returns the source pattern regex string if this node was
 // instantiated from a pattern rule, or "" if it has a concrete rule. Used
 // by display layers to group nodes that came from the same pattern.
 func (n *TargetNode) SourcePattern() string {
 	if n.rule == nil {
+		// Verb node with no explicit verb rule: fall back to the default
+		// rule's pattern so display layers can group it with its siblings.
+		if n.verb != "" {
+			if defaultRule := n.build.concretes[n.target]; defaultRule != nil {
+				return defaultRule.Pattern
+			}
+		}
 		return ""
 	}
 	return n.rule.Pattern
@@ -1282,9 +1322,25 @@ func (n *TargetNode) computeDate() (time.Time, error) {
 	switch n.rule.Type {
 	case "":
 		return time.Now(), nil
+	case "file", "source":
+		return n.fileTypeDate()
 	default:
 		return n.userTypeDate()
 	}
+}
+
+// fileTypeDate returns the mtime of the target file, or zero time if the file
+// does not exist. It is a fast path for the built-in "file" and "source" types
+// that avoids spawning a bash subprocess.
+func (n *TargetNode) fileTypeDate() (time.Time, error) {
+	info, err := os.Stat(n.target)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return time.Time{}, nil
+		}
+		return time.Time{}, err
+	}
+	return info.ModTime(), nil
 }
 
 // NeedsRun reports whether the target needs to run.
