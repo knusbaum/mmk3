@@ -102,6 +102,7 @@ type Build struct {
 	defBodies          map[string]bool // type name → has default body (built-in or user defbody)
 	defVerbBodies      map[defVerbBodyKey]bool
 	userDefBodyOptions map[defVerbBodyKey][]parse.Option // user defbody options keyed by (type, verb)
+	defBodyDeps        map[defVerbBodyKey][]string       // user defbody dep tokens keyed by (type, verb)
 	subprojects        map[string]*subprojectInfo        // subproject target → metadata for sub-path delegation
 	matrixInfo     map[string]*matrixRuleInfo // base target → matrix info (for aggregators and dep resolution)
 	matrixVars     map[string]matrixCombo     // internal combo target name → its variable assignments
@@ -217,6 +218,13 @@ func validateDirectives(f *parse.File) error {
 				return fmt.Errorf("duplicate defbody for type %q", d.Type)
 			}
 			defbodies[key] = true
+			// Verb-specific defbody dep clauses parse but aren't yet honored
+			// by the runtime (verb deps inherit from the build defbody via
+			// existing verb-rule semantics). Reject up front rather than
+			// silently dropping deps the user wrote.
+			if d.Verb != "" && len(d.Deps) > 0 {
+				return fmt.Errorf("defbody %q verb %q: dep clause is only supported on the build-verb defbody", d.Type, d.Verb)
+			}
 		case *parse.TargetRule:
 			if d.Pattern == "" && d.Verb == "" {
 				concretes[d.Target] = d
@@ -357,6 +365,7 @@ func newBuildFromAST(f *parse.File) (*Build, error) {
 		defBodies:          make(map[string]bool),
 		defVerbBodies:      make(map[defVerbBodyKey]bool),
 		userDefBodyOptions: make(map[defVerbBodyKey][]parse.Option),
+		defBodyDeps:        make(map[defVerbBodyKey][]string),
 		subprojects:        make(map[string]*subprojectInfo),
 		matrixInfo:         make(map[string]*matrixRuleInfo),
 		matrixVars:         make(map[string]matrixCombo),
@@ -401,6 +410,9 @@ func newBuildFromAST(f *parse.File) (*Build, error) {
 		if d, ok := d.(*parse.DefBody); ok {
 			if len(d.Options) > 0 {
 				b.userDefBodyOptions[defVerbBodyKey{d.Type, d.Verb}] = d.Options
+			}
+			if len(d.Deps) > 0 {
+				b.defBodyDeps[defVerbBodyKey{d.Type, d.Verb}] = d.Deps
 			}
 			if d.Verb != "" {
 				b.defVerbBodies[defVerbBodyKey{d.Type, d.Verb}] = true
@@ -1038,6 +1050,15 @@ func (n *TargetNode) Dependencies() []*TargetNode {
 			n.deps = append(n.deps, depNode)
 		}
 	}
+	// Type-level computed deps from defbody dep clause. These augment whatever
+	// explicit deps the rule already declared and become real DAG edges so verb
+	// inheritance, -graph, and incremental rebuild all see them.
+	if n.rule.Type != "" {
+		if err := n.appendDefBodyDeps(); err != nil {
+			n.resolveErr = err
+			return n.deps
+		}
+	}
 	if n.rule.Runner != "" {
 		runnerNode, err := n.build.Resolve(n.rule.Runner)
 		if err != nil {
@@ -1047,6 +1068,36 @@ func (n *TargetNode) Dependencies() []*TargetNode {
 		n.deps = append(n.deps, runnerNode, n.build.runnerNode(runnerNode))
 	}
 	return n.deps
+}
+
+// appendDefBodyDeps evaluates the dep clause of the build-verb defbody for
+// this target's type (if any) and appends the resulting nodes to n.deps. Each
+// dep token is run through bash with target options, $target, and ${dep[@]}
+// (the explicit deps already resolved) bound; the output is word-split and
+// each name resolved as a regular dep.
+func (n *TargetNode) appendDefBodyDeps() error {
+	tokens := n.build.defBodyDeps[defVerbBodyKey{n.rule.Type, ""}]
+	if len(tokens) == 0 {
+		return nil
+	}
+	explicit := make([]string, 0, len(n.deps))
+	for _, d := range n.deps {
+		explicit = append(explicit, d.target)
+	}
+	for _, tok := range tokens {
+		names, err := n.build.expandDefBodyDep(tok, n.target, n.rule.Options, explicit)
+		if err != nil {
+			return fmt.Errorf("target %q: %w", n.target, err)
+		}
+		for _, name := range names {
+			depNode, err := n.build.Resolve(name)
+			if err != nil {
+				return err
+			}
+			n.deps = append(n.deps, depNode)
+		}
+	}
+	return nil
 }
 
 // verbDependencies resolves deps for a verb node.
@@ -1182,12 +1233,14 @@ func (n *TargetNode) inheritedVerbDeps() []*TargetNode {
 		return nil
 	}
 	var deps []*TargetNode
+	var explicitNames []string
 	for _, dep := range defaultRule.Deps {
 		targets, err := n.build.expandDep(dep.Target)
 		if err != nil {
 			n.resolveErr = err
 			return deps
 		}
+		explicitNames = append(explicitNames, targets...)
 		for _, target := range targets {
 			depNode, err := n.build.ResolveVerb(target, n.verb)
 			if err != nil {
@@ -1195,6 +1248,27 @@ func (n *TargetNode) inheritedVerbDeps() []*TargetNode {
 				return deps
 			}
 			deps = append(deps, depNode)
+		}
+	}
+	// Type-level computed deps from the defbody dep clause inherit verb-applied,
+	// just like explicit deps. Evaluating here (rather than reading from a
+	// separately-resolved default node) avoids ordering/state coupling.
+	if defaultRule.Type != "" {
+		tokens := n.build.defBodyDeps[defVerbBodyKey{defaultRule.Type, ""}]
+		for _, tok := range tokens {
+			names, err := n.build.expandDefBodyDep(tok, n.target, defaultRule.Options, explicitNames)
+			if err != nil {
+				n.resolveErr = err
+				return deps
+			}
+			for _, name := range names {
+				depNode, err := n.build.ResolveVerb(name, n.verb)
+				if err != nil {
+					n.resolveErr = err
+					return deps
+				}
+				deps = append(deps, depNode)
+			}
 		}
 	}
 	if defaultRule.Runner != "" && (n.rule == nil || n.rule.Runner != defaultRule.Runner) {
@@ -1622,9 +1696,11 @@ func (n *TargetNode) runnerSetup() error {
 	return nil
 }
 
-// explicitDepNames returns just the target names from rule.Deps — not the
-// implicit deps (runner target, container node) that Dependencies() appends.
-// This is what `$deps` should expose to user bodies.
+// explicitDepNames returns the dep names a body should see in `$deps` /
+// `${dep[@]}`: the rule's explicit deps plus any names produced by the type's
+// defbody dep clause. Implicit deps (runner target, container node) that
+// Dependencies() appends are excluded — they're build infrastructure, not
+// content the body asked for.
 func (n *TargetNode) explicitDepNames() []string {
 	if n.rule == nil {
 		return nil
@@ -1638,6 +1714,18 @@ func (n *TargetNode) explicitDepNames() []string {
 		}
 		names = append(names, expanded...)
 	}
+	// Append type-computed deps (defbody dep clause). These are real DAG edges
+	// and so should be visible to the body the same way explicit deps are.
+	if n.rule.Type != "" {
+		tokens := n.build.defBodyDeps[defVerbBodyKey{n.rule.Type, ""}]
+		for _, tok := range tokens {
+			computed, err := n.build.expandDefBodyDep(tok, n.target, n.rule.Options, names)
+			if err != nil {
+				continue
+			}
+			names = append(names, computed...)
+		}
+	}
 	return names
 }
 
@@ -1646,6 +1734,43 @@ func (n *TargetNode) explicitDepNames() []string {
 // holding multiple space-separated names produces multiple deps.
 func (b *Build) expandDep(dep string) ([]string, error) {
 	return b.expandToken(dep, "dep")
+}
+
+// expandDefBodyDep evaluates a defbody dep clause token. Unlike expandDep, the
+// evaluation environment includes per-target options as bash variables (so
+// `$source` etc. resolve), plus `$target` and `${dep[@]}` (the explicit deps
+// already accumulated). Any token (not just $-prefixed) is run through bash so
+// command substitutions like `$(find ...)` are interpreted.
+func (b *Build) expandDefBodyDep(token, target string, options []parse.Option, explicitDeps []string) ([]string, error) {
+	var script strings.Builder
+	script.WriteString(`. "$MMK_GENFILE"` + "\n")
+	script.WriteString("target=" + shellQuote(target) + "\n")
+	script.WriteString("dep=(")
+	for i, d := range explicitDeps {
+		if i > 0 {
+			script.WriteByte(' ')
+		}
+		script.WriteString(shellQuote(d))
+	}
+	script.WriteString(")\n")
+	for _, opt := range options {
+		script.WriteString(opt.Key + "=" + shellQuote(opt.Value) + "\n")
+	}
+	script.WriteString("echo " + token + "\n")
+
+	cmd := exec.Command("bash", "-c", script.String())
+	cmd.Env = append(os.Environ(), "MMK_GENFILE="+b.genPath)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("expand defbody dep %q: %w", token, err)
+	}
+	return strings.Fields(string(out)), nil
+}
+
+// shellQuote wraps a value in single quotes, escaping any embedded single
+// quotes for safe inclusion in a generated bash script.
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }
 
 // expandToken evaluates a single token by sourcing the genfile in bash and

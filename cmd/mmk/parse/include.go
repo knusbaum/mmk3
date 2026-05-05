@@ -97,11 +97,19 @@ func resolveIncludes(f *File, baseDir string, seen map[string]bool, parentPT []s
 }
 
 // resolveIncludePath turns a raw include path (which may contain `$VAR`,
-// `$(...)`, etc.) into an absolute filesystem path. If the path has no `$`,
-// it's used verbatim — no bash needed. Otherwise, accumulated passthrough
-// lines are run in a bash subprocess that echoes the path; the resulting
-// single word is taken as the resolved path. Relative results are joined
-// against baseDir.
+// `$(...)`, etc.) into an absolute filesystem path.
+//
+// Resolution after $-expansion:
+//   - Absolute paths are used as-is.
+//   - Relative paths first resolve relative to the file containing the
+//     include directive. If that file exists, it wins. Otherwise the path
+//     is searched against MMK_LIB_PATH plus the binary-relative defaults
+//     (`<exe>/../lib/mmk`, `<exe>/lib`) — this is how `include go.mmk`
+//     finds stdlib files shipped with mmk.
+//
+// If the path has no `$`, it's used verbatim — no bash needed. Otherwise,
+// accumulated passthrough lines are run in a bash subprocess that echoes the
+// path; the resulting single word is taken as the resolved path.
 func resolveIncludePath(path, baseDir string, passthroughs []string) (string, error) {
 	expanded := path
 	if strings.Contains(path, "$") {
@@ -126,5 +134,54 @@ func resolveIncludePath(path, baseDir string, passthroughs []string) (string, er
 	if filepath.IsAbs(expanded) {
 		return expanded, nil
 	}
-	return filepath.Join(baseDir, expanded), nil
+	local := filepath.Join(baseDir, expanded)
+	if _, err := os.Stat(local); err == nil {
+		return local, nil
+	}
+	// Fall through to library search path. Local resolution wins when both
+	// exist — projects can shadow stdlib files by dropping a same-named file
+	// next to their mmkfile.
+	return resolveLibInclude(expanded, local)
+}
+
+// resolveLibInclude searches the include library path for a bare-name include
+// (e.g. `go.mmk`, `lang/c.mmk`). Returns the absolute path of the first match
+// found. localPath is the path that was tried locally (used in the error
+// message for context).
+//
+// Search order:
+//  1. Each colon-separated directory in $MMK_LIB_PATH, in order.
+//  2. `<dir-of-mmk-binary>/../lib/mmk` (install layout).
+//  3. `<dir-of-mmk-binary>/lib` (source-tree layout).
+func resolveLibInclude(name, localPath string) (string, error) {
+	dirs := libIncludeDirs()
+	for _, dir := range dirs {
+		candidate := filepath.Join(dir, name)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, nil
+		}
+	}
+	if len(dirs) == 0 {
+		return localPath, nil
+	}
+	return localPath, nil
+}
+
+// libIncludeDirs returns the search directories for bare-name includes, in
+// order. Empty entries from MMK_LIB_PATH are skipped.
+func libIncludeDirs() []string {
+	var dirs []string
+	if env := os.Getenv("MMK_LIB_PATH"); env != "" {
+		for _, d := range strings.Split(env, ":") {
+			if d != "" {
+				dirs = append(dirs, d)
+			}
+		}
+	}
+	if exe, err := os.Executable(); err == nil {
+		exeDir := filepath.Dir(exe)
+		dirs = append(dirs, filepath.Join(exeDir, "..", "lib", "mmk"))
+		dirs = append(dirs, filepath.Join(exeDir, "lib"))
+	}
+	return dirs
 }

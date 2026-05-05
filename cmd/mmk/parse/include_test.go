@@ -259,6 +259,78 @@ func TestParseFile_PassthroughVisibleAcrossIncludes(t *testing.T) {
 	}
 }
 
+// --- include search path (MMK_LIB_PATH) ---
+
+func TestParseFile_LibSearchPath_FindsBareInclude(t *testing.T) {
+	dir := t.TempDir()
+	libDir := t.TempDir()
+	writeFile(t, libDir, "go.mmk", "from_stdlib : { :; }\n")
+	root := writeFile(t, dir, "mmkfile", "include go.mmk\n")
+
+	t.Setenv("MMK_LIB_PATH", libDir)
+	f, err := ParseFile(root)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if got := directiveTargets(f); len(got) != 1 || got[0] != "from_stdlib" {
+		t.Errorf("targets: got %v, want [from_stdlib]", got)
+	}
+}
+
+func TestParseFile_LibSearchPath_LocalShadowsStdlib(t *testing.T) {
+	// If both a local file and a stdlib file with the same name exist, the
+	// local one wins (relative resolution is tried first).
+	dir := t.TempDir()
+	libDir := t.TempDir()
+	writeFile(t, libDir, "go.mmk", "from_stdlib : { :; }\n")
+	writeFile(t, dir, "go.mmk", "from_local : { :; }\n")
+	root := writeFile(t, dir, "mmkfile", "include go.mmk\n")
+
+	t.Setenv("MMK_LIB_PATH", libDir)
+	f, err := ParseFile(root)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if got := directiveTargets(f); len(got) != 1 || got[0] != "from_local" {
+		t.Errorf("local should shadow stdlib; got %v, want [from_local]", got)
+	}
+}
+
+func TestParseFile_LibSearchPath_MultipleDirsSearchedInOrder(t *testing.T) {
+	dir := t.TempDir()
+	libA := t.TempDir()
+	libB := t.TempDir()
+	writeFile(t, libA, "lib.mmk", "from_a : { :; }\n")
+	writeFile(t, libB, "lib.mmk", "from_b : { :; }\n")
+	root := writeFile(t, dir, "mmkfile", "include lib.mmk\n")
+
+	t.Setenv("MMK_LIB_PATH", libA+":"+libB)
+	f, err := ParseFile(root)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if got := directiveTargets(f); len(got) != 1 || got[0] != "from_a" {
+		t.Errorf("first dir should win; got %v, want [from_a]", got)
+	}
+}
+
+func TestParseFile_LibSearchPath_SubdirInLibDir(t *testing.T) {
+	// `include lang/c.mmk` should search MMK_LIB_PATH for lang/c.mmk.
+	dir := t.TempDir()
+	libDir := t.TempDir()
+	writeFile(t, libDir, "lang/c.mmk", "from_c_stdlib : { :; }\n")
+	root := writeFile(t, dir, "mmkfile", "include lang/c.mmk\n")
+
+	t.Setenv("MMK_LIB_PATH", libDir)
+	f, err := ParseFile(root)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	if got := directiveTargets(f); len(got) != 1 || got[0] != "from_c_stdlib" {
+		t.Errorf("targets: got %v, want [from_c_stdlib]", got)
+	}
+}
+
 func TestParseFile_TransitivePassthroughVisible(t *testing.T) {
 	// vars.mmk is included from sub.mmk, which is included from the root.
 	// A sibling include (still in the root) using $LIBDIR should resolve

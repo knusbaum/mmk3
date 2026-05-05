@@ -47,6 +47,27 @@ func depTargets(nodes []*TargetNode) []string {
 	return names
 }
 
+// runForTest builds a node and all its transitive deps via post-order DFS.
+// Stops on the first failure. Useful for tests that need to inspect a body's
+// observable side effects.
+func runForTest(n *TargetNode) error {
+	visited := make(map[*TargetNode]bool)
+	var visit func(*TargetNode) error
+	visit = func(node *TargetNode) error {
+		if visited[node] {
+			return nil
+		}
+		visited[node] = true
+		for _, dep := range node.Dependencies() {
+			if err := visit(dep); err != nil {
+				return err
+			}
+		}
+		return node.Run()
+	}
+	return visit(n)
+}
+
 // --- resolution ---
 
 func TestResolveConcreteTarget(t *testing.T) {
@@ -1936,6 +1957,326 @@ defbody mytype clean { false }
 	}
 	if !strings.Contains(err.Error(), "duplicate") {
 		t.Errorf("error should mention duplicate: %v", err)
+	}
+}
+
+// --- defbody dep clause ---
+
+func TestDefBodyDepClauseAddsDepsToTarget(t *testing.T) {
+	src := `
+deftype c_library { stat -f %m "$target" 2>/dev/null }
+defbody c_library : $(echo foo.o bar.o) {
+    ar -rcs "$target" "${dep[@]}"
+}
+file '(.*)\.o' : $1.c { cc -c $1.c -o $target }
+c_library mylib.a :
+`
+	b := newBuild(t, src)
+	n, err := b.Resolve("mylib.a")
+	if err != nil {
+		t.Fatalf("Resolve mylib.a: %v", err)
+	}
+	deps := n.Dependencies()
+	got := depTargets(deps)
+	want := []string{"foo.o", "bar.o"}
+	if len(got) != len(want) {
+		t.Fatalf("deps: got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("dep[%d]: got %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestDefBodyDepClauseUsesOptions(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "a.c"), nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b.c"), nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	src := fmt.Sprintf(`
+deftype c_library { stat -f %%m "$target" 2>/dev/null }
+defbody c_library : $(find "$source" -name '*.c' | sed 's/\.c$/.o/') {
+    ar -rcs "$target" "${dep[@]}"
+}
+file '(.*)\.o' : $1.c { cc -c $1.c -o $target }
+c_library mylib.a source=%q :
+`, dir)
+	b := newBuild(t, src)
+	n, _ := b.Resolve("mylib.a")
+	deps := n.Dependencies()
+	got := depTargets(deps)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 deps from $source scan, got %v", got)
+	}
+	// Order from find is filesystem-dependent; check set membership.
+	wantSet := map[string]bool{
+		filepath.Join(dir, "a.o"): true,
+		filepath.Join(dir, "b.o"): true,
+	}
+	for _, g := range got {
+		if !wantSet[g] {
+			t.Errorf("unexpected dep %q (want one of a.o/b.o under %s)", g, dir)
+		}
+	}
+}
+
+func TestDefBodyDepClauseAugmentsExplicitDeps(t *testing.T) {
+	src := `
+deftype c_library { stat -f %m "$target" 2>/dev/null }
+defbody c_library : $(echo computed.o) {
+    ar -rcs "$target" "${dep[@]}"
+}
+file '(.*)\.o' : $1.c { cc -c $1.c -o $target }
+c_library mylib.a : explicit.o
+`
+	b := newBuild(t, src)
+	n, _ := b.Resolve("mylib.a")
+	got := depTargets(n.Dependencies())
+	want := []string{"explicit.o", "computed.o"}
+	if len(got) != len(want) {
+		t.Fatalf("deps: got %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("dep[%d]: got %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestDefBodyDepClauseFiresWithCustomBody(t *testing.T) {
+	// Computed deps must still be added to the DAG when the rule has its own body.
+	src := `
+deftype c_library { stat -f %m "$target" 2>/dev/null }
+defbody c_library : $(echo a.o b.o) {
+    ar -rcs "$target" "${dep[@]}"
+}
+file '(.*)\.o' : $1.c { cc -c $1.c -o $target }
+c_library mylib.a : { custom_link_command "${dep[@]}"; }
+`
+	b := newBuild(t, src)
+	n, _ := b.Resolve("mylib.a")
+	got := depTargets(n.Dependencies())
+	if len(got) != 2 || got[0] != "a.o" || got[1] != "b.o" {
+		t.Errorf("computed deps should still fire with custom body; got %v", got)
+	}
+}
+
+func TestDefBodyDepClauseVerbInheritance(t *testing.T) {
+	// `mmk clean mylib.a` should recurse through defbody-computed deps.
+	src := `
+deftype c_library { stat -f %m "$target" 2>/dev/null }
+defbody c_library : $(echo foo.o) {
+    ar -rcs "$target" "${dep[@]}"
+}
+defbody c_library clean {
+    rm -f "$target" "${dep[@]}"
+}
+file '(.*)\.o' : $1.c { cc -c $1.c -o $target }
+c_library mylib.a :
+`
+	b := newBuild(t, src)
+	cleanNode, err := b.ResolveVerb("mylib.a", "clean")
+	if err != nil {
+		t.Fatalf("ResolveVerb mylib.a clean: %v", err)
+	}
+	deps := cleanNode.Dependencies()
+	// We expect [clean foo.o] as a dep of [clean mylib.a] via verb inheritance
+	// over the type-computed dep.
+	found := false
+	for _, d := range deps {
+		if d.target == "foo.o" && d.verb == "clean" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		var got []string
+		for _, d := range deps {
+			got = append(got, fmt.Sprintf("[%s %s]", d.verb, d.target))
+		}
+		t.Errorf("expected [clean foo.o] in deps via verb inheritance, got %v", got)
+	}
+}
+
+func TestDefBodyDepClauseBindsTargetVar(t *testing.T) {
+	// $target should be bound during dep clause evaluation.
+	src := `
+deftype c_library { stat -f %m "$target" 2>/dev/null }
+defbody c_library : $(echo "$target.dep") {
+    :
+}
+mylib.a.dep :
+c_library mylib.a :
+`
+	b := newBuild(t, src)
+	n, _ := b.Resolve("mylib.a")
+	got := depTargets(n.Dependencies())
+	if len(got) != 1 || got[0] != "mylib.a.dep" {
+		t.Errorf("$target should expand to mylib.a; got deps %v", got)
+	}
+}
+
+func TestDefBodyDepClauseBindsExplicitDeps(t *testing.T) {
+	// ${dep[@]} should be bound to the rule's explicit deps during dep
+	// clause evaluation, so a dep expression can reference them.
+	src := `
+deftype c_library { stat -f %m "$target" 2>/dev/null }
+defbody c_library : $(echo "${dep[0]}.computed") {
+    :
+}
+foo.o :
+foo.o.computed :
+c_library mylib.a : foo.o
+`
+	b := newBuild(t, src)
+	n, _ := b.Resolve("mylib.a")
+	got := depTargets(n.Dependencies())
+	want := []string{"foo.o", "foo.o.computed"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("dep clause should see ${dep[@]} from explicit deps; got %v, want %v", got, want)
+	}
+}
+
+func TestDefBodyDepClauseSeesPassthroughVars(t *testing.T) {
+	// Passthrough variables should be visible in dep clause evaluation.
+	src := `
+EXTRA="x.o y.o"
+deftype c_library { stat -f %m "$target" 2>/dev/null }
+defbody c_library : $(echo $EXTRA) {
+    :
+}
+x.o :
+y.o :
+c_library mylib.a :
+`
+	b := newBuild(t, src)
+	n, _ := b.Resolve("mylib.a")
+	got := depTargets(n.Dependencies())
+	want := []string{"x.o", "y.o"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Errorf("dep clause should see passthrough vars; got %v, want %v", got, want)
+	}
+}
+
+func TestDefBodyDepClauseMultipleTokens(t *testing.T) {
+	// A dep clause can have multiple tokens; each is evaluated and word-split.
+	src := `
+deftype c_library { stat -f %m "$target" 2>/dev/null }
+defbody c_library : $(echo a.o b.o) extra.o $(echo c.o) {
+    :
+}
+a.o :
+b.o :
+c.o :
+extra.o :
+c_library mylib.a :
+`
+	b := newBuild(t, src)
+	n, _ := b.Resolve("mylib.a")
+	got := depTargets(n.Dependencies())
+	want := []string{"a.o", "b.o", "extra.o", "c.o"}
+	if len(got) != len(want) {
+		t.Fatalf("got %d deps, want %d: %v", len(got), len(want), got)
+	}
+	for i, w := range want {
+		if got[i] != w {
+			t.Errorf("dep[%d]: got %q, want %q", i, got[i], w)
+		}
+	}
+}
+
+func TestDefBodyDepClauseBodySeesCombinedDeps(t *testing.T) {
+	// The body must see explicit deps + computed deps combined in ${dep[@]}.
+	// Run the body (no custom override) and verify $deps content.
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.WriteFile("explicit.o", nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	src := `
+deftype c_library { stat -f %m "$target" 2>/dev/null }
+defbody c_library : $(echo computed1.o computed2.o) {
+    printf '%s\n' "${dep[@]}" > deps.txt
+    touch "$target"
+}
+file '(.*)\.o' : { touch "$target"; }
+c_library mylib.a : explicit.o
+`
+	b := newBuild(t, src)
+	n, err := b.Resolve("mylib.a")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if err := runForTest(n); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	data, err := os.ReadFile("deps.txt")
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	gotLines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	want := []string{"explicit.o", "computed1.o", "computed2.o"}
+	if len(gotLines) != len(want) {
+		t.Fatalf("body's ${dep[@]}: got %v, want %v", gotLines, want)
+	}
+	for i, w := range want {
+		if gotLines[i] != w {
+			t.Errorf("body's dep[%d]: got %q, want %q", i, gotLines[i], w)
+		}
+	}
+}
+
+func TestDefBodyDepClauseCustomBodyOverrides(t *testing.T) {
+	// When the rule has its own body, the custom body runs (not the defbody),
+	// while computed deps still apply.
+	dir := t.TempDir()
+	t.Chdir(dir)
+	src := `
+deftype c_library { stat -f %m "$target" 2>/dev/null }
+defbody c_library : $(echo a.o b.o) {
+    echo "DEFBODY ran" > out.txt
+    touch "$target"
+}
+file '(.*)\.o' : { touch "$target"; }
+c_library mylib.a : {
+    echo "CUSTOM ran with deps=${dep[*]}" > out.txt
+    touch "$target"
+}
+`
+	b := newBuild(t, src)
+	n, _ := b.Resolve("mylib.a")
+	if err := runForTest(n); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	data, _ := os.ReadFile("out.txt")
+	got := strings.TrimSpace(string(data))
+	if !strings.HasPrefix(got, "CUSTOM ran") {
+		t.Fatalf("expected custom body to run, got %q", got)
+	}
+	if !strings.Contains(got, "a.o") || !strings.Contains(got, "b.o") {
+		t.Errorf("custom body should see computed deps in ${dep[@]}; got %q", got)
+	}
+}
+
+func TestDefBodyDepClauseRejectsVerbForm(t *testing.T) {
+	// Verb-specific defbody dep clauses are parsed but not yet honored at
+	// runtime. Reject up front so users don't write something silently broken.
+	src := `
+deftype c_library { stat -f %m "$target" 2>/dev/null }
+defbody c_library clean : $(echo extra.o) {
+    rm -f "${dep[@]}"
+}
+`
+	_, err := NewBuild([]byte(src))
+	if err == nil {
+		t.Fatal("expected error for verb-specific defbody dep clause")
+	}
+	if !strings.Contains(err.Error(), "verb") {
+		t.Errorf("error should mention verb: %v", err)
 	}
 }
 

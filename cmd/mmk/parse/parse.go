@@ -119,11 +119,20 @@ type TargetRule struct {
 // Options are key=value annotations on the defbody header — the same shape
 // as TargetRule.Options. The defbody's options apply to every verb-rule
 // node that uses this defbody (when no per-rule body is set).
+//
+// Deps is the optional dep list from a `defbody T : depexpr ... { ... }` form.
+// Each entry is a raw bash token (commonly a $(...) substitution) that is
+// evaluated at graph construction time, per target instance, with target
+// options and passthrough vars in scope. The output is word-split and the
+// resulting names are appended to the target's DAG edges (augmenting the
+// rule's explicit deps). The dep clause fires for every target of the type,
+// regardless of whether the rule has a custom body.
 type DefBody struct {
 	Type    string
 	Verb    string
 	Body    string
 	Options []Option
+	Deps    []string
 }
 
 // Passthrough is a raw line of bash that is not an mmk directive.
@@ -825,10 +834,14 @@ func (p *parser) parseDefBlock(keyword string, make func(name, body string) Dire
 	return make(name, body), nil
 }
 
-// parseDefBody handles 'defbody type [verb]? [key=value...]? { body }'.
+// parseDefBody handles 'defbody type [verb]? [key=value...]? [: dep ...]? { body }'.
 // Optional tokens after the type name are interpreted as the verb (the first
 // bare word) and as key=value options (one or more); they may appear in any
-// order between the type and the opening brace.
+// order between the type and the opening brace or ':'.
+//
+// An optional ':' introduces a dep list — each token is a raw bash expression
+// (commonly $(...)) evaluated at graph construction time per target instance.
+// See DefBody.Deps.
 func (p *parser) parseDefBody() (Directive, error) {
 	p.s.readWord() // consume "defbody"
 	typeName, err := p.parseName()
@@ -840,7 +853,7 @@ func (p *parser) parseDefBody() (Directive, error) {
 	for {
 		p.s.skipHorizontalSpace()
 		b := p.s.peek()
-		if b == 0 || b == '\n' || b == '{' || b == '#' {
+		if b == 0 || b == '\n' || b == '{' || b == '#' || b == ':' {
 			break
 		}
 		if !isWordByte(b) && b != '"' {
@@ -868,6 +881,23 @@ func (p *parser) parseDefBody() (Directive, error) {
 		}
 		verb = word
 	}
+	var deps []string
+	p.s.skipHorizontalSpace()
+	if p.s.peek() == ':' {
+		p.s.advance()
+		for {
+			p.s.skipHorizontalSpace()
+			b := p.s.peek()
+			if b == '\n' || b == 0 || b == '{' || b == '#' {
+				break
+			}
+			name, err := p.parseName()
+			if err != nil {
+				return nil, fmt.Errorf("defbody %s deps: %w", typeName, err)
+			}
+			deps = append(deps, name)
+		}
+	}
 	p.skipWhitespaceAndComments()
 	if p.s.peek() != '{' {
 		return nil, fmt.Errorf("line %d: expected '{' after defbody %s", p.s.line, typeName)
@@ -878,7 +908,7 @@ func (p *parser) parseDefBody() (Directive, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &DefBody{Type: typeName, Verb: verb, Body: body, Options: options}, nil
+	return &DefBody{Type: typeName, Verb: verb, Body: body, Options: options, Deps: deps}, nil
 }
 
 // parseDefRunner handles 'defrunner name [setup|cleanup]? { body }' directives.

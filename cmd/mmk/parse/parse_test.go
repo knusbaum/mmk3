@@ -775,6 +775,73 @@ func TestDefBodyNoVerbUnchanged(t *testing.T) {
 	expect(t, "Verb", db.Verb, "")
 }
 
+func TestDefBodyWithDeps(t *testing.T) {
+	f := mustParse(t, `defbody c_library : $(find "$source" -name '*.c' | sed 's/\.c$/.o/') {
+	ar -rcs "$target" "${dep[@]}"
+}`)
+	db, ok := f.Directives[0].(*DefBody)
+	if !ok {
+		t.Fatalf("expected *DefBody, got %T", f.Directives[0])
+	}
+	expect(t, "Type", db.Type, "c_library")
+	if len(db.Deps) != 1 {
+		t.Fatalf("expected 1 dep token, got %d: %v", len(db.Deps), db.Deps)
+	}
+	if !strings.HasPrefix(db.Deps[0], "$(find") {
+		t.Errorf("dep token %q: expected to start with $(find", db.Deps[0])
+	}
+	if db.Body == "" {
+		t.Fatal("expected non-empty body")
+	}
+}
+
+func TestDefBodyWithDepsAndOptions(t *testing.T) {
+	f := mustParse(t, `defbody c_library cflags=-O2 : $(find "$source" -name '*.c' | sed 's/\.c$/.o/') extra_dep {
+	ar -rcs "$target" "${dep[@]}"
+}`)
+	db := f.Directives[0].(*DefBody)
+	expect(t, "Type", db.Type, "c_library")
+	if len(db.Options) != 1 || db.Options[0].Key != "cflags" || db.Options[0].Value != "-O2" {
+		t.Errorf("expected cflags=-O2 option, got %v", db.Options)
+	}
+	if len(db.Deps) != 2 {
+		t.Fatalf("expected 2 deps, got %d: %v", len(db.Deps), db.Deps)
+	}
+	expect(t, "dep[1]", db.Deps[1], "extra_dep")
+}
+
+func TestDefBodyVerbWithDeps(t *testing.T) {
+	f := mustParse(t, `defbody c_library clean : $(find "$source" -name '*.c' | sed 's/\.c$/.o/') {
+	rm -f "$target" "${dep[@]}"
+}`)
+	db := f.Directives[0].(*DefBody)
+	expect(t, "Type", db.Type, "c_library")
+	expect(t, "Verb", db.Verb, "clean")
+	if len(db.Deps) != 1 {
+		t.Fatalf("expected 1 dep, got %d", len(db.Deps))
+	}
+}
+
+func TestDefBodyEmptyDepListAfterColon(t *testing.T) {
+	f := mustParse(t, `defbody c_library : {
+	echo "no deps"
+}`)
+	db := f.Directives[0].(*DefBody)
+	if len(db.Deps) != 0 {
+		t.Errorf("expected 0 deps, got %d: %v", len(db.Deps), db.Deps)
+	}
+}
+
+func TestDefBodyDepsUnchangedWhenAbsent(t *testing.T) {
+	f := mustParse(t, `defbody image {
+	docker build -t "$target" .
+}`)
+	db := f.Directives[0].(*DefBody)
+	if len(db.Deps) != 0 {
+		t.Errorf("expected nil/empty deps, got %v", db.Deps)
+	}
+}
+
 // --- error cases ---
 
 func TestErrorMissingTarget(t *testing.T) {
