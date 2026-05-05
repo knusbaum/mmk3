@@ -1795,9 +1795,10 @@ func (b *Build) expandToken(token, kind string) ([]string, error) {
 }
 
 // expandRuleNames mutates each TargetRule in f, expanding $VAR references in
-// its concrete target name and runner clause using bash. Pattern targets are
-// left untouched (their string is a regex). Both Target and Runner must
-// expand to exactly one word.
+// its concrete target name, runner clause, and option values using bash.
+// Pattern targets are left untouched (their string is a regex). Target and
+// Runner must expand to exactly one word; option values pass through verbatim
+// (spaces preserved) and are only expanded if they contain a '$'.
 func (b *Build) expandRuleNames(f *parse.File) error {
 	for _, d := range f.Directives {
 		r, ok := d.(*parse.TargetRule)
@@ -1824,8 +1825,33 @@ func (b *Build) expandRuleNames(f *parse.File) error {
 			}
 			r.Runner = names[0]
 		}
+		for i, opt := range r.Options {
+			if !strings.Contains(opt.Value, "$") {
+				continue
+			}
+			expanded, err := b.expandOptionValue(opt.Value)
+			if err != nil {
+				return fmt.Errorf("expand option %s=%q: %w", opt.Key, opt.Value, err)
+			}
+			r.Options[i].Value = expanded
+		}
 	}
 	return nil
+}
+
+// expandOptionValue runs an option value through bash so that $VAR and
+// $(...) get expanded against passthrough state, then returns the result
+// verbatim (no word-splitting). Used to make `key=./linux/$ARCH`-style
+// values work — without this, the value is bound to bash with single quotes
+// and never expands.
+func (b *Build) expandOptionValue(value string) (string, error) {
+	cmd := exec.Command("bash", "-c", `. "$MMK_GENFILE"; printf '%s' `+value)
+	cmd.Env = append(os.Environ(), "MMK_GENFILE="+b.genPath)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
 }
 
 // comboTargetName returns the DAG name for a specific matrix combo.

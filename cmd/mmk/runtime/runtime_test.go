@@ -2264,6 +2264,55 @@ c_library mylib.a : {
 
 // --- verb body sees default rule's options ---
 
+// --- option-value $VAR expansion ---
+
+func TestOptionValueExpandsVar(t *testing.T) {
+	// `source=./dir/$SUFFIX` should resolve $SUFFIX from passthrough state at
+	// build registration time, not be bound to bash as the literal string.
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.txt")
+	src := fmt.Sprintf(`SUFFIX=foo
+mytype mytarget source=./dir/$SUFFIX {
+    printf '%%s' "$source" > %q
+}
+deftype mytype { return 1; }
+defbody mytype {
+    :
+}
+`, out)
+	b := newBuild(t, src)
+	n, _ := b.Resolve("mytarget")
+	if err := runForTest(n); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got, _ := os.ReadFile(out)
+	if string(got) != "./dir/foo" {
+		t.Errorf("$SUFFIX should expand in option value; got %q want %q", got, "./dir/foo")
+	}
+}
+
+func TestOptionValueLiteralPassesThroughUnchanged(t *testing.T) {
+	// Values with no $ skip the expansion path and survive unchanged
+	// (e.g. they don't get accidentally word-split or trimmed).
+	dir := t.TempDir()
+	out := filepath.Join(dir, "out.txt")
+	src := fmt.Sprintf(`mytype mytarget flags="--whole-archive  -lfoo" {
+    printf '%%s' "$flags" > %q
+}
+deftype mytype { return 1; }
+defbody mytype { :; }
+`, out)
+	b := newBuild(t, src)
+	n, _ := b.Resolve("mytarget")
+	if err := runForTest(n); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got, _ := os.ReadFile(out)
+	if string(got) != "--whole-archive  -lfoo" {
+		t.Errorf("literal option value should pass through unchanged; got %q", got)
+	}
+}
+
 func TestVerbBodyInheritsDefaultRuleOptions_InheritedVerb(t *testing.T) {
 	// A verb body that inherits from a defbody (no explicit verb rule)
 	// should see the target rule's options.
