@@ -34,15 +34,20 @@
 
 # ---- Source discovery helper -------------------------------------------------
 
-# Used by c_library / c_executable defbody dep clauses to enumerate .c
-# files under $source. recursive=1 triggers a deep find; otherwise we only
-# pick up *.c at the top of $source.
-__c_find_sources() {
-    if [ -n "${recursive:-}" ]; then
-        find "$1" -name '*.c' -type f
-    else
-        find "$1" -maxdepth 1 -name '*.c' -type f
-    fi
+# c_sources <dir>... — list .c files under each directory, in order. Flat by
+# default (only top-level *.c); set recursive=1 in the call's environment to
+# walk subdirs too. Used internally by c_library / c_executable defbody dep
+# clauses; also exposed for use by other rules that need the same source
+# list (e.g. a parallel ASan link that compiles all sources differently).
+c_sources() {
+    local d
+    for d in "$@"; do
+        if [ -n "${recursive:-}" ]; then
+            find "$d" -name '*.c' -type f
+        else
+            find "$d" -maxdepth 1 -name '*.c' -type f
+        fi
+    done
 }
 
 # ---- .o pattern rule ---------------------------------------------------------
@@ -62,7 +67,7 @@ deftype c_library {
     [ -f "$target" ] && (stat -c "%Y" "$target" 2>/dev/null || stat -f "%m" "$target" 2>/dev/null)
 }
 
-defbody c_library : $(__c_find_sources "$source" | sed 's/\.c$/.o/') {
+defbody c_library : $(c_sources "$source" | sed 's/\.c$/.o/') {
     ${AR:-ar} -rcs "$target" "${dep[@]}"
 }
 
@@ -90,7 +95,7 @@ deftype c_executable {
     [ -f "$target" ] && (stat -c "%Y" "$target" 2>/dev/null || stat -f "%m" "$target" 2>/dev/null)
 }
 
-defbody c_executable : $([ -n "${source:-}" ] && __c_find_sources "$source" | sed 's/\.c$/.o/') {
+defbody c_executable : $([ -n "${source:-}" ] && c_sources "$source" | sed 's/\.c$/.o/') {
     ${CC:-gcc} -o "$target" "${dep[@]}" ${ldflags:-}
 }
 
