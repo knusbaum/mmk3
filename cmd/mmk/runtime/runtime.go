@@ -1617,6 +1617,16 @@ func (n *TargetNode) runWithRunner(execute string) error {
 	if n.build.OutputWriter != nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	}
+	// For verb nodes, the default rule's options are layered in below the
+	// verb-rule's own options (matches the verb-body inheritance applied in
+	// runBash for the non-runner path). The combined set determines both
+	// the env passed to the runner script and the MMK_RULE_OPT_KEYS list
+	// runner scripts use to forward values into the body's exec environment.
+	var defaultRule *parse.TargetRule
+	if n.verb != "" {
+		defaultRule = n.build.concretes[n.target]
+	}
+
 	cmd.Env = append(os.Environ(),
 		"MMK_GENFILE="+n.build.genPath,
 		"target="+runnerNode.target,
@@ -1625,13 +1635,26 @@ func (n *TargetNode) runWithRunner(execute string) error {
 		"MMK_EXECUTE="+execute,
 		"MMK_TARGET="+n.target,
 		"MMK_DEPS="+strings.Join(n.explicitDepNames(), " "),
+		// Consumer rule's option keys, space-separated. Runner scripts that
+		// exec the body in a separated environment (the built-in image
+		// runner's `docker exec` is the canonical case) iterate this list to
+		// forward the corresponding values. Without this, rule options like
+		// `c_library libfoo.a source=./foo : on someimage` are visible in
+		// the runner's bash env but never reach the body's bash inside the
+		// container.
+		"MMK_RULE_OPT_KEYS="+mergedRuleOptionKeys(defaultRule, n.rule),
 	)
 	if n.build.Verbose {
 		cmd.Env = append(cmd.Env, "MMK_VERBOSE=1")
 	}
-	// Image (runner) options first, then target options. On collision Go's
-	// os/exec resolves duplicate keys by last-write-wins, so target shadows.
+	// Image (runner) options first; then default-rule options (verb only);
+	// then target/verb options. On collision Go's os/exec resolves duplicate
+	// keys by last-write-wins, so target overrides default, default
+	// overrides runner.
 	cmd.Env = appendRuleOptions(cmd.Env, runnerNode.rule)
+	if defaultRule != nil {
+		cmd.Env = appendRuleOptions(cmd.Env, defaultRule)
+	}
 	cmd.Env = appendRuleOptions(cmd.Env, n.rule)
 	cmd.Env = appendMatrixVars(cmd.Env, n.build.matrixVars[n.target])
 	stdout, stderr := n.bodyWriters()
@@ -2972,6 +2995,47 @@ func appendRuleOptions(env []string, rule *parse.TargetRule) []string {
 		env = append(env, opt.Key+"="+opt.Value)
 	}
 	return env
+}
+
+// ruleOptionKeys returns a space-separated list of the rule's option keys,
+// suitable for shell iteration. Used to plumb consumer-rule option names
+// into runner scripts that need to forward the values to a separate exec
+// environment (e.g. docker exec).
+func ruleOptionKeys(rule *parse.TargetRule) string {
+	if rule == nil || len(rule.Options) == 0 {
+		return ""
+	}
+	keys := make([]string, len(rule.Options))
+	for i, opt := range rule.Options {
+		keys[i] = opt.Key
+	}
+	return strings.Join(keys, " ")
+}
+
+// mergedRuleOptionKeys returns the union of option keys from defaultRule
+// and overlay, defaultRule's keys first, deduped (overlay's are skipped if
+// already present from default). This is the set of option-name env vars
+// that runner scripts should forward into the body's exec environment when
+// executing a verb whose rule (overlay) and the underlying default rule
+// both contribute options.
+func mergedRuleOptionKeys(defaultRule, overlay *parse.TargetRule) string {
+	seen := make(map[string]bool)
+	var keys []string
+	collect := func(r *parse.TargetRule) {
+		if r == nil {
+			return
+		}
+		for _, opt := range r.Options {
+			if seen[opt.Key] {
+				continue
+			}
+			seen[opt.Key] = true
+			keys = append(keys, opt.Key)
+		}
+	}
+	collect(defaultRule)
+	collect(overlay)
+	return strings.Join(keys, " ")
 }
 
 // subprojectSummary captures what's in a (sub-)mmkfile for -list display.

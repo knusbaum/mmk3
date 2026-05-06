@@ -213,6 +213,10 @@ var builtinRunnerDefs = map[string]runnerDefBodies{
 	fi
 	__mmk_extra_env=()
 	for __mmk_v in $forward_env; do __mmk_extra_env+=(-e "$__mmk_v"); done
+	# Forward the consumer rule's option keys too. Without this, options
+	# (e.g. ` + "`source=./src`" + ` on a typed target) are visible in this runner
+	# script's environment but never reach the body's bash inside the container.
+	for __mmk_v in $MMK_RULE_OPT_KEYS; do __mmk_extra_env+=(-e "$__mmk_v"); done
 ` + userFlag + `	docker exec -i $__mmk_tty_flag \
 		"${__mmk_user[@]}" \
 		-e "MMK_TARGET=$MMK_TARGET" \

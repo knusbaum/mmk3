@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/knusbaum/mmk3/cmd/mmk/parse"
 )
 
 func newBuild(t *testing.T, src string) *Build {
@@ -2263,6 +2265,56 @@ c_library mylib.a : {
 }
 
 // --- verb body sees default rule's options ---
+
+// --- ruleOptionKeys ---
+
+func TestRuleOptionKeys_EmptyRule(t *testing.T) {
+	if got := ruleOptionKeys(nil); got != "" {
+		t.Errorf("nil rule: got %q, want empty", got)
+	}
+	if got := ruleOptionKeys(&parse.TargetRule{}); got != "" {
+		t.Errorf("rule with no options: got %q, want empty", got)
+	}
+}
+
+func TestRuleOptionKeys_PreservesOrder(t *testing.T) {
+	r := &parse.TargetRule{Options: []parse.Option{
+		{Key: "alpha", Value: "1"},
+		{Key: "beta", Value: "2"},
+		{Key: "gamma", Value: "3"},
+	}}
+	got := ruleOptionKeys(r)
+	want := "alpha beta gamma"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestMergedRuleOptionKeys(t *testing.T) {
+	def := &parse.TargetRule{Options: []parse.Option{
+		{Key: "build_dir", Value: "build"},
+		{Key: "prefix", Value: "dist"},
+	}}
+	overlay := &parse.TargetRule{Options: []parse.Option{
+		{Key: "prefix", Value: "override"},
+		{Key: "extra", Value: "x"},
+	}}
+	got := mergedRuleOptionKeys(def, overlay)
+	want := "build_dir prefix extra"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+	// Nil cases should not panic.
+	if got := mergedRuleOptionKeys(nil, nil); got != "" {
+		t.Errorf("nil/nil: got %q, want empty", got)
+	}
+	if got := mergedRuleOptionKeys(def, nil); got != "build_dir prefix" {
+		t.Errorf("def/nil: got %q, want %q", got, "build_dir prefix")
+	}
+	if got := mergedRuleOptionKeys(nil, overlay); got != "prefix extra" {
+		t.Errorf("nil/overlay: got %q, want %q", got, "prefix extra")
+	}
+}
 
 // --- option-value $VAR expansion ---
 
