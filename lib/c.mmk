@@ -36,16 +36,18 @@
 
 # c_sources <dir>... — list .c files under each directory, in order. Flat by
 # default (only top-level *.c); set recursive=1 in the call's environment to
-# walk subdirs too. Used internally by c_library / c_executable defbody dep
-# clauses; also exposed for use by other rules that need the same source
-# list (e.g. a parallel ASan link that compiles all sources differently).
+# walk subdirs too. Output is sorted within each directory so builds are
+# reproducible (some link-order behavior, e.g. weak-symbol resolution under
+# the AddressSanitizer interceptor, depends on it). Used internally by
+# c_library / c_executable defbody dep clauses; also exposed for use by other
+# rules that need the same source list.
 c_sources() {
     local d
     for d in "$@"; do
         if [ -n "${recursive:-}" ]; then
-            find "$d" -name '*.c' -type f
+            find "$d" -name '*.c' -type f | sort
         else
-            find "$d" -maxdepth 1 -name '*.c' -type f
+            find "$d" -maxdepth 1 -name '*.c' -type f | sort
         fi
     done
 }
