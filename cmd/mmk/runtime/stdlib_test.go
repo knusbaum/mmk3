@@ -500,44 +500,125 @@ c_library libsrc.a source=./src recursive=1 :
 	}
 }
 
-func TestStdlib_FmtPatternVerbReformats(t *testing.T) {
+func TestStdlib_CLibrary_ObjPathPlacesOutputsUnderBuildTree(t *testing.T) {
+	// obj_path=build retargets the discovered .o paths into a separate tree
+	// so .o files don't litter the source dir. The user's '.o' pattern rule
+	// (or a custom one) compiles source.c into build/source.o.
 	withStdlib(t)
-	if _, err := exec.LookPath("clang-format"); err != nil {
-		t.Skip("clang-format not available")
-	}
-	dir := t.TempDir()
+	dir := makeCFixture(t)
 	t.Chdir(dir)
-	mustWrite(t, dir, "messy.c", "int f( ){return 1;}\n")
-	mustWrite(t, dir, "mmkfile", `include c.mmk
+	mustWrite(t, dir, "mmkfile", `# Project's .o pattern targets build/<path>.o ← <path>.c. Declared
+# before include c.mmk so it wins over the stdlib's generic '(.*)\.o' rule.
+file 'build/(.+)\.o' : $1.c {
+    mkdir -p "$(dirname "$target")"
+    ${CC:-gcc} -c "$1.c" -o "$target"
+}
+
+include c.mmk
+
+c_library build/libsrc.a source=src obj_path=build :
 `)
 	b := newFileBuild(t, dir)
-	n, err := b.ResolveVerb("messy.c", "fmt")
+	n, err := b.Resolve("build/libsrc.a")
 	if err != nil {
-		t.Fatalf("ResolveVerb fmt: %v", err)
+		t.Fatalf("Resolve: %v", err)
+	}
+	got := depTargets(n.Dependencies())
+	wantSet := map[string]bool{"build/src/a.o": true, "build/src/b.o": true}
+	for _, d := range got {
+		delete(wantSet, d)
+	}
+	if len(wantSet) != 0 {
+		t.Errorf("missing expected build-tree .o deps: %v (got %v)", wantSet, got)
 	}
 	if err := runForTest(n); err != nil {
-		t.Fatalf("fmt: %v", err)
+		t.Fatalf("build: %v", err)
 	}
-	got, _ := os.ReadFile(filepath.Join(dir, "messy.c"))
-	if strings.Contains(string(got), "( )") {
-		t.Errorf("fmt should normalize whitespace; got %q", got)
+	for _, p := range []string{"build/libsrc.a", "build/src/a.o", "build/src/b.o"} {
+		if _, err := os.Stat(filepath.Join(dir, p)); err != nil {
+			t.Errorf("expected %s built under obj_path tree: %v", p, err)
+		}
+	}
+	// The default sibling-to-source path should NOT exist.
+	for _, p := range []string{"src/a.o", "src/b.o"} {
+		if _, err := os.Stat(filepath.Join(dir, p)); err == nil {
+			t.Errorf("obj_path should redirect output: %s should not exist", p)
+		}
 	}
 }
 
-func TestStdlib_FmtCheckPatternVerbFailsOnUnformatted(t *testing.T) {
+func TestStdlib_CLibrary_MultiDirSource(t *testing.T) {
+	// source="a b" scans multiple directories for .c files. All resulting
+	// .o files end up in the same archive.
 	withStdlib(t)
-	if _, err := exec.LookPath("clang-format"); err != nil {
-		t.Skip("clang-format not available")
-	}
-	dir := t.TempDir()
+	dir := makeCFixture(t)
 	t.Chdir(dir)
-	mustWrite(t, dir, "messy.c", "int f( ){return 1;}\n")
+	mustWrite(t, dir, "extra/x.c", "int x_func() { return 7; }\n")
 	mustWrite(t, dir, "mmkfile", `include c.mmk
+
+c_library libcombined.a source="src extra" :
 `)
 	b := newFileBuild(t, dir)
-	n, _ := b.ResolveVerb("messy.c", "fmt-check")
-	err := runForTest(n)
-	if err == nil {
-		t.Error("fmt-check should fail on unformatted source")
+	n, _ := b.Resolve("libcombined.a")
+	got := depTargets(n.Dependencies())
+	wantSet := map[string]bool{
+		"src/a.o":   true,
+		"src/b.o":   true,
+		"extra/x.o": true,
+	}
+	for _, d := range got {
+		delete(wantSet, d)
+	}
+	if len(wantSet) != 0 {
+		t.Errorf("multi-dir source= missed: %v (got %v)", wantSet, got)
+	}
+	if err := runForTest(n); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "libcombined.a")); err != nil {
+		t.Errorf("libcombined.a not produced: %v", err)
 	}
 }
+
+func TestStdlib_CExecutable_ObjPathAndMultiDir(t *testing.T) {
+	// c_executable picks up obj_path and multi-dir source= the same way as
+	// c_library — both go through c_objects in c.mmk.
+	withStdlib(t)
+	dir := makeCFixture(t)
+	t.Chdir(dir)
+	mustWrite(t, dir, "extra/x.c", "int x_func() { return 7; }\n")
+	mustWrite(t, dir, "mmkfile", `file 'build/(.+)\.o' : $1.c {
+    mkdir -p "$(dirname "$target")"
+    ${CC:-gcc} -c "$1.c" -o "$target"
+}
+
+include c.mmk
+
+c_executable build/myapp source="src extra" obj_path=build : build/main.o
+`)
+	b := newFileBuild(t, dir)
+	n, err := b.Resolve("build/myapp")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	got := depTargets(n.Dependencies())
+	wantSet := map[string]bool{
+		"build/src/a.o":   true,
+		"build/src/b.o":   true,
+		"build/extra/x.o": true,
+		"build/main.o":    true,
+	}
+	for _, d := range got {
+		delete(wantSet, d)
+	}
+	if len(wantSet) != 0 {
+		t.Errorf("c_executable missed expected deps: %v (got %v)", wantSet, got)
+	}
+	if err := runForTest(n); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "build/myapp")); err != nil {
+		t.Errorf("build/myapp not produced: %v", err)
+	}
+}
+
