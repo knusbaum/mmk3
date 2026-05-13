@@ -67,25 +67,39 @@ var statMtime = func() string {
 
 // BuiltinDefTypes contains the built-in deftype body (bash printing a timestamp)
 // for each built-in type. A user deftype with the same name overrides these.
+//
+// directory's deftype reports a fixed-low date (1) when the directory exists
+// so that consumers ("file foo : src.c bar_dir") don't see the directory's
+// own mtime — which would otherwise rise every time a file is added or
+// removed from it, churning every consumer. Absence still returns non-zero
+// (the defbody then runs `mkdir -p`).
 var BuiltinDefTypes = map[string]string{
-	"file":   statMtime,
-	"image":  "\n\tdocker inspect --format '{{.Created}}' \"$target\" 2>/dev/null || return 1\n",
-	"source": statMtime,
+	"file":      statMtime,
+	"image":     "\n\tdocker inspect --format '{{.Created}}' \"$target\" 2>/dev/null || return 1\n",
+	"source":    statMtime,
+	"directory": "\n\t[ -d \"$target\" ] && echo 1 || return 1\n",
 }
 
 // BuiltinDefBodies contains the built-in default body for each built-in type.
 // A user defbody for the same type name overrides these.
 var BuiltinDefBodies = map[string]string{
-	"file":   "\n\t[[ -e \"$target\" ]] && return 0\n\tprintf 'mmk: %s does not exist and has no rule to create it\\n' \"$target\" >&2; return 1\n",
-	"image":  "\n\tif [[ -n \"$deps\" ]]; then\n\t\tdocker build ${platform:+--platform \"$platform\"} -t \"$target\" -f \"${deps%% *}\" .\n\telse\n\t\tdocker pull ${platform:+--platform \"$platform\"} \"$target\"\n\tfi\n",
-	"source": "\n\t[[ -e \"$target\" ]] && return 0\n\tprintf 'mmk: %s does not exist and has no rule to create it\\n' \"$target\" >&2; return 1\n",
+	"file":      "\n\t[[ -e \"$target\" ]] && return 0\n\tprintf 'mmk: %s does not exist and has no rule to create it\\n' \"$target\" >&2; return 1\n",
+	"image":     "\n\tif [[ -n \"$deps\" ]]; then\n\t\tdocker build ${platform:+--platform \"$platform\"} -t \"$target\" -f \"${deps%% *}\" .\n\telse\n\t\tdocker pull ${platform:+--platform \"$platform\"} \"$target\"\n\tfi\n",
+	"source":    "\n\t[[ -e \"$target\" ]] && return 0\n\tprintf 'mmk: %s does not exist and has no rule to create it\\n' \"$target\" >&2; return 1\n",
+	"directory": "\n\tmkdir -p \"$target\"\n",
 }
 
 // BuiltinVerbBodies contains the built-in verb body for (type, verb) pairs.
 // A user defbody for the same type+verb overrides these.
+//
+// directory clean uses rm -rf so it works even when files in the directory
+// haven't been cleaned yet (matching what a user typically wants from
+// "clean the directory"). The file type's `rm -f` is the analog for one
+// artifact; this is the analog for a tree.
 var BuiltinVerbBodies = map[string]map[string]string{
-	"file":  {"clean": "\n\trm -f \"$target\"\n"},
-	"image": {"clean": "\n\tdocker image inspect \"$target\" >/dev/null 2>&1 || return 0\n\tdocker image rm -f \"$target\"\n"},
+	"file":      {"clean": "\n\trm -f \"$target\"\n"},
+	"image":     {"clean": "\n\tdocker image inspect \"$target\" >/dev/null 2>&1 || return 0\n\tdocker image rm -f \"$target\"\n"},
+	"directory": {"clean": "\n\trm -rf \"$target\"\n"},
 }
 
 // DefBodyOptionsKey identifies a (type, verb) pair for built-in defbody options.
@@ -238,7 +252,7 @@ var builtinRunnerDefs = map[string]runnerDefBodies{
 var builtinRunnerOrder = []string{"image"}
 
 // builtinOrder lists built-in types in a deterministic emit order.
-var builtinOrder = []string{"source", "file", "image"}
+var builtinOrder = []string{"source", "file", "directory", "image"}
 
 // Generate writes bash function definitions for all directives in f to w.
 // frozen is pre-evaluated content that replaces all passthrough directives;

@@ -273,16 +273,29 @@ docstring.
 
 A type tells `mmk` how to determine when an artifact was last built. Built-in:
 
-| Type     | Freshness check                          | Default body                                | Clean verb        |
-|----------|------------------------------------------|---------------------------------------------|-------------------|
-| `source` | mtime (`stat`)                           | error if file absent                        | none              |
-| `file`   | mtime (`stat`)                           | error if file absent                        | `rm -f "$target"` |
-| `image`  | `docker inspect --format '{{.Created}}'` | `docker build -t $target -f ${deps%% *} .`  | `docker image rm` |
+| Type        | Freshness check                          | Default body                                | Clean verb         |
+|-------------|------------------------------------------|---------------------------------------------|--------------------|
+| `source`    | mtime (`stat`)                           | error if file absent                        | none               |
+| `file`      | mtime (`stat`)                           | error if file absent                        | `rm -f "$target"`  |
+| `directory` | exists (`test -d`); fixed-low mtime once present | `mkdir -p "$target"`                   | `rm -rf "$target"` |
+| `image`     | `docker inspect --format '{{.Created}}'` | `docker build -t $target -f ${deps%% *} .`  | `docker image rm`  |
 
 `source` vs `file`: both are mtime-based. `source` is inferred for any dep
 with no rule and no matching pattern — it represents an existing file `mmk`
 didn't create and shouldn't delete (no clean verb). `file` is for build
 artifacts.
+
+`directory` is for "this directory needs to exist before a consumer's body
+runs." Once present, its freshness check returns a fixed-low timestamp
+(epoch 1) instead of the dir's actual mtime — otherwise every file added
+to or removed from the dir would churn every consumer that depends on it.
+Use it to declare build-tree directories without sprinkling `mkdir -p` in
+every recipe:
+
+```bash
+directory build/src :
+file build/src/foo.o : foo.c build/src { cc -c foo.c -o $target }
+```
 
 Print all built-in definitions as mmk syntax with `mmk -builtins`.
 

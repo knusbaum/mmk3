@@ -76,6 +76,7 @@ ANY_OTHER_LINE                          # treated as raw bash
 | You want to... | Use this |
 |---|---|
 | Make sure something stays up to date as a file on disk | `file T : deps { ... }` |
+| Make sure a directory exists before a consumer runs | `directory build/sub :` and dep on it |
 | Reference an existing file mmk doesn't build | Just name it as a dep — mmk infers `source` |
 | Define an always-run task (no caching, no artifact) | Untyped: `T : deps { ... }` |
 | Aggregate several builds under one name | Untyped, deps only: `all : a b c` |

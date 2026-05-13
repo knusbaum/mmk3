@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -764,6 +765,160 @@ func TestDefrunnerIsAccepted(t *testing.T) {
 	_, err := NewBuild([]byte(`defrunner myrunner { echo run }`))
 	if err != nil {
 		t.Fatalf("unexpected error for valid defrunner: %v", err)
+	}
+}
+
+// --- built-in directory type ---
+
+func TestDirectoryTypeCreatesDir(t *testing.T) {
+	// `directory <path>` with no body uses the built-in defbody, which runs
+	// `mkdir -p`. After Run, the directory exists.
+	dir := t.TempDir()
+	target := filepath.Join(dir, "out", "nested")
+	src := fmt.Sprintf(`directory %q :`, target)
+	b := newBuild(t, src)
+	n, err := b.Resolve(target)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if err := runForTest(n); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatalf("stat after Run: %v", err)
+	}
+	if !info.IsDir() {
+		t.Errorf("expected %q to be a directory", target)
+	}
+}
+
+func TestDirectoryTypeAbsentTriggersBuild(t *testing.T) {
+	// When the directory doesn't exist, deftype returns nonzero ⇒ Date is
+	// the zero time, NeedsRun returns true, defbody runs.
+	dir := t.TempDir()
+	target := filepath.Join(dir, "missing")
+	src := fmt.Sprintf(`directory %q :`, target)
+	b := newBuild(t, src)
+	n, _ := b.Resolve(target)
+	needs, err := n.NeedsRun()
+	if err != nil {
+		t.Fatalf("NeedsRun: %v", err)
+	}
+	if !needs {
+		t.Errorf("NeedsRun before mkdir: want true, got false")
+	}
+}
+
+func TestDirectoryTypeFixedDate(t *testing.T) {
+	// Once the directory exists, deftype reports a fixed small mtime (epoch 1)
+	// so consumers don't churn when files inside the dir are added/removed.
+	dir := t.TempDir()
+	target := filepath.Join(dir, "out")
+	src := fmt.Sprintf(`directory %q :`, target)
+	b := newBuild(t, src)
+	n, _ := b.Resolve(target)
+	if err := runForTest(n); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	date, err := n.Date()
+	if err != nil {
+		t.Fatalf("Date: %v", err)
+	}
+	if date.Unix() != 1 {
+		t.Errorf("Date after creation: got %d, want 1 (fixed-low so consumers don't churn)", date.Unix())
+	}
+	// Touch a file inside the directory — its mtime shouldn't bleed through
+	// to consumers as a "newer than them" signal.
+	stamp := filepath.Join(target, "x")
+	if err := os.WriteFile(stamp, nil, 0o644); err != nil {
+		t.Fatalf("write inside dir: %v", err)
+	}
+	// Clear cached Date so we re-stat.
+	n.dateOnce = sync.Once{}
+	n.dateVal = time.Time{}
+	date2, err := n.Date()
+	if err != nil {
+		t.Fatalf("Date second call: %v", err)
+	}
+	if date2.Unix() != 1 {
+		t.Errorf("Date after content change: got %d, want 1 (dir mtime must not propagate)", date2.Unix())
+	}
+}
+
+func TestDirectoryTypeCleanRemovesTree(t *testing.T) {
+	// Clean verb is rm -rf — removes the directory and any contents.
+	dir := t.TempDir()
+	target := filepath.Join(dir, "out")
+	src := fmt.Sprintf(`directory %q :`, target)
+	b := newBuild(t, src)
+	n, _ := b.Resolve(target)
+	if err := runForTest(n); err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	stamp := filepath.Join(target, "leftover")
+	if err := os.WriteFile(stamp, nil, 0o644); err != nil {
+		t.Fatalf("write inside dir: %v", err)
+	}
+	cleanNode, err := b.ResolveVerb(target, "clean")
+	if err != nil {
+		t.Fatalf("ResolveVerb clean: %v", err)
+	}
+	if err := runForTest(cleanNode); err != nil {
+		t.Fatalf("clean Run: %v", err)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Errorf("after clean: dir should be gone, stat err = %v", err)
+	}
+}
+
+func TestDirectoryTypeCreatesParents(t *testing.T) {
+	// `mkdir -p` semantics: declaring `directory a/b/c :` should create a,
+	// a/b, AND a/b/c without the user having to declare each level.
+	dir := t.TempDir()
+	target := filepath.Join(dir, "a", "b", "c")
+	src := fmt.Sprintf(`directory %q :`, target)
+	b := newBuild(t, src)
+	n, _ := b.Resolve(target)
+	if err := runForTest(n); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	for _, path := range []string{
+		filepath.Join(dir, "a"),
+		filepath.Join(dir, "a", "b"),
+		filepath.Join(dir, "a", "b", "c"),
+	} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Errorf("expected %q to exist: %v", path, err)
+			continue
+		}
+		if !info.IsDir() {
+			t.Errorf("expected %q to be a directory", path)
+		}
+	}
+}
+
+func TestDirectoryAsDependency(t *testing.T) {
+	// The typical use: a build artifact lists the directory as a dep so the
+	// dir exists before the artifact's body runs.
+	dir := t.TempDir()
+	dirTarget := filepath.Join(dir, "out", "sub")
+	fileTarget := filepath.Join(dirTarget, "stamp")
+	src := fmt.Sprintf(`directory %q :
+file %q : %q {
+    touch "$target"
+}`, dirTarget, fileTarget, dirTarget)
+	b := newBuild(t, src)
+	n, err := b.Resolve(fileTarget)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if err := runForTest(n); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if _, err := os.Stat(fileTarget); err != nil {
+		t.Errorf("file dep on dir should have created file: %v", err)
 	}
 }
 
