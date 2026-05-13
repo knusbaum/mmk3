@@ -397,10 +397,10 @@ type model struct {
 
 func initialModel(t treeData, ring *logRing, b *runtime.Build) model {
 	return model{
-		tree:           t,
-		ring:           ring,
-		build:          b,
-		graphView:      true,
+		tree:  t,
+		ring:  ring,
+		build: b,
+		//graphView:      true,
 		dagGroupMatrix: true,
 	}
 }
