@@ -32,7 +32,7 @@ func (b *Build) GraphTo(w io.Writer, target, verb string, full bool) error {
 	if err != nil {
 		return err
 	}
-	if err := checkVerbApplicable(root); err != nil {
+	if err := checkVerbHasTargets(root); err != nil {
 		return err
 	}
 
@@ -228,7 +228,7 @@ func visibleDeps(n *TargetNode, inGraph map[*TargetNode]bool) []displayDep {
 		if d.kind == kindRunner {
 			continue
 		}
-		if shouldPruneVerbSubtree(d) {
+		if shouldPruneVerbSubgraph(d) {
 			continue
 		}
 		result = append(result, displayDep{node: d, orderly: false})
@@ -240,7 +240,7 @@ func visibleDeps(n *TargetNode, inGraph map[*TargetNode]bool) []displayDep {
 		if !inGraph[d] {
 			continue
 		}
-		if shouldPruneVerbSubtree(d) {
+		if shouldPruneVerbSubgraph(d) {
 			continue
 		}
 		result = append(result, displayDep{node: d, orderly: true})
@@ -248,14 +248,14 @@ func visibleDeps(n *TargetNode, inGraph map[*TargetNode]bool) []displayDep {
 	return result
 }
 
-// shouldPruneVerbSubtree returns true when n is a verb node whose entire
-// subtree contains no executable verb body. Non-verb nodes are never pruned
-// — they're real build steps. A verb node with its own body is never pruned.
-// A virtual / inherited verb node (no own body) is pruned only when none of
-// its descendants has work either.
-func shouldPruneVerbSubtree(n *TargetNode) bool {
+// shouldPruneVerbSubgraph returns true when n is a verb node whose entire
+// dependency subgraph contains no node with a body to run. Non-verb nodes
+// are never pruned — they're real build steps. A verb node with its own
+// body is never pruned. A virtual / inherited verb node (no own body) is
+// pruned only when none of its descendants has work either.
+func shouldPruneVerbSubgraph(n *TargetNode) bool {
 	if n.verb == "" {
 		return false
 	}
-	return !hasApplicableVerbBody(n, make(map[*TargetNode]bool))
+	return !subgraphHasBody(n, make(map[*TargetNode]bool))
 }

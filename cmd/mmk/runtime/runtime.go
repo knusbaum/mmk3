@@ -705,33 +705,36 @@ func (b *Build) Prepare(target, verb string) error {
 	return err
 }
 
-// checkVerbApplicable returns an error if root is a verb node and no node in
-// its dependency tree has a non-empty body for that verb. This catches the
-// case where a verb is defined elsewhere in the project but doesn't apply to
-// any target reachable from the requested root — `mmk foop all` where `foop`
-// only has a rule for some target outside `all`'s subtree.
-func checkVerbApplicable(root *TargetNode) error {
+// checkVerbHasTargets returns an error when invoking [verb target] would
+// produce a no-op: nothing in the dependency graph has a body to run. This
+// catches typos like `mmk chekc all` — `chekc` isn't defined anywhere, verb
+// inheritance creates a graph of empty verb nodes, and without this guard
+// mmk would silently exit 0 having done nothing.
+//
+// A non-verb node in the graph always counts as work: non-verb deps only
+// appear in a verb node's graph via the user's explicit `:` or `:+` clause
+// (inherited deps are always verb-applied via inheritedVerbDeps), so they
+// are direct user intent.
+func checkVerbHasTargets(root *TargetNode) error {
 	if root.verb == "" {
 		return nil
 	}
-	if hasApplicableVerbBody(root, make(map[*TargetNode]bool)) {
+	if subgraphHasBody(root, make(map[*TargetNode]bool)) {
 		return nil
 	}
-	return fmt.Errorf("verb %q has no applicable rule in the dependency tree of [%s %s]", root.verb, root.verb, root.target)
+	return fmt.Errorf("verb %q on %q has no targets with bodies in its dependency graph", root.verb, root.target)
 }
 
-func hasApplicableVerbBody(n *TargetNode, seen map[*TargetNode]bool) bool {
+func subgraphHasBody(n *TargetNode, seen map[*TargetNode]bool) bool {
 	if seen[n] {
 		return false
 	}
 	seen[n] = true
-	if n.verb != "" {
-		if _, has := n.executeScript(); has {
-			return true
-		}
+	if _, has := n.executeScript(); has {
+		return true
 	}
 	for _, dep := range n.Dependencies() {
-		if hasApplicableVerbBody(dep, seen) {
+		if subgraphHasBody(dep, seen) {
 			return true
 		}
 	}
@@ -752,7 +755,7 @@ func (b *Build) Execute(target, verb string, parallelism int) error {
 	if err != nil {
 		return err
 	}
-	if err := checkVerbApplicable(root); err != nil {
+	if err := checkVerbHasTargets(root); err != nil {
 		return err
 	}
 	if !b.Verbose {
@@ -1009,7 +1012,7 @@ func (n *TargetNode) DisplayDeps() []*TargetNode {
 		if d.kind == kindRunner {
 			continue
 		}
-		if shouldPruneVerbSubtree(d) {
+		if shouldPruneVerbSubgraph(d) {
 			continue
 		}
 		out = append(out, d)

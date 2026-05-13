@@ -1792,8 +1792,8 @@ foo :
 	}
 }
 
-func TestExecuteRejectsVerbWithNoApplicableRule(t *testing.T) {
-	// `foop` is defined for `weird`, but not for anything in `all`'s subtree.
+func TestExecuteRejectsVerbWithNoTargetsInGraph(t *testing.T) {
+	// `foop` is defined for `weird`, but not for anything in `all`'s graph.
 	src := `
 all : foo
 foo :
@@ -1806,12 +1806,12 @@ weird {
 `
 	b := newBuild(t, src)
 	err := b.Execute("all", "foop", 0)
-	if err == nil || !strings.Contains(err.Error(), "no applicable rule") {
-		t.Fatalf("expected 'no applicable rule' error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), "no targets with bodies") {
+		t.Fatalf("expected 'no targets with bodies' error, got %v", err)
 	}
 }
 
-func TestGraphPrunesEmptyVerbSubtrees(t *testing.T) {
+func TestGraphPrunesEmptyVerbSubgraphs(t *testing.T) {
 	// `all` has deps `foo` (with [test foo] rule) and `bar` (no [test bar]).
 	// `mmk -graph test all` should prune [test bar] but keep [test foo].
 	src := `
@@ -1849,6 +1849,94 @@ foo :
 	b := newBuild(t, src)
 	if err := b.Execute("all", "clean", 0); err != nil {
 		t.Errorf("expected verb-inheritance to succeed, got %v", err)
+	}
+}
+
+// A verb rule whose explicit deps are plain (non-verb) targets with real
+// bodies is fully defined: the verb's "work" is the deps. checkVerbHasTargets
+// should not reject it.
+func TestVerbWithExplicitNonVerbDepsExecutes(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	mustWrite(t, dir, "mmkfile", `
+leaf {
+    touch leaf.stamp
+}
+[test all] : leaf
+`)
+	b := newFileBuild(t, dir)
+	if err := b.Execute("all", "test", 0); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "leaf.stamp")); err != nil {
+		t.Errorf("expected leaf body to run; %v", err)
+	}
+}
+
+// `[test all] : a b c` with several non-verb deps, each with a body, runs
+// all three (and would parallelize under -j > 1).
+func TestVerbWithMultipleNonVerbDepsRunsAll(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	mustWrite(t, dir, "mmkfile", `
+a { touch a.stamp }
+b { touch b.stamp }
+c { touch c.stamp }
+[test all] : a b c
+`)
+	b := newFileBuild(t, dir)
+	if err := b.Execute("all", "test", 0); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	for _, name := range []string{"a.stamp", "b.stamp", "c.stamp"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Errorf("expected %s; %v", name, err)
+		}
+	}
+}
+
+// `[verb all] :+ leaf` mixes an explicit non-verb dep with the inherited
+// verb-applied deps. Both halves should run.
+func TestVerbAugmentMixingNonVerbAndInheritedExecutes(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	mustWrite(t, dir, "mmkfile", `
+all : inherited
+inherited :
+[test inherited] { touch inherited.stamp }
+leaf { touch leaf.stamp }
+[test all] :+ leaf
+`)
+	b := newFileBuild(t, dir)
+	if err := b.Execute("all", "test", 0); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	for _, name := range []string{"inherited.stamp", "leaf.stamp"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Errorf("expected %s; %v", name, err)
+		}
+	}
+}
+
+// When an explicit non-verb dep references an undeclared target, mmk infers
+// a source rule for it. The static checkVerbHasTargets accepts this (the
+// source body counts as work), and the runtime then surfaces the missing
+// source via the source-rule body (which prints to stderr) — better than
+// the previous misleading "no applicable rule" message.
+func TestVerbWithUndeclaredNonVerbDepFailsAtRuntime(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	mustWrite(t, dir, "mmkfile", `[test all] : nosuchfile.c
+`)
+	b := newFileBuild(t, dir)
+	err := b.Execute("all", "test", 0)
+	if err == nil {
+		t.Fatal("expected error from missing source dep")
+	}
+	// The check passed (no "no targets with bodies"), so the failure is the
+	// runtime source-existence check, not the static check.
+	if strings.Contains(err.Error(), "no targets with bodies") {
+		t.Errorf("expected runtime failure, not static check failure: %v", err)
 	}
 }
 
