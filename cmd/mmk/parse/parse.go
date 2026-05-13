@@ -5,7 +5,7 @@
 //	file       := (directive | newline | comment)*
 //	directive  := deftype | defrunner | target_rule
 //	deftype    := 'deftype' name body
-//	defrunner  := 'defrunner' name ('setup' | 'cleanup')? body
+//	defrunner  := 'defrunner' name ('setup' | 'cleanup')? (':' dep*)? body
 //	target_rule:= type? (target|pattern) ('on' runner)? (':' dep*)? body?
 //	body       := '{' ... '}' (balanced braces, arbitrary content)
 //	name       := word | string
@@ -51,10 +51,29 @@ type DefType struct {
 // once after the mmk execution finishes. $target, $deps, and $MMK_GENFILE are
 // available in all phases; the run phase additionally receives $MMK_RUNNER_STATE,
 // $MMK_FUNC, $MMK_TARGET, and $MMK_DEPS.
+//
+// Deps is the optional dep list from a `defrunner T : depexpr ... { ... }` form
+// on the run-stage definition. Each entry is a raw bash token (commonly a
+// $(...) substitution) evaluated at graph construction time, per runner
+// instance, with the runner's options and passthrough vars in scope. The
+// output is word-split and the resulting names are appended to the dep list
+// of every target that says `on T`, augmenting (not replacing) the target's
+// own explicit deps. Default when absent: the runner target itself is
+// auto-added as a dep (the historical behavior).
+//
+// Only valid on the run-stage form (Phase == ""). A dep clause on a setup or
+// cleanup defrunner is a parse error.
+//
+// HasDeps distinguishes "no `:` written" (the type contributes its runner
+// target as a dep — the historical default) from "`:` written with an empty
+// list" (the type contributes nothing, useful for opting out entirely).
+// Deps is non-nil iff HasDeps is true and at least one token was supplied.
 type DefRunner struct {
-	Name  string
-	Phase string // "", "setup", or "cleanup"
-	Body  string
+	Name    string
+	Phase   string // "", "setup", or "cleanup"
+	Body    string
+	HasDeps bool
+	Deps    []string
 }
 
 // Group declares a named pool that targets can register into via `into <name>`.
@@ -911,9 +930,15 @@ func (p *parser) parseDefBody() (Directive, error) {
 	return &DefBody{Type: typeName, Verb: verb, Body: body, Options: options, Deps: deps}, nil
 }
 
-// parseDefRunner handles 'defrunner name [setup|cleanup]? { body }' directives.
+// parseDefRunner handles 'defrunner name [setup|cleanup]? [: dep ...]? { body }'.
 // An optional phase word ("setup" or "cleanup") may appear on the same line as
 // the name, before the opening brace. Omitting the phase defines the run body.
+//
+// An optional ':' (only on the run-stage form — no phase word) introduces a
+// dep list. Each token is a raw bash expression (commonly $(...)) evaluated
+// at graph construction time, per runner instance. The output is word-split
+// and the resulting names are appended to the dep list of every target that
+// says `on <name>`. See DefRunner.Deps.
 func (p *parser) parseDefRunner() (Directive, error) {
 	p.s.readWord() // consume "defrunner"
 	name, err := p.parseName()
@@ -922,7 +947,7 @@ func (p *parser) parseDefRunner() (Directive, error) {
 	}
 	p.s.skipHorizontalSpace()
 	var phase string
-	if b := p.s.peek(); b != 0 && b != '\n' && b != '{' && b != '#' {
+	if b := p.s.peek(); b != 0 && b != '\n' && b != '{' && b != '#' && b != ':' {
 		if isWordByte(b) || b == '"' {
 			phase, err = p.parseName()
 			if err != nil {
@@ -932,6 +957,28 @@ func (p *parser) parseDefRunner() (Directive, error) {
 	}
 	if phase != "" && phase != "setup" && phase != "cleanup" {
 		return nil, fmt.Errorf("line %d: defrunner %s: unknown phase %q (want \"setup\" or \"cleanup\")", p.s.line, name, phase)
+	}
+	var deps []string
+	hasDeps := false
+	p.s.skipHorizontalSpace()
+	if p.s.peek() == ':' {
+		if phase != "" {
+			return nil, fmt.Errorf("line %d: defrunner %s %s: dep clause is only valid on the run-stage form (no phase)", p.s.line, name, phase)
+		}
+		hasDeps = true
+		p.s.advance()
+		for {
+			p.s.skipHorizontalSpace()
+			b := p.s.peek()
+			if b == '\n' || b == 0 || b == '{' || b == '#' {
+				break
+			}
+			depName, err := p.parseName()
+			if err != nil {
+				return nil, fmt.Errorf("defrunner %s deps: %w", name, err)
+			}
+			deps = append(deps, depName)
+		}
 	}
 	p.skipWhitespaceAndComments()
 	if p.s.peek() != '{' {
@@ -943,7 +990,7 @@ func (p *parser) parseDefRunner() (Directive, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &DefRunner{Name: name, Phase: phase, Body: body}, nil
+	return &DefRunner{Name: name, Phase: phase, Body: body, HasDeps: hasDeps, Deps: deps}, nil
 }
 
 // parseSubproject handles 'subproject NAME [on RUNNER] [key=value ...]'.

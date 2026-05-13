@@ -103,6 +103,8 @@ type Build struct {
 	defVerbBodies      map[defVerbBodyKey]bool
 	userDefBodyOptions map[defVerbBodyKey][]parse.Option // user defbody options keyed by (type, verb)
 	defBodyDeps        map[defVerbBodyKey][]string       // user defbody dep tokens keyed by (type, verb)
+	defRunnerDeps      map[string][]string               // defrunner dep tokens keyed by runner type name (nil means: type does not customize, use default)
+	defRunnerDepsCache map[string][]string               // resolved runner-instance dep names, keyed by runner target name; cached so the dep-clause bash runs once per runner instance
 	subprojects        map[string]*subprojectInfo        // subproject target → metadata for sub-path delegation
 	matrixInfo     map[string]*matrixRuleInfo // base target → matrix info (for aggregators and dep resolution)
 	matrixVars     map[string]matrixCombo     // internal combo target name → its variable assignments
@@ -366,6 +368,8 @@ func newBuildFromAST(f *parse.File) (*Build, error) {
 		defVerbBodies:      make(map[defVerbBodyKey]bool),
 		userDefBodyOptions: make(map[defVerbBodyKey][]parse.Option),
 		defBodyDeps:        make(map[defVerbBodyKey][]string),
+		defRunnerDeps:      make(map[string][]string),
+		defRunnerDepsCache: make(map[string][]string),
 		subprojects:        make(map[string]*subprojectInfo),
 		matrixInfo:         make(map[string]*matrixRuleInfo),
 		matrixVars:         make(map[string]matrixCombo),
@@ -378,6 +382,11 @@ func newBuildFromAST(f *parse.File) (*Build, error) {
 	// Populate runnerDefs from built-in definitions.
 	for typeName, info := range gen.BuiltinRunnerDefs {
 		b.runnerDefs[typeName] = runnerDefInfo{hasSetup: info.HasSetup, hasCleanup: info.HasCleanup}
+		// Built-in runner dep clause (e.g. image's skip-aware $(__mmk_runner_deps_image)).
+		// A user-supplied run-stage defrunner for this type takes over below.
+		if len(info.Deps) > 0 {
+			b.defRunnerDeps[typeName] = info.Deps
+		}
 	}
 	// Layer user defrunner phases on top.
 	for _, d := range f.Directives {
@@ -388,6 +397,17 @@ func newBuildFromAST(f *parse.File) (*Build, error) {
 				info.hasSetup = true
 			case "cleanup":
 				info.hasCleanup = true
+			default:
+				// Run-stage form. A user run-stage defrunner replaces any
+				// built-in dep clause for this type — even if the user
+				// omitted the `:` (no clause = historical "auto-add R"
+				// default), that's still an opt-in choice that overrides
+				// what mmk shipped for the type.
+				if dr.HasDeps {
+					b.defRunnerDeps[dr.Name] = dr.Deps
+				} else {
+					delete(b.defRunnerDeps, dr.Name)
+				}
 			}
 			b.runnerDefs[dr.Name] = info
 		}
@@ -970,7 +990,24 @@ func (n *TargetNode) Dependencies() []*TargetNode {
 	n.depsBuilt = true
 
 	if n.kind == kindRunner {
-		n.deps = []*TargetNode{n.runnerFor}
+		// The synthetic runner node's deps come from the runner type's dep
+		// clause (default: the runner target itself). If the clause elides
+		// the runner target — e.g., image's skip-aware clause when we're
+		// already inside a container — the setup phase has nothing to wait
+		// on and won't attempt the docker build / pull either.
+		injected, err := n.build.runnerInjectedDepNames(n.runnerFor.target)
+		if err != nil {
+			n.resolveErr = err
+			return n.deps
+		}
+		for _, name := range injected {
+			depNode, err := n.build.Resolve(name)
+			if err != nil {
+				n.resolveErr = err
+				return n.deps
+			}
+			n.deps = append(n.deps, depNode)
+		}
 		return n.deps
 	}
 
@@ -1060,14 +1097,39 @@ func (n *TargetNode) Dependencies() []*TargetNode {
 		}
 	}
 	if n.rule.Runner != "" {
-		runnerNode, err := n.build.Resolve(n.rule.Runner)
-		if err != nil {
+		if err := n.appendRunnerDeps(); err != nil {
 			n.resolveErr = err
 			return n.deps
 		}
-		n.deps = append(n.deps, runnerNode, n.build.runnerNode(runnerNode))
 	}
 	return n.deps
+}
+
+// appendRunnerDeps resolves the deps a target acquires from its `on R` clause
+// — the runner-type's defrunner dep clause (default: R itself) plus the
+// synthetic runner setup node. Used by both the default-build and verb-rule
+// dep-resolution paths so the rules see consistent edges.
+func (n *TargetNode) appendRunnerDeps() error {
+	runnerNode, err := n.build.Resolve(n.rule.Runner)
+	if err != nil {
+		return err
+	}
+	injected, err := n.build.runnerInjectedDepNames(n.rule.Runner)
+	if err != nil {
+		return err
+	}
+	for _, name := range injected {
+		depNode, err := n.build.Resolve(name)
+		if err != nil {
+			return err
+		}
+		n.deps = append(n.deps, depNode)
+	}
+	// The synthetic runner setup node always fires so the runner's setup
+	// phase can establish state (e.g. emit the skip sentinel) before the
+	// consumer's body runs through the runner's run phase.
+	n.deps = append(n.deps, n.build.runnerNode(runnerNode))
+	return nil
 }
 
 // appendDefBodyDeps evaluates the dep clause of the build-verb defbody for
@@ -1191,24 +1253,20 @@ func (n *TargetNode) verbDependencies() []*TargetNode {
 			n.deps = append(n.deps, n.inheritedVerbDeps()...)
 		}
 		if n.rule.Runner != "" {
-			runnerNode, err := n.build.Resolve(n.rule.Runner)
-			if err != nil {
+			if err := n.appendRunnerDeps(); err != nil {
 				n.resolveErr = err
 				return n.deps
 			}
-			n.deps = append(n.deps, runnerNode, n.build.runnerNode(runnerNode))
 		}
 		return n.deps
 	}
 
 	n.deps = append(n.deps, n.inheritedVerbDeps()...)
 	if n.rule != nil && n.rule.Runner != "" {
-		runnerNode, err := n.build.Resolve(n.rule.Runner)
-		if err != nil {
+		if err := n.appendRunnerDeps(); err != nil {
 			n.resolveErr = err
 			return n.deps
 		}
-		n.deps = append(n.deps, runnerNode, n.build.runnerNode(runnerNode))
 	}
 	return n.deps
 }
@@ -1757,6 +1815,73 @@ func (n *TargetNode) explicitDepNames() []string {
 // holding multiple space-separated names produces multiple deps.
 func (b *Build) expandDep(dep string) ([]string, error) {
 	return b.expandToken(dep, "dep")
+}
+
+// runnerInjectedDepNames returns the names that should be added to a target's
+// dep list as a consequence of `on runnerTarget`. The result is determined by
+// the runner type's defrunner dep clause:
+//
+//   - No clause registered for the type → return just the runner target name
+//     (historical default — `on R` adds R as a dep).
+//   - Clause registered → evaluate each token in bash with the runner's
+//     options and $target=runnerTarget in scope; word-split stdout.
+//
+// Evaluation is memoized per runnerTarget — multiple consumers pointing at the
+// same runner instance produce the same dep set, so the bash subprocess only
+// runs once.
+func (b *Build) runnerInjectedDepNames(runnerTarget string) ([]string, error) {
+	if cached, ok := b.defRunnerDepsCache[runnerTarget]; ok {
+		return cached, nil
+	}
+	rule := b.concretes[runnerTarget]
+	if rule == nil {
+		// Pattern-defined or otherwise not yet materialized — fall back to default.
+		b.defRunnerDepsCache[runnerTarget] = []string{runnerTarget}
+		return b.defRunnerDepsCache[runnerTarget], nil
+	}
+	tokens, ok := b.defRunnerDeps[rule.Type]
+	if !ok {
+		// Type didn't register a dep clause: historical default.
+		out := []string{runnerTarget}
+		b.defRunnerDepsCache[runnerTarget] = out
+		return out, nil
+	}
+	if len(tokens) == 0 {
+		// `defrunner T : { ... }` — explicit empty clause means no deps.
+		b.defRunnerDepsCache[runnerTarget] = nil
+		return nil, nil
+	}
+	var names []string
+	for _, tok := range tokens {
+		got, err := b.expandDefRunnerDep(tok, runnerTarget, rule.Options)
+		if err != nil {
+			return nil, fmt.Errorf("runner %q (type %q): %w", runnerTarget, rule.Type, err)
+		}
+		names = append(names, got...)
+	}
+	b.defRunnerDepsCache[runnerTarget] = names
+	return names, nil
+}
+
+// expandDefRunnerDep evaluates a single defrunner dep clause token. Parallel
+// to expandDefBodyDep: sources the genfile, sets `$target` to the runner
+// instance's name, binds the runner's options as bash variables, then echoes
+// the token. The output is word-split.
+func (b *Build) expandDefRunnerDep(token, target string, options []parse.Option) ([]string, error) {
+	var script strings.Builder
+	script.WriteString(`. "$MMK_GENFILE"` + "\n")
+	script.WriteString("target=" + shellQuote(target) + "\n")
+	for _, opt := range options {
+		script.WriteString(opt.Key + "=" + shellQuote(opt.Value) + "\n")
+	}
+	script.WriteString("echo " + token + "\n")
+	cmd := exec.Command("bash", "-c", script.String())
+	cmd.Env = append(os.Environ(), "MMK_GENFILE="+b.genPath)
+	out, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("expand defrunner dep %q: %w", token, err)
+	}
+	return strings.Fields(string(out)), nil
 }
 
 // expandDefBodyDep evaluates a defbody dep clause token. Unlike expandDep, the

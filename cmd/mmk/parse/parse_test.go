@@ -220,6 +220,59 @@ func TestDefRunnerUnknownPhaseError(t *testing.T) {
 	expectError(t, `defrunner ubuntu badphase { echo hi }`, "unknown phase")
 }
 
+func TestDefRunnerDepClause(t *testing.T) {
+	f := mustParse(t, `defrunner ubuntu : $(__ubuntu_deps) foo.o { echo run }`)
+	requireRules(t, f, 1)
+	dr, ok := f.Directives[0].(*DefRunner)
+	if !ok {
+		t.Fatalf("expected *DefRunner, got %T", f.Directives[0])
+	}
+	expect(t, "Name", dr.Name, "ubuntu")
+	expect(t, "Phase", dr.Phase, "")
+	if !dr.HasDeps {
+		t.Fatalf("HasDeps: want true, got false")
+	}
+	if got, want := strings.Join(dr.Deps, "|"), "$(__ubuntu_deps)|foo.o"; got != want {
+		t.Fatalf("Deps: got %q, want %q", got, want)
+	}
+}
+
+func TestDefRunnerDepClauseEmpty(t *testing.T) {
+	// `defrunner T : { ... }` — colon present but no tokens — means "this
+	// runner type injects no consumer deps." Distinct from the no-`:` form
+	// (which falls back to the type's default).
+	f := mustParse(t, `defrunner ubuntu : { echo run }`)
+	dr := f.Directives[0].(*DefRunner)
+	if !dr.HasDeps {
+		t.Fatalf("HasDeps: want true (empty `:` was present), got false")
+	}
+	if len(dr.Deps) != 0 {
+		t.Fatalf("Deps: want empty slice, got %v", dr.Deps)
+	}
+}
+
+func TestDefRunnerNoDepClause(t *testing.T) {
+	// No `:` at all — type uses its default (auto-add runner target).
+	f := mustParse(t, `defrunner ubuntu { echo run }`)
+	dr := f.Directives[0].(*DefRunner)
+	if dr.HasDeps {
+		t.Fatalf("HasDeps: want false (no `:`), got true")
+	}
+	if len(dr.Deps) != 0 {
+		t.Fatalf("Deps: want empty, got %v", dr.Deps)
+	}
+}
+
+func TestDefRunnerDepClauseOnSetupErrors(t *testing.T) {
+	// Dep clause is only meaningful on the run-stage form: setup/cleanup
+	// don't inject consumer deps. Diagnose at parse time.
+	expectError(t, `defrunner ubuntu setup : foo { echo }`, "dep clause is only valid on the run-stage form")
+}
+
+func TestDefRunnerDepClauseOnCleanupErrors(t *testing.T) {
+	expectError(t, `defrunner ubuntu cleanup : foo { echo }`, "dep clause is only valid on the run-stage form")
+}
+
 func TestQuotedTargetName(t *testing.T) {
 	f := mustParse(t, `"ubuntu:latest" : foo`)
 	r := asRule(t, f.Directives[0])

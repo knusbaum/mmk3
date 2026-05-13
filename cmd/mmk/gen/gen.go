@@ -46,6 +46,12 @@ func RunnerRunFunc(name string) string { return "__mmk_runner_run_" + name }
 // RunnerCleanupFunc returns the bash function name for the cleanup phase of a runner type.
 func RunnerCleanupFunc(name string) string { return "__mmk_runner_cleanup_" + name }
 
+// RunnerDepsFunc returns the bash function name for the deps clause helper of
+// a runner type. Built-in image uses this to express "no consumer-dep when
+// skip_if matches." User defrunner deps clauses that need a helper function
+// can adopt the same naming if they want it auto-exposed.
+func RunnerDepsFunc(name string) string { return "__mmk_runner_deps_" + name }
+
 // DefaultFunc returns the bash function name for a type's default body.
 func DefaultFunc(typeName string) string { return "__mmk_default_" + typeName }
 
@@ -119,22 +125,40 @@ var BuiltinDefBodyOptions = map[DefBodyOptionsKey][]parse.Option{
 
 // RunnerDefInfo describes which optional phases are defined for a built-in runner type.
 // The run phase is always present for any valid runner type.
+//
+// Deps is the dep clause tokens from `defrunner T : depexpr ... { run body }`.
+// Each entry is a raw bash expression evaluated at graph construction time per
+// runner instance; the output is word-split and appended to the dep list of
+// every target that says `on T`. Default (nil/empty Deps): the runner target
+// itself is auto-added — the historical behavior.
 type RunnerDefInfo struct {
 	HasSetup   bool
 	HasCleanup bool
+	Deps       []string
 }
 
 // BuiltinRunnerDefs maps type names that have built-in runner definitions to
 // info about which phases exist. The runtime uses this to know which types are
-// valid runners and whether to call setup/cleanup.
+// valid runners, whether to call setup/cleanup, and what deps `on T` injects.
 var BuiltinRunnerDefs = map[string]RunnerDefInfo{
-	"image": {HasSetup: true, HasCleanup: true},
+	"image": {
+		HasSetup:   true,
+		HasCleanup: true,
+		// Empty output ⇒ no implicit dep on the image target (skip_if matched);
+		// otherwise depend on $target so the image is built before consumers run.
+		Deps: []string{"$(" + RunnerDepsFunc("image") + ")"},
+	},
 }
 
 type runnerDefBodies struct {
 	Setup   string
 	Run     string
 	Cleanup string
+	// DepsHelper is the bash body of __mmk_runner_deps_<type>, emitted as a
+	// top-level helper alongside the runner phase functions. The exported
+	// RunnerDefInfo.Deps references it via $(...) so the dep clause stays a
+	// one-liner in the mmk-syntax form printed by -builtins.
+	DepsHelper string
 }
 
 // builtinRunnerDefs holds the bash bodies for each built-in runner type.
@@ -182,8 +206,20 @@ const userFlag = `	__mmk_user=()
 	esac
 `
 
+// imageDepsHelper is the bash body of the image runner's deps clause.
+// $target is the runner target; $skip_if is the image's skip_if option.
+// Output: empty when skipping (no consumer-dep on the image); otherwise the
+// image target's name so consumers depend on it the same way they always have.
+const imageDepsHelper = `
+` + skipIfCheck + `	if __mmk_skip_check; then
+		return 0
+	fi
+	printf '%s' "$target"
+`
+
 var builtinRunnerDefs = map[string]runnerDefBodies{
 	"image": {
+		DepsHelper: imageDepsHelper,
 		Setup: `
 ` + skipIfCheck + `	if __mmk_skip_check; then
 		printf '` + skipSentinel + `'
@@ -204,7 +240,7 @@ var builtinRunnerDefs = map[string]runnerDefBodies{
 `,
 		Run: `
 	if [ "$MMK_RUNNER_STATE" = "` + skipSentinel + `" ]; then
-		target="$MMK_TARGET"; deps="$MMK_DEPS"; eval "$MMK_EXECUTE"
+		target="$MMK_TARGET"; deps="$MMK_DEPS"; read -ra dep <<< "$deps"; eval "$MMK_EXECUTE"
 		return $?
 	fi
 	# tty=true on the rule (or runner) opts the body into an in-container PTY
@@ -353,6 +389,15 @@ func Generate(w io.Writer, f *parse.File, frozen []string) error {
 				return err
 			}
 		}
+		// Emit the deps-clause helper alongside the runner. Suppressed when
+		// the user provides their own run-stage defrunner (they own the deps
+		// clause too in that case).
+		if def.DepsHelper != "" && !phases["run"] {
+			body := NormalizeBody(def.DepsHelper)
+			if _, err := fmt.Fprintf(w, "\n# built-in runner deps helper: %s\n%s() {%s}\n", typeName, RunnerDepsFunc(typeName), body); err != nil {
+				return err
+			}
+		}
 	}
 
 	frozenEmitted := false
@@ -497,13 +542,23 @@ func PrintBuiltins(w io.Writer) error {
 	}
 	for _, typeName := range builtinRunnerOrder {
 		def := builtinRunnerDefs[typeName]
+		info := BuiltinRunnerDefs[typeName]
+		if def.DepsHelper != "" {
+			if _, err := fmt.Fprintf(w, "\n# Helper invoked from `defrunner %s : $(...)` below.\n%s() {%s}\n", typeName, RunnerDepsFunc(typeName), def.DepsHelper); err != nil {
+				return err
+			}
+		}
 		if def.Setup != "" {
 			if _, err := fmt.Fprintf(w, "\ndefrunner %s setup {%s}\n", typeName, def.Setup); err != nil {
 				return err
 			}
 		}
 		if def.Run != "" {
-			if _, err := fmt.Fprintf(w, "\ndefrunner %s {%s}\n", typeName, def.Run); err != nil {
+			depsClause := ""
+			if len(info.Deps) > 0 {
+				depsClause = " : " + strings.Join(info.Deps, " ")
+			}
+			if _, err := fmt.Fprintf(w, "\ndefrunner %s%s {%s}\n", typeName, depsClause, def.Run); err != nil {
 				return err
 			}
 		}

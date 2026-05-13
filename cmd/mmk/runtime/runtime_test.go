@@ -768,6 +768,179 @@ func TestDefrunnerIsAccepted(t *testing.T) {
 	}
 }
 
+// --- defrunner dep clause ---
+
+func TestRunnerDepsDefaultAddsRunnerTarget(t *testing.T) {
+	// Backwards-compat: a runner type with no dep clause causes consumers'
+	// `on R` to add R as a dep — the historical behavior.
+	b := newBuild(t, `
+deftype custom_runner { echo 1 }
+defrunner custom_runner { :; }
+custom_runner myrunner :
+file build/foo on myrunner : src.c { :; }
+`)
+	n, err := b.Resolve("build/foo")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	got := depTargets(n.Dependencies())
+	if !contains(got, "myrunner") {
+		t.Errorf("expected 'myrunner' in deps (default runner-as-dep behavior), got %v", got)
+	}
+}
+
+func TestRunnerDepsEmptyClauseElidesRunnerTarget(t *testing.T) {
+	// `defrunner T : { ... }` — explicit empty clause means the runner type
+	// contributes no consumer-side dep. The synthetic runner setup node still
+	// fires, but the runner target itself is not in the consumer's dep list.
+	b := newBuild(t, `
+deftype custom_runner { echo 1 }
+defrunner custom_runner : { :; }
+custom_runner myrunner :
+file build/foo on myrunner : src.c { :; }
+`)
+	n, err := b.Resolve("build/foo")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	got := depTargets(n.Dependencies())
+	if contains(got, "myrunner") {
+		t.Errorf("expected 'myrunner' NOT in deps (empty dep clause), got %v", got)
+	}
+	// The synthetic setup node should still be present so the runner's setup
+	// phase fires (even when it has nothing meaningful to do).
+	if !containsAnyWithPrefix(got, "__runner__") {
+		t.Errorf("expected a synthetic runner setup dep, got %v", got)
+	}
+}
+
+func TestRunnerDepsClauseInjectsCustomDeps(t *testing.T) {
+	// A defrunner dep clause can name arbitrary deps. The output is
+	// word-split and appended to every `on T` consumer's dep list.
+	b := newBuild(t, `
+deftype custom_runner { echo 1 }
+defrunner custom_runner : prereq.bin $target { :; }
+custom_runner myrunner :
+file build/foo on myrunner : src.c { :; }
+`)
+	n, err := b.Resolve("build/foo")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	got := depTargets(n.Dependencies())
+	if !contains(got, "prereq.bin") {
+		t.Errorf("expected 'prereq.bin' in deps (named in clause), got %v", got)
+	}
+	if !contains(got, "myrunner") {
+		t.Errorf("expected 'myrunner' in deps ($target in clause), got %v", got)
+	}
+}
+
+func TestRunnerDepsClauseSeesRunnerOptions(t *testing.T) {
+	// The dep clause is evaluated with the runner target's options bound as
+	// bash variables. Different runner instances with the same type get
+	// different deps based on their options.
+	b := newBuild(t, `
+deftype custom_runner { echo 1 }
+defrunner custom_runner : prereq_$flavor.bin { :; }
+custom_runner runner_a flavor=alpha :
+custom_runner runner_b flavor=beta :
+file build/foo on runner_a : src.c { :; }
+file build/bar on runner_b : src.c { :; }
+`)
+	nFoo, err := b.Resolve("build/foo")
+	if err != nil {
+		t.Fatalf("Resolve foo: %v", err)
+	}
+	nBar, err := b.Resolve("build/bar")
+	if err != nil {
+		t.Fatalf("Resolve bar: %v", err)
+	}
+	if got := depTargets(nFoo.Dependencies()); !contains(got, "prereq_alpha.bin") {
+		t.Errorf("foo: expected 'prereq_alpha.bin', got %v", got)
+	}
+	if got := depTargets(nBar.Dependencies()); !contains(got, "prereq_beta.bin") {
+		t.Errorf("bar: expected 'prereq_beta.bin', got %v", got)
+	}
+}
+
+func TestBuiltinImageRunnerDepsAddsImageByDefault(t *testing.T) {
+	// With no skip_if, the built-in image runner's dep clause expands to the
+	// image's own name. Consumers depend on the image target. (Tested via
+	// graph inspection — no docker needed.)
+	b := newBuild(t, `
+image fakeimg : Dockerfile
+file build/foo on fakeimg : src.c { :; }
+`)
+	n, err := b.Resolve("build/foo")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got := depTargets(n.Dependencies()); !contains(got, "fakeimg") {
+		t.Errorf("expected 'fakeimg' in deps (no skip_if), got %v", got)
+	}
+}
+
+func TestBuiltinImageRunnerDepsSkipElidesImage(t *testing.T) {
+	// With skip_if=true the image runner's dep clause emits no deps; the
+	// consumer's edge to the image target is gone. The synthetic runner
+	// setup node stays so the run phase still has its skip-sentinel state.
+	b := newBuild(t, `
+image fakeimg skip_if=true : Dockerfile
+file build/foo on fakeimg : src.c { :; }
+`)
+	n, err := b.Resolve("build/foo")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	got := depTargets(n.Dependencies())
+	if contains(got, "fakeimg") {
+		t.Errorf("expected 'fakeimg' NOT in deps (skip_if=true), got %v", got)
+	}
+	if !containsAnyWithPrefix(got, "__runner__") {
+		t.Errorf("expected a synthetic runner setup dep, got %v", got)
+	}
+}
+
+func TestRunnerDepsCachedAcrossConsumers(t *testing.T) {
+	// Two consumers sharing one runner instance should share one resolved
+	// dep set — the bash subprocess runs once per runner instance.
+	b := newBuild(t, `
+deftype custom_runner { echo 1 }
+defrunner custom_runner : $target { :; }
+custom_runner myrunner :
+file build/foo on myrunner : a.c { :; }
+file build/bar on myrunner : b.c { :; }
+`)
+	nFoo, err := b.Resolve("build/foo")
+	if err != nil {
+		t.Fatalf("Resolve foo: %v", err)
+	}
+	_ = nFoo.Dependencies()
+	nBar, err := b.Resolve("build/bar")
+	if err != nil {
+		t.Fatalf("Resolve bar: %v", err)
+	}
+	_ = nBar.Dependencies()
+	cached, ok := b.defRunnerDepsCache["myrunner"]
+	if !ok {
+		t.Fatal("expected myrunner to be cached after Dependencies()")
+	}
+	if len(cached) != 1 || cached[0] != "myrunner" {
+		t.Errorf("cache: got %v, want [myrunner]", cached)
+	}
+}
+
+// containsAnyWithPrefix reports whether any element of s starts with prefix.
+func containsAnyWithPrefix(s []string, prefix string) bool {
+	for _, x := range s {
+		if strings.HasPrefix(x, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // --- built-in directory type ---
 
 func TestDirectoryTypeCreatesDir(t *testing.T) {

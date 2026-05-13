@@ -41,9 +41,13 @@ defbody TYPE [opt=val ...] { default body for typed targets with no body }
 defbody TYPE VERB [opt=val ...] { default body for [VERB target] on TYPE }
 
 # Custom runner type
-defrunner NAME { run-phase body }       # mandatory
-defrunner NAME setup { ... }            # optional; stdout = runner state
-defrunner NAME cleanup { ... }          # optional
+defrunner NAME [: dep ...] { run-phase body }   # mandatory; optional dep clause
+defrunner NAME setup { ... }                    # optional; stdout = runner state
+defrunner NAME cleanup { ... }                  # optional
+# Dep clause: deps appended to every `on NAME` consumer.
+# No `:` ⇒ historical default (auto-add the runner target).
+# `:` followed by nothing ⇒ explicit "no consumer deps."
+# Only valid on the run-stage form (not setup/cleanup).
 
 # Splice another mmkfile in at this point (same namespace, same DAG).
 # Path is bare word or double-quoted; relative to the including file.

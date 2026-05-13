@@ -519,6 +519,46 @@ file prog on builder.local : main.c { cc -o prog main.c }
 The setup and cleanup phases are optional; if you supply either, you must
 also supply the run phase.
 
+#### Runner dep clause (`defrunner T : depexpr ... { ... }`)
+
+A `defrunner`'s run-stage form may carry an optional dep list, mirroring
+the dep clause on `defbody`:
+
+```bash
+defrunner TYPE [opts] : <depexpr> ... { run body }
+```
+
+Each token is a raw bash expression (commonly `$(...)`) evaluated at graph
+construction time, per runner instance, with the runner's options bound as
+bash variables and `$target` set to the runner target's name. The output is
+word-split and the resulting names are **appended to the dep list of every
+target that says `on T`** — augmenting, not replacing, the consumer's own
+explicit deps.
+
+Three forms, with distinct semantics:
+
+| Form | Behavior |
+|---|---|
+| No `:` clause | Historical default. `on T` adds the runner target itself. |
+| `:` followed by tokens | Output of the tokens replaces the auto-add. |
+| `:` followed by nothing | Explicit "no deps." Useful for opting consumers out entirely. |
+
+The built-in `image` runner uses this to elide the consumer→image edge
+when `skip_if` matches (see `mmk -builtins`). A custom runner type can do
+the same to inject prereq-of-the-runner targets:
+
+```bash
+deftype remote_shell { ... }
+defrunner remote_shell : $target ssh_key.pem { ... }
+remote_shell vm.example.com :
+file prog on vm.example.com : main.c { cc -o prog main.c }
+# prog effectively depends on: main.c, vm.example.com, ssh_key.pem
+```
+
+A dep clause on `defrunner T setup { ... }` or `defrunner T cleanup { ... }`
+is a parse error — setup/cleanup are runner lifecycle, not contributors of
+consumer deps.
+
 ## Matrix targets
 
 A `for VAR in [expr]` clause expands a single rule into one combo per value:
