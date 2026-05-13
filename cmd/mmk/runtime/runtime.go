@@ -95,9 +95,14 @@ type Build struct {
 	concretes     map[string]*parse.TargetRule
 	verbConcretes map[verbNodeKey]*parse.TargetRule
 	patterns      []*patternEntry
-	nodes         map[string]*TargetNode
-	verbNodes     map[verbNodeKey]*TargetNode
-	runnerNodes   map[string]*TargetNode // runner target name → synthetic runner init node
+	// nodes / verbNodes / runnerNodes are populated lazily by Resolve,
+	// ResolveVerb, and runnerNode. dag.Build kicks off most of the writes,
+	// but in the TUI those happen in the executor goroutine while the View
+	// goroutine reads via NodeFor — so all four operations take nodesMu.
+	nodesMu     sync.RWMutex
+	nodes       map[string]*TargetNode
+	verbNodes   map[verbNodeKey]*TargetNode
+	runnerNodes map[string]*TargetNode // runner target name → synthetic runner init node
 	runnerDefs    map[string]runnerDefInfo
 	defBodies          map[string]bool // type name → has default body (built-in or user defbody)
 	defVerbBodies      map[defVerbBodyKey]bool
@@ -608,8 +613,17 @@ func (b *Build) Close() {
 
 // runnerNode returns (creating once) the synthetic node that runs setup for
 // the given runner target. Multiple targets with `on runnerTarget` share a
-// single runner node so setup executes only once.
+// single runner node so setup executes only once. Safe to call from any
+// goroutine — guarded by nodesMu like Resolve.
 func (b *Build) runnerNode(runnerTarget *TargetNode) *TargetNode {
+	b.nodesMu.RLock()
+	if n, ok := b.runnerNodes[runnerTarget.target]; ok {
+		b.nodesMu.RUnlock()
+		return n
+	}
+	b.nodesMu.RUnlock()
+	b.nodesMu.Lock()
+	defer b.nodesMu.Unlock()
 	if n, ok := b.runnerNodes[runnerTarget.target]; ok {
 		return n
 	}
@@ -627,9 +641,11 @@ func (b *Build) runnerNode(runnerTarget *TargetNode) *TargetNode {
 func (b *Build) GenPath() string { return b.genPath }
 
 // NodeFor returns the TargetNode for the given target and verb, or nil if it
-// has not been resolved. Safe to call from any goroutine once the graph is
-// built (the maps are not modified during execution).
+// has not been resolved. Safe to call from any goroutine — the maps are
+// guarded by nodesMu so concurrent Resolve/ResolveVerb writes are serialized.
 func (b *Build) NodeFor(target, verb string) *TargetNode {
+	b.nodesMu.RLock()
+	defer b.nodesMu.RUnlock()
 	if verb == "" {
 		return b.nodes[target]
 	}
@@ -763,8 +779,19 @@ func (b *Build) Execute(target, verb string, parallelism int) error {
 }
 
 // Resolve returns (creating if necessary) the TargetNode for the named target.
-// It is safe to call multiple times with the same name; the same node is returned.
+// Safe to call from any goroutine — the read-then-write on b.nodes is
+// serialized by nodesMu. Multiple calls with the same name return the same
+// node (the second wins-the-race caller picks up its sibling's node via the
+// double-checked read inside the write lock).
 func (b *Build) Resolve(name string) (*TargetNode, error) {
+	b.nodesMu.RLock()
+	if n, ok := b.nodes[name]; ok {
+		b.nodesMu.RUnlock()
+		return n, nil
+	}
+	b.nodesMu.RUnlock()
+	b.nodesMu.Lock()
+	defer b.nodesMu.Unlock()
 	if n, ok := b.nodes[name]; ok {
 		return n, nil
 	}
@@ -779,18 +806,29 @@ func (b *Build) Resolve(name string) (*TargetNode, error) {
 
 // ResolveVerb returns (creating if necessary) the verb-qualified TargetNode for
 // [verb target]. An explicit verb rule takes precedence; otherwise an inherited
-// node is created as long as the target has a default rule.
+// node is created as long as the target has a default rule. Safe to call from
+// any goroutine — the read-then-write is serialized by nodesMu.
 func (b *Build) ResolveVerb(target, verb string) (*TargetNode, error) {
 	key := verbNodeKey{target, verb}
+	b.nodesMu.RLock()
+	if n, ok := b.verbNodes[key]; ok {
+		b.nodesMu.RUnlock()
+		return n, nil
+	}
+	b.nodesMu.RUnlock()
+	b.nodesMu.Lock()
+	defer b.nodesMu.Unlock()
 	if n, ok := b.verbNodes[key]; ok {
 		return n, nil
 	}
 	rule := b.findRuleForVerb(target, verb)
 	if rule == nil {
-		// Ensure a default rule exists so dep inheritance can propagate.
-		// Resolve populates concretes for inferred source targets.
+		// Inherit from the target's default rule. Make sure that default rule
+		// exists in b.concretes (findRule infers a source-typed rule for
+		// previously-unknown names). findRule writes to b.concretes; we're
+		// already holding the write lock, so it's safe to call inline.
 		if _, ok := b.concretes[target]; !ok {
-			b.Resolve(target) //nolint — side effect: populates concretes
+			b.findRule(target) //nolint — side effect: populates concretes
 		}
 		if _, ok := b.concretes[target]; !ok {
 			found := false

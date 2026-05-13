@@ -1095,6 +1095,32 @@ file %q : %q {
 	}
 }
 
+func TestNodeForRaceVsResolveVerb(t *testing.T) {
+	// Regression for: TUI View goroutine reads b.verbNodes via NodeFor while
+	// the executor goroutine writes to it via ResolveVerb during dag.Build.
+	// With -race, the unprotected version trips concurrent map access; with
+	// nodesMu in place, no race.
+	src := `
+file foo : src.c { :; }
+[clean foo]
+`
+	b := newBuild(t, src)
+	const iters = 200
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < iters; i++ {
+			_, _ = b.ResolveVerb("foo", "clean")
+			_, _ = b.Resolve("foo")
+		}
+	}()
+	for i := 0; i < iters; i++ {
+		_ = b.NodeFor("foo", "clean")
+		_ = b.NodeFor("foo", "")
+	}
+	<-done
+}
+
 func TestDefrunnerSetupWithoutRunErrors(t *testing.T) {
 	_, err := NewBuild([]byte(`defrunner myrunner setup { echo setup }`))
 	if err == nil {
