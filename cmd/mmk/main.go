@@ -16,6 +16,7 @@ func main() {
 	raiseOpenFileLimit()
 	j := flag.Int("j", 100, "parallelism (0 = unlimited)")
 	v := flag.Bool("v", false, "verbose: log each target as it runs or is skipped")
+	why := flag.Bool("why", false, "print the dep chain from root → target as each target starts")
 	dump := flag.Bool("dump", false, "print generated shell script and exit")
 	builtins := flag.Bool("builtins", false, "print built-in type definitions as mmk syntax and exit")
 	list := flag.Bool("list", false, "list available targets and verbs, then exit")
@@ -64,6 +65,7 @@ func main() {
 	// makes a sub-mmk inherit verbose mode without the parent having to
 	// rewrite synthetic subproject bodies to pass -v explicitly.
 	b.Verbose = *v || os.Getenv("MMK_VERBOSE") == "1"
+	b.Why = *why
 
 	if *list {
 		b.PrintList(os.Stdout, *all)

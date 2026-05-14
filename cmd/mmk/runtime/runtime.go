@@ -86,8 +86,13 @@ type subprojectInfo struct {
 // Create one with NewBuild; call Close when done to remove the temp script
 // and run cleanup for any runners that were started during the build.
 // Set Verbose = true before calling Execute to log each target as it runs or is skipped.
+// Set Why = true to print the dependency chain from root → target on every OnRun.
 type Build struct {
-	Verbose       bool
+	Verbose bool
+	// Why prints the dep chain from the build root down to each target as
+	// it starts running, so the user can see how a running node relates to
+	// the target they asked for.
+	Why bool
 	// OutputWriter, if non-nil, supplies the stdout/stderr writers for a
 	// node's body execution. Used by the TUI to capture per-node output for
 	// later replay on failure. If nil, body output goes to os.Stdout/Stderr.
@@ -120,6 +125,11 @@ type Build struct {
 
 	runnerStatesMu sync.Mutex
 	runnerStates   map[string]string // runner target name → state from setup stdout
+
+	// whyMu serializes -why hook prints across concurrent OnRun callbacks
+	// so a multi-line chain renders atomically rather than interleaving
+	// with a sibling node's chain.
+	whyMu sync.Mutex
 
 	// Cancellation: the TUI (and any other supervisor) can stop scheduling
 	// new task bodies via Cancel, then escalate via SignalAll(SIGTERM/SIGKILL)
@@ -744,6 +754,9 @@ func subgraphHasBody(n *TargetNode, seen map[*TargetNode]bool) bool {
 // Execute builds the DAG rooted at target (optionally qualified by verb) and
 // runs it with the given parallelism. parallelism <= 0 means unlimited.
 // When b.Verbose is true, each target is logged as it runs or is skipped.
+// When b.Why is true, the dep chain from root → target is printed on each
+// OnRun, so the user can see how a running node relates to the requested
+// target.
 func (b *Build) Execute(target, verb string, parallelism int) error {
 	var root *TargetNode
 	var err error
@@ -758,11 +771,26 @@ func (b *Build) Execute(target, verb string, parallelism int) error {
 	if err := checkVerbHasTargets(root); err != nil {
 		return err
 	}
-	if !b.Verbose {
+	if !b.Verbose && !b.Why {
 		return dag.Execute(root, parallelism, b.cancelCh)
+	}
+	var pi *parentIndex
+	if b.Why {
+		pi = buildParentIndex(root)
 	}
 	hooks := dag.Hooks[*TargetNode]{
 		OnRun: func(n *TargetNode) {
+			if b.Why {
+				chain := pi.path(n)
+				if len(chain) == 0 {
+					return
+				}
+				out := renderWhyPath(chain)
+				b.whyMu.Lock()
+				fmt.Print(out)
+				b.whyMu.Unlock()
+				return
+			}
 			if n.kind == kindRunner {
 				fmt.Printf("starting runner: %s\n", n.runnerFor.target)
 			} else if n.verb != "" {
@@ -772,6 +800,11 @@ func (b *Build) Execute(target, verb string, parallelism int) error {
 			}
 		},
 		OnSkip: func(n *TargetNode) {
+			// -why focuses on what's running, not what's skipped. Skip
+			// output only when the user also passed -v.
+			if !b.Verbose {
+				return
+			}
 			if n.kind == kindRunner {
 				return // runner setup dedup is an internal detail, not user-visible
 			}
