@@ -36,13 +36,20 @@ inside each task's subprocess.
 
 # Type definitions
 deftype TYPE { body that prints epoch-seconds or RFC3339 to stdout; non-zero = absent }
-defbody TYPE [opt=val ...] { default body for typed targets with no body }
+defbody TYPE [opt=val ...] [: dep ...] { default body for typed targets with no body }
 defbody TYPE VERB [opt=val ...] { default body for [VERB target] on TYPE }
+# Dep clause on the non-verb defbody: bash expressions evaluated per-target-instance
+# at graph-construction time; output is word-split and appended to DAG edges.
+# Verb-defbody dep clauses are a parse error.
 
 # Custom runner type
-defrunner NAME { run-phase body }       # mandatory
-defrunner NAME setup { ... }            # optional; stdout = runner state
-defrunner NAME cleanup { ... }          # optional
+defrunner NAME [: dep ...] { run-phase body }   # mandatory; optional dep clause
+defrunner NAME setup { ... }                    # optional; stdout = runner state
+defrunner NAME cleanup { ... }                  # optional
+# Dep clause: deps appended to every `on NAME` consumer's dep list.
+# No `:` ⇒ historical default (runner target itself is auto-added as a dep).
+# `:` with an empty list ⇒ no consumer deps on the runner at all.
+# Only valid on the run-stage form (not setup/cleanup).
 
 # Splice another mmkfile in at this point (same namespace, same DAG).
 # Path is bare word or double-quoted; relative to the including file.
@@ -75,6 +82,7 @@ ANY_OTHER_LINE                          # treated as raw bash
 | You want to... | Use this |
 |---|---|
 | Make sure something stays up to date as a file on disk | `file T : deps { ... }` |
+| Build a directory that other targets depend on (freshness = "exists", mtime not tracked) | `directory T :` |
 | Reference an existing file mmk doesn't build | Just name it as a dep — mmk infers `source` |
 | Define an always-run task (no caching, no artifact) | Untyped: `T : deps { ... }` |
 | Aggregate several builds under one name | Untyped, deps only: `all : a b c` |
@@ -139,6 +147,17 @@ defbody s3_object {
 
 s3_object reports/q1.csv  bucket=acme-prod : data/q1.csv
 s3_object dev/scratch.csv bucket=acme-dev  : data/scratch.csv
+```
+
+```bash
+# `directory` creates a dir and treats it as fresh as long as it exists —
+# adding or removing files inside does not churn consumers (unlike `file`
+# which would pick up the directory's own mtime).
+directory build :
+
+file build/prog : build main.c {
+    cc -o "$target" main.c
+}
 ```
 
 ```bash
@@ -272,6 +291,7 @@ shipping.
   shows everything. Add a `##` docstring above any target you want to
   surface as a user entry point.
 - `mmk -graph` and `mmk -dag` show the dep graph.
+- `mmk -why` — print the dep chain from the build root down to each target as it starts running, so you can see why it's being built.
 
 ## Body environment cheatsheet
 
@@ -295,6 +315,7 @@ In **runner run-phase** bodies (custom `defrunner NAME { ... }`), additionally:
 | `$MMK_TARGET`, `$MMK_DEPS` | Consumer's target name and deps. |
 | `$MMK_EXECUTE` | Self-contained snippet you should `eval` (or pass to a remote shell) to run the consumer's body. |
 | `$MMK_RUNNER_STATE` | Whatever the setup phase printed to stdout. |
+| `$MMK_RULE_OPT_KEYS` | Space-separated option key names from the consumer rule. Use to forward per-rule options into a container or remote environment (e.g., `-e key` for each entry). |
 
 ## A complete sample
 
@@ -347,7 +368,9 @@ What this gives the user:
   matrix aggregators, image runners, anything without a docstring).
 - `mmk -graph T` / `mmk -dag T` — confirm the dep tree matches what you
   expected.
-- `mmk -builtins` — see how `file` / `source` / `image` are implemented in
-  mmk syntax. Useful when defining your own `deftype` / `defrunner`.
+- `mmk -why` — print the dep chain from root → target as each target starts.
+  Useful when a target runs unexpectedly or you need to trace why it's in the graph.
+- `mmk -builtins` — see how `file` / `source` / `directory` / `image` are
+  implemented in mmk syntax. Useful when defining your own `deftype` / `defrunner`.
 - `example/mmkfile` — exercises every major feature.
 - `README.md` — prose explanation with rationale.

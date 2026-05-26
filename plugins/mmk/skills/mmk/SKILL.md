@@ -37,8 +37,11 @@ inside each task's subprocess.
 
 # Type definitions
 deftype TYPE { body that prints epoch-seconds or RFC3339 to stdout; non-zero = absent }
-defbody TYPE [opt=val ...] { default body for typed targets with no body }
+defbody TYPE [opt=val ...] [: dep ...] { default body for typed targets with no body }
 defbody TYPE VERB [opt=val ...] { default body for [VERB target] on TYPE }
+# Dep clause on the non-verb defbody: bash expressions evaluated per-target-instance
+# at graph-construction time; output is word-split and appended to DAG edges.
+# Verb-defbody dep clauses are a parse error.
 
 # Custom runner type
 defrunner NAME [: dep ...] { run-phase body }   # mandatory; optional dep clause
@@ -80,7 +83,7 @@ ANY_OTHER_LINE                          # treated as raw bash
 | You want to... | Use this |
 |---|---|
 | Make sure something stays up to date as a file on disk | `file T : deps { ... }` |
-| Make sure a directory exists before a consumer runs | `directory build/sub :` and dep on it |
+| Build a directory that other targets depend on (freshness = "exists", mtime not tracked) | `directory T :` |
 | Reference an existing file mmk doesn't build | Just name it as a dep — mmk infers `source` |
 | Define an always-run task (no caching, no artifact) | Untyped: `T : deps { ... }` |
 | Aggregate several builds under one name | Untyped, deps only: `all : a b c` |
@@ -145,6 +148,17 @@ defbody s3_object {
 
 s3_object reports/q1.csv  bucket=acme-prod : data/q1.csv
 s3_object dev/scratch.csv bucket=acme-dev  : data/scratch.csv
+```
+
+```bash
+# `directory` creates a dir and treats it as fresh as long as it exists —
+# adding or removing files inside does not churn consumers (unlike `file`
+# which would pick up the directory's own mtime).
+directory build :
+
+file build/prog : build main.c {
+    cc -o "$target" main.c
+}
 ```
 
 ```bash
@@ -301,6 +315,7 @@ In **runner run-phase** bodies (custom `defrunner NAME { ... }`), additionally:
 | `$MMK_TARGET`, `$MMK_DEPS` | Consumer's target name and deps. |
 | `$MMK_EXECUTE` | Self-contained snippet you should `eval` (or pass to a remote shell) to run the consumer's body. |
 | `$MMK_RUNNER_STATE` | Whatever the setup phase printed to stdout. |
+| `$MMK_RULE_OPT_KEYS` | Space-separated option key names from the consumer rule. Use to forward per-rule options into a container or remote environment (e.g., `-e key` for each entry). |
 
 ## A complete sample
 
@@ -353,5 +368,84 @@ What this gives the user:
   matrix aggregators, image runners, anything without a docstring).
 - `mmk -graph T` / `mmk -dag T` — confirm the dep tree matches what you
   expected.
-- `mmk -builtins` — see how `file` / `source` / `image` are implemented in
-  mmk syntax. Useful when defining your own `deftype` / `defrunner`.
+- `mmk -why` — print the dep chain from root → target as each target starts.
+  Useful when a target runs unexpectedly or you need to trace why it's in the graph.
+- `mmk -builtins` — see how `file` / `source` / `directory` / `image` are
+  implemented in mmk syntax. Useful when defining your own `deftype` / `defrunner`.
+
+## Standard library
+
+mmk ships bundled stdlib files. Load them with a bare-name `include` — no path prefix needed:
+
+```bash
+include c.mmk
+include go.mmk
+include cmake.mmk
+```
+
+Bare-name includes are resolved first relative to the mmkfile's directory (so projects can shadow stdlib files), then from the bundled copy embedded in the binary. No download needed.
+
+### c.mmk — C compilation
+
+**Passthrough variables**: `CC` (default: `gcc`), `AR` (default: `ar`), `CFLAGS`, `C_BUILD_OPTIONS`
+
+**Helper functions** (usable in bodies and defbody dep clauses after include):
+
+| Function | Signature | What it does |
+|---|---|---|
+| `c_sources` | `c_sources DIR...` | List `.c` files under each dir. Set `recursive=1` in scope to recurse. |
+| `c_objects` | `c_objects DIR...` | Like `c_sources` but converts `.c` → `.o`; prepends `obj_path=` option prefix. |
+
+**Built-in pattern rule**: `file '(.*)\.o' : $1.c` — compiles with `$CC $CFLAGS $C_BUILD_OPTIONS`.
+
+**Types**:
+
+| Type | Key options | Default body | Verbs |
+|---|---|---|---|
+| `c_library` | `source=DIR`, `recursive=1`, `obj_path=PATH` | `ar -rcs` over objects from dep clause | `clean` |
+| `c_shared_lib` | `ldflags=` | `$CC -shared "${dep[@]}"` | `clean` |
+| `c_executable` | `source=DIR`, `recursive=1`, `obj_path=PATH`, `ldflags=` | `$CC "${dep[@]}"` | `clean` |
+
+`c_library` and `c_executable` use a `defbody` dep clause (`$(c_objects $source)`) to automatically discover and inject the right `.o` deps at graph-construction time. You can add extra explicit deps on the rule header alongside the auto-discovered ones. `c_shared_lib` has no source discovery — list object files and/or static archives explicitly as rule deps.
+
+```bash
+include c.mmk
+
+CC=clang
+CFLAGS='-O2 -Wall'
+
+c_library libfoo.a source=src obj_path=build :
+c_executable myprog  source=src obj_path=build : libfoo.a
+```
+
+### go.mmk — Go builds
+
+**Per-target options** (both types): `pkg=<path>` (Go package; defaults to `./...` for module, `.` for exe), `ldflags=`, `cgo=0`
+
+| Type | Freshness | Default body | Verbs |
+|---|---|---|---|
+| `go_module` | always re-runs (Go toolchain manages its cache) | `go build ${pkg:-./...}` | `test`, `fmt`, `fmt-check`, `vet`, `clean`, `update` |
+| `go_exe` | binary mtime | `go build -o $target "${pkg:-.}"` | `test`, `clean` |
+
+```bash
+include go.mmk
+
+go_module mymod pkg=./...
+go_exe ./bin/myapp pkg=./cmd/myapp ldflags="-s -w"
+```
+
+### cmake.mmk — CMake projects and git sources
+
+| Type | Key options | Freshness | Default body | Verbs |
+|---|---|---|---|---|
+| `cmake_project` | `build_dir=DIR` (required), `source=DIR`, `preset=NAME`, `prefix=DIR`, `ctest_args=` | always re-runs | cmake configure + build | `install`, `test`, `clean` |
+| `git_source` | `repo=URL` (required), `tag=REF` (required) | `.mmk-git-tag` sentinel matches `tag=` | clone or fetch + checkout | `clean` |
+
+`cmake_project` always re-runs so cmake's own incremental tracking decides what to rebuild. For consumers that need a freshness signal, depend on a specific output file (e.g. `build/libfoo.a`) rather than on the `cmake_project` target itself.
+
+```bash
+include cmake.mmk
+
+git_source deps/zlib repo=https://github.com/madler/zlib tag=v1.3.1
+cmake_project zlib_build build_dir=build/zlib source=deps/zlib : deps/zlib
+```
