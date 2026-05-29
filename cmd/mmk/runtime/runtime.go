@@ -948,6 +948,15 @@ func (b *Build) findRule(name string) (*parse.TargetRule, error) {
 	if r := b.findRuleForVerb(name, ""); r != nil {
 		return r, nil
 	}
+	// Before treating this as a source file, check whether it's a path into
+	// a subproject (e.g. "cmd/bas/test" when "cmd/bas" is a subproject).
+	// ResolveSubpath registers a delegating rule in b.concretes if it matches;
+	// callers hold b.nodesMu write lock so the write is safe.
+	if b.ResolveSubpath(name, "") {
+		if r := b.findRuleForVerb(name, ""); r != nil {
+			return r, nil
+		}
+	}
 	inferred := &parse.TargetRule{
 		Type:   "source",
 		Target: name,
@@ -2998,14 +3007,25 @@ func (b *Build) expandSubprojects(f *parse.File) error {
 // returns ok=false and the caller falls through to normal lookup. Top-level
 // targets that already exist take precedence — registering the same target
 // twice is a duplicate, so we only synthesize when nothing is registered.
+//
+// Subproject names may themselves contain slashes (e.g. "cmd/bas"), so we
+// find the longest-matching subproject prefix rather than splitting on the
+// first slash.
 func (b *Build) ResolveSubpath(target, verb string) bool {
-	i := strings.IndexByte(target, '/')
-	if i <= 0 {
-		return false
+	// Find the longest matching subproject name that is a prefix of target.
+	var sp *subprojectInfo
+	var suffix string
+	for spTarget, info := range b.subprojects {
+		prefix := spTarget + "/"
+		if strings.HasPrefix(target, prefix) {
+			rest := target[len(prefix):]
+			if sp == nil || len(spTarget) > len(sp.target) {
+				sp = info
+				suffix = rest
+			}
+		}
 	}
-	prefix, suffix := target[:i], target[i+1:]
-	sp, ok := b.subprojects[prefix]
-	if !ok {
+	if sp == nil {
 		return false
 	}
 	if verb == "" {
