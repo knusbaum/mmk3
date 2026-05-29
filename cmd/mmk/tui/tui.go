@@ -54,9 +54,15 @@ func Run(b *runtime.Build, target, verb string, parallelism int) error {
 	prog := tea.NewProgram(m, tea.WithAltScreen())
 
 	// Drive the build from a goroutine. Hooks update node state directly;
-	// only failures push a message through the event loop.
+	// only failures push a message through the event loop. `ran` records
+	// which nodes actually executed their own body — aggregator nodes that
+	// just propagate an upstream failure (no OnRun fired) still get marked
+	// NodeFailed in the tree but are kept out of the failure summary so
+	// the count reflects real body failures only.
+	var ran sync.Map
 	hooks := dag.Hooks[*runtime.TargetNode]{
 		OnRun: func(n *runtime.TargetNode) {
+			ran.Store(n, struct{}{})
 			n.SetState(runtime.NodeRunning)
 		},
 		OnSkip: func(n *runtime.TargetNode) {
@@ -69,6 +75,9 @@ func Run(b *runtime.Build, target, verb string, parallelism int) error {
 			}
 			if err != nil {
 				n.SetState(runtime.NodeFailed)
+				if _, ok := ran.Load(n); !ok {
+					return // propagated upstream failure; don't double-count
+				}
 				out := caps.take(nodeKey(n.Target(), n.Verb()))
 				prog.Send(failureMsg{target: n.Target(), verb: n.Verb(), err: err, output: out})
 				return
@@ -237,7 +246,7 @@ func emitChildren(t *treeData, children []*runtime.TargetNode, prefix string, vi
 	for i, it := range items {
 		isLast := i == len(items)-1
 		if it.isGroup {
-			emitGroup(t, it, prefix, isLast)
+			emitGroup(t, it, prefix, isLast, visited)
 			continue
 		}
 		appendChild(t, it.node, prefix, isLast, visited)
@@ -292,10 +301,12 @@ func groupChildren(children []*runtime.TargetNode) []childItem {
 	return out
 }
 
-func emitGroup(t *treeData, it childItem, prefix string, isLast bool) {
+func emitGroup(t *treeData, it childItem, prefix string, isLast bool, visited map[string]bool) {
 	connector := "├── "
+	childPrefix := prefix + "│   "
 	if isLast {
 		connector = "└── "
+		childPrefix = prefix + "    "
 	}
 	keys := make([]string, len(it.members))
 	for i, m := range it.members {
@@ -310,6 +321,26 @@ func emitGroup(t *treeData, it childItem, prefix string, isLast bool) {
 		label:     label,
 		groupKeys: keys,
 	})
+
+	// Surface the group's shared deps under the collapsed line, the way
+	// -graph does. Take the union of every member's DisplayDeps (in
+	// first-seen order, deduped by nodeKey) so $1-templated deps that
+	// differ across members all show up. Members of a typical pattern
+	// rule share an identical dep set; the union collapses to one entry
+	// per dep in that case.
+	seen := map[string]bool{}
+	var combined []*runtime.TargetNode
+	for _, m := range it.members {
+		for _, d := range m.DisplayDeps() {
+			k := nodeKey(d.Target(), d.Verb())
+			if seen[k] {
+				continue
+			}
+			seen[k] = true
+			combined = append(combined, d)
+		}
+	}
+	emitChildren(t, combined, childPrefix, visited)
 }
 
 func appendChild(t *treeData, n *runtime.TargetNode, prefix string, isLast bool, visited map[string]bool) {
@@ -357,17 +388,10 @@ const (
 	statusCancelled
 )
 
-type failure struct {
-	target string
-	verb   string
-	err    error
-	output string
-}
-
 type model struct {
 	tree     treeData
 	ring     *logRing
-	failures []failure
+	failures []runtime.FailureRecord
 	build    *runtime.Build
 
 	// cancelStage advances on each Ctrl+C while the build is running:
@@ -491,11 +515,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		}
 	case failureMsg:
-		m.failures = append(m.failures, failure{
-			target: msg.target,
-			verb:   msg.verb,
-			err:    msg.err,
-			output: msg.output,
+		m.failures = append(m.failures, runtime.FailureRecord{
+			Target: msg.target,
+			Verb:   msg.verb,
+			Err:    msg.err,
+			Output: msg.output,
 		})
 	case tickMsg:
 		if m.graphView {
@@ -601,24 +625,13 @@ func (m model) render(final bool) string {
 		}
 	}
 
-	// Failure summary.
+	// Failure summary — shared with the non-TUI Execute path so the two
+	// stay in lockstep. emph wraps headers/labels with the failed style;
+	// body output is left unstyled.
 	if m.buildDone && len(m.failures) > 0 {
-		b.WriteString("\n")
-		b.WriteString(failedStyle.Render(fmt.Sprintf("─── %d failure(s) ───", len(m.failures))))
-		b.WriteString("\n")
-		first := m.failures[0]
-		b.WriteString(failedStyle.Render(failureLabel(first)))
-		b.WriteString("\n")
-		b.WriteString(strings.TrimRight(first.output, "\n"))
-		b.WriteString("\n")
-		if first.err != nil {
-			b.WriteString(failedStyle.Render(fmt.Sprintf("error: %v", first.err)))
-			b.WriteString("\n")
-		}
-		for _, f := range m.failures[1:] {
-			b.WriteString(failedStyle.Render("  - " + failureLabel(f)))
-			b.WriteString(" — rerun for details\n")
-		}
+		runtime.WriteFailureSummary(&b, m.failures, func(s string) string {
+			return failedStyle.Render(s)
+		})
 	}
 
 	if !final && m.buildDone {
@@ -628,13 +641,6 @@ func (m model) render(final bool) string {
 	}
 
 	return b.String()
-}
-
-func failureLabel(f failure) string {
-	if f.verb != "" {
-		return fmt.Sprintf("[%s %s]", f.verb, f.target)
-	}
-	return f.target
 }
 
 // renderGroup returns the leading icon and the styled label for a collapsed

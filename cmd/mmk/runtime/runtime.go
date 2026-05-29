@@ -771,15 +771,39 @@ func (b *Build) Execute(target, verb string, parallelism int) error {
 	if err := checkVerbHasTargets(root); err != nil {
 		return err
 	}
-	if !b.Verbose && !b.Why {
-		return dag.Execute(root, parallelism, b.cancelCh)
-	}
 	var pi *parentIndex
 	if b.Why {
 		pi = buildParentIndex(root)
 	}
+
+	// Tee body output through a per-node capture buffer so failures can be
+	// replayed at the end of the build. Only installed when the caller
+	// hasn't pre-set OutputWriter (the TUI installs its own capture-only
+	// writer and renders failures itself).
+	var caps *captures
+	if b.OutputWriter == nil {
+		caps = newCaptures()
+		b.OutputWriter = func(target, verb string) (io.Writer, io.Writer) {
+			e := caps.get(target, verb)
+			return &teeCapture{out: os.Stdout, e: e}, &teeCapture{out: os.Stderr, e: e}
+		}
+		defer func() { b.OutputWriter = nil }()
+	}
+
+	var failuresMu sync.Mutex
+	var failures []FailureRecord
+	// ran tracks which nodes actually had OnRun fire — i.e. their own body
+	// got a chance to execute. A node whose upstream failed gets OnFinish
+	// with the propagated err but never sees OnRun (dag/dag.go skips
+	// NeedsRun/Run in that case). Filtering on this set keeps aggregator
+	// nodes like `test : <fanned-out test files>` out of the failure
+	// summary — they're red because their deps are, not because their
+	// own body broke.
+	var ran sync.Map
+
 	hooks := dag.Hooks[*TargetNode]{
 		OnRun: func(n *TargetNode) {
+			ran.Store(n, struct{}{})
 			if b.Why {
 				chain := pi.path(n)
 				if len(chain) == 0 {
@@ -789,6 +813,9 @@ func (b *Build) Execute(target, verb string, parallelism int) error {
 				b.whyMu.Lock()
 				fmt.Print(out)
 				b.whyMu.Unlock()
+				return
+			}
+			if !b.Verbose {
 				return
 			}
 			if n.kind == kindRunner {
@@ -810,8 +837,38 @@ func (b *Build) Execute(target, verb string, parallelism int) error {
 			}
 			fmt.Printf("skipping: %s (up to date)\n", n.target)
 		},
+		OnFinish: func(n *TargetNode, err error) {
+			if err == nil {
+				return
+			}
+			if errors.Is(err, dag.ErrCancelled) || errors.Is(err, ErrCancelled) {
+				return
+			}
+			if _, ok := ran.Load(n); !ok {
+				return // propagated upstream failure; don't double-count
+			}
+			var out string
+			if caps != nil {
+				out = caps.take(n.Target(), n.Verb())
+			}
+			failuresMu.Lock()
+			failures = append(failures, FailureRecord{
+				Target: n.Target(),
+				Verb:   n.Verb(),
+				Err:    err,
+				Output: out,
+			})
+			failuresMu.Unlock()
+		},
 	}
-	return dag.Execute(root, parallelism, b.cancelCh, hooks)
+	execErr := dag.Execute(root, parallelism, b.cancelCh, hooks)
+	// Only render the summary when we installed capture ourselves. Callers
+	// like the TUI handle their own failure surface and don't want a second
+	// copy spilled to stderr.
+	if caps != nil {
+		WriteFailureSummary(os.Stderr, failures, nil)
+	}
+	return execErr
 }
 
 // Resolve returns (creating if necessary) the TargetNode for the named target.
