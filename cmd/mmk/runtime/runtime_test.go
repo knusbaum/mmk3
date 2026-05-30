@@ -5,7 +5,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -611,6 +610,93 @@ func TestNeedsRunFileMissing(t *testing.T) {
 	}
 }
 
+// TestInRunRebuildCascadesToConsumer is a regression test for a bug where a
+// target's cached Date held its pre-rebuild value, so a consumer scheduled
+// later in the same build saw the old mtime and skipped. With the fix, a
+// successful Run invalidates the cached Date and the consumer sees the new
+// mtime when its own NeedsRun fires.
+func TestInRunRebuildCascadesToConsumer(t *testing.T) {
+	dir := t.TempDir()
+	a := filepath.Join(dir, "a")
+	b := filepath.Join(dir, "b")
+	c := filepath.Join(dir, "c")
+
+	// Start with a < b = c (all older than now). Then touch `a` to make b
+	// stale; c must cascade-rebuild.
+	past := time.Now().Add(-time.Minute)
+	touchAt(t, a, past)
+	touchAt(t, b, past)
+	touchAt(t, c, past)
+	// Bump a so it's strictly newer than b — this is the only source change.
+	touchAt(t, a, time.Now())
+
+	src := fmt.Sprintf(`
+file %q : %q { cp %q %q }
+file %q : %q { cp %q %q }
+file %q :
+`, c, b, b, c, b, a, a, b, a)
+
+	build := newBuild(t, src)
+	if err := build.Execute(c, "", 1); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+
+	// c must be at least as new as b after the cascade. The bug manifested
+	// as c keeping its original "past" mtime because the rebuild was skipped.
+	bInfo, err := os.Stat(b)
+	if err != nil {
+		t.Fatalf("stat b: %v", err)
+	}
+	cInfo, err := os.Stat(c)
+	if err != nil {
+		t.Fatalf("stat c: %v", err)
+	}
+	if cInfo.ModTime().Before(bInfo.ModTime()) {
+		t.Errorf("c (%v) is older than b (%v): cascade did not propagate", cInfo.ModTime(), bInfo.ModTime())
+	}
+	if !cInfo.ModTime().After(past) {
+		t.Errorf("c mtime %v ≤ past %v: c was not rebuilt at all", cInfo.ModTime(), past)
+	}
+}
+
+// TestUserDeftypeNanoStatNoSpuriousRebuild combines the cascade fix and the
+// epoch.nanos parser: a user deftype emitting `stat -c %.Y` against a source
+// dep in the same integer second must NOT trigger a spurious rebuild on the
+// second mmk run. The pre-fix behavior was a precision mismatch between the
+// source's Go-native ModTime (full precision) and the user deftype's bash
+// `stat -c %Y` (integer seconds) — the source always looked sub-second-newer
+// even when it wasn't actually written after the target.
+func TestUserDeftypeNanoStatNoSpuriousRebuild(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src")
+	out := filepath.Join(dir, "out")
+
+	// Source at t.000, output at t.500 — same integer second, output strictly
+	// later in real time. Without %.Y, target.Date() returns the integer t.000
+	// and source.Date() returns t.000000000 — equal, so no rebuild. With %Y
+	// integer + source's Go ModTime, the comparison sees source > target.
+	t0 := time.Unix(time.Now().Unix(), 0)
+	touchAt(t, src, t0)
+	touchAt(t, out, t0.Add(500*time.Millisecond))
+
+	mmkSrc := fmt.Sprintf(`
+deftype mypkg { stat -c %%.Y "$target" 2>/dev/null || return 1 }
+mypkg %q : %q { cp %q %q }
+file %q :
+`, out, src, src, out, src)
+
+	build := newBuild(t, mmkSrc)
+	n, _ := build.Resolve(out)
+	n.Dependencies()
+	needsRun, err := n.NeedsRun()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if needsRun {
+		t.Errorf("expected NeedsRun() == false: source (%v) is older than target (%v) at full precision; spurious rebuild indicates precision mismatch in deftype parsing", t0, t0.Add(500*time.Millisecond))
+	}
+}
+
 // --- validation errors ---
 
 func TestDeftypeEpochDate(t *testing.T) {
@@ -629,6 +715,29 @@ mytype mytarget :
 		t.Fatal(err)
 	}
 	want := time.Unix(epoch, 0)
+	if !got.Equal(want) {
+		t.Errorf("Date(): got %v, want %v", got, want)
+	}
+}
+
+// TestDeftypeEpochNanosDate exercises the "epoch.nanos" timestamp form that
+// matches GNU `stat -c %.Y` output, so deftypes can preserve sub-second
+// precision without going through RFC3339.
+func TestDeftypeEpochNanosDate(t *testing.T) {
+	want := time.Unix(1780111599, 362179295)
+	src := fmt.Sprintf(`
+deftype mytype {
+	echo %d.%09d
+}
+mytype mytarget :
+`, want.Unix(), want.Nanosecond())
+	b := newBuild(t, src)
+	n, _ := b.Resolve("mytarget")
+	n.Dependencies()
+	got, err := n.Date()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !got.Equal(want) {
 		t.Errorf("Date(): got %v, want %v", got, want)
 	}
@@ -1008,8 +1117,7 @@ func TestDirectoryTypeFixedDate(t *testing.T) {
 		t.Fatalf("write inside dir: %v", err)
 	}
 	// Clear cached Date so we re-stat.
-	n.dateOnce = sync.Once{}
-	n.dateVal = time.Time{}
+	n.invalidateDate()
 	date2, err := n.Date()
 	if err != nil {
 		t.Fatalf("Date second call: %v", err)

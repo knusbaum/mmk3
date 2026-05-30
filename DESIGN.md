@@ -219,8 +219,9 @@ override with a different list.
 ### Type and body definitions
 
 ```bash
-# A deftype body prints the artifact's timestamp to stdout (epoch seconds
-# or RFC3339). Non-zero exit means the artifact doesn't exist yet.
+# A deftype body prints the artifact's timestamp to stdout (epoch seconds,
+# "epoch.nanos" as emitted by GNU `stat -c %.Y`, or RFC3339). Non-zero exit
+# means the artifact doesn't exist yet.
 # $target and $deps are available.
 deftype file {
     stat -c %Y "$target" 2>/dev/null || return 1

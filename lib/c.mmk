@@ -81,7 +81,7 @@ file '(.*)\.o' : $1.c {
 # ---- c_library ---------------------------------------------------------------
 
 deftype c_library {
-    [ -f "$target" ] && (stat -c "%Y" "$target" 2>/dev/null || stat -f "%m" "$target" 2>/dev/null)
+    [ -f "$target" ] && (stat -c "%.Y" "$target" 2>/dev/null || stat -f "%m" "$target" 2>/dev/null)
 }
 
 defbody c_library : $(c_objects $source) {
@@ -95,7 +95,7 @@ defbody c_library clean {
 # ---- c_shared_lib ------------------------------------------------------------
 
 deftype c_shared_lib {
-    [ -f "$target" ] && (stat -c "%Y" "$target" 2>/dev/null || stat -f "%m" "$target" 2>/dev/null)
+    [ -f "$target" ] && (stat -c "%.Y" "$target" 2>/dev/null || stat -f "%m" "$target" 2>/dev/null)
 }
 
 defbody c_shared_lib {
@@ -109,7 +109,7 @@ defbody c_shared_lib clean {
 # ---- c_executable ------------------------------------------------------------
 
 deftype c_executable {
-    [ -f "$target" ] && (stat -c "%Y" "$target" 2>/dev/null || stat -f "%m" "$target" 2>/dev/null)
+    [ -f "$target" ] && (stat -c "%.Y" "$target" 2>/dev/null || stat -f "%m" "$target" 2>/dev/null)
 }
 
 defbody c_executable : $([ -n "${source:-}" ] && c_objects $source) {

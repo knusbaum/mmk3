@@ -55,7 +55,7 @@ deftype git_source {
     sentinel="$target/.mmk-git-tag"
     [ -f "$sentinel" ] || exit 1
     [ "$(cat "$sentinel")" = "$tag" ] || exit 1
-    stat -c "%Y" "$sentinel" 2>/dev/null || stat -f "%m" "$sentinel" 2>/dev/null
+    stat -c "%.Y" "$sentinel" 2>/dev/null || stat -f "%m" "$sentinel" 2>/dev/null
 }
 
 defbody git_source {

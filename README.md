@@ -303,7 +303,8 @@ Print all built-in definitions as mmk syntax with `mmk -builtins`.
 
 ```bash
 deftype my_artifact {
-    # Body prints epoch seconds or RFC3339 to stdout.
+    # Body prints epoch seconds, "epoch.nanos" (e.g. `stat -c %.Y`),
+    # or RFC3339 to stdout.
     # Non-zero exit means "doesn't exist yet".
     my-tool stat "$target" 2>/dev/null || return 1
 }

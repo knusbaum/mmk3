@@ -35,7 +35,7 @@ inside each task's subprocess.
 [verb target] [on runner] [opt=val ...] :+ dep ...    # inherit + extend
 
 # Type definitions
-deftype TYPE { body that prints epoch-seconds or RFC3339 to stdout; non-zero = absent }
+deftype TYPE { body that prints epoch-seconds, "epoch.nanos" (e.g. `stat -c %.Y`), or RFC3339 to stdout; non-zero = absent }
 defbody TYPE [opt=val ...] [: dep ...] { default body for typed targets with no body }
 defbody TYPE VERB [opt=val ...] { default body for [VERB target] on TYPE }
 # Dep clause on the non-verb defbody: bash expressions evaluated per-target-instance

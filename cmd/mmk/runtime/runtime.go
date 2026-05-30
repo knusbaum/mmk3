@@ -1087,9 +1087,10 @@ type TargetNode struct {
 	depsBuilt bool
 	resolveErr error
 
-	dateOnce sync.Once
-	dateVal  time.Time
-	dateErr  error
+	dateMu    sync.Mutex
+	dateVal   time.Time
+	dateErr   error
+	dateValid bool
 
 	nodeState atomic.Int32 // NodeState; read by TUI via State()
 }
@@ -1600,12 +1601,29 @@ func (b *Build) effectiveVerbOption(target, verb, key string) string {
 //   - file: returns the file's mtime, or zero if the file doesn't exist.
 //   - image: returns the docker image's creation time, or zero if not found.
 //   - user-defined (deftype): runs __mmk_type_<name>, parses stdout as a
-//     timestamp (epoch seconds or RFC3339); non-zero exit returns zero time.
+//     timestamp (epoch seconds, epoch seconds with nanosecond fraction, or
+//     RFC3339); non-zero exit returns zero time.
 func (n *TargetNode) Date() (time.Time, error) {
-	n.dateOnce.Do(func() {
-		n.dateVal, n.dateErr = n.computeDate()
-	})
+	n.dateMu.Lock()
+	defer n.dateMu.Unlock()
+	if n.dateValid {
+		return n.dateVal, n.dateErr
+	}
+	n.dateVal, n.dateErr = n.computeDate()
+	n.dateValid = true
 	return n.dateVal, n.dateErr
+}
+
+// invalidateDate clears the cached Date so the next Date() call re-evaluates
+// against the artifact's current state. Called after Run() rewrites the
+// artifact so a downstream consumer's NeedsRun sees the new mtime instead of
+// the pre-rebuild value the cache otherwise holds. The dag executor closes
+// step.done only after Run returns, so the invalidation (deferred in Run)
+// happens-before any consumer's NeedsRun reads this node's Date.
+func (n *TargetNode) invalidateDate() {
+	n.dateMu.Lock()
+	n.dateValid = false
+	n.dateMu.Unlock()
 }
 
 func (n *TargetNode) computeDate() (time.Time, error) {
@@ -1681,7 +1699,8 @@ func (n *TargetNode) NeedsRun() (bool, error) {
 }
 
 // userTypeDate runs the deftype bash function for this node's type and parses
-// its stdout as a timestamp (epoch seconds or RFC3339/RFC3339Nano).
+// its stdout as a timestamp (epoch seconds, epoch seconds with a nanosecond
+// fraction matching GNU `stat -c %.Y`, or RFC3339/RFC3339Nano).
 // Non-zero exit means the artifact is absent (returns zero time, nil error).
 // Failure to spawn bash or parse output is a real error.
 func (n *TargetNode) userTypeDate() (time.Time, error) {
@@ -1696,7 +1715,9 @@ func (n *TargetNode) userTypeDate() (time.Time, error) {
 	return parseTimestamp(strings.TrimSpace(out))
 }
 
-// parseTimestamp parses s as either epoch seconds (all digits) or RFC3339/RFC3339Nano.
+// parseTimestamp parses s as epoch seconds (all digits, e.g. "1780111599"),
+// epoch seconds with a fractional component (e.g. "1780111599.362179295",
+// matching GNU `stat -c %.Y`), or RFC3339/RFC3339Nano.
 func parseTimestamp(s string) (time.Time, error) {
 	if isAllDigits(s) {
 		epoch, err := strconv.ParseInt(s, 10, 64)
@@ -1705,13 +1726,31 @@ func parseTimestamp(s string) (time.Time, error) {
 		}
 		return time.Unix(epoch, 0), nil
 	}
+	if i := strings.IndexByte(s, '.'); i > 0 && i < len(s)-1 {
+		intPart, fracPart := s[:i], s[i+1:]
+		if isAllDigits(intPart) && isAllDigits(fracPart) {
+			secs, err := strconv.ParseInt(intPart, 10, 64)
+			if err == nil {
+				// Normalize fracPart to exactly 9 digits (nanoseconds).
+				if len(fracPart) > 9 {
+					fracPart = fracPart[:9]
+				} else if len(fracPart) < 9 {
+					fracPart = fracPart + strings.Repeat("0", 9-len(fracPart))
+				}
+				nanos, err := strconv.ParseInt(fracPart, 10, 64)
+				if err == nil {
+					return time.Unix(secs, nanos), nil
+				}
+			}
+		}
+	}
 	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
 		return t, nil
 	}
 	if t, err := time.Parse(time.RFC3339, s); err == nil {
 		return t, nil
 	}
-	return time.Time{}, fmt.Errorf("cannot parse timestamp %q (want epoch seconds or RFC3339)", s)
+	return time.Time{}, fmt.Errorf("cannot parse timestamp %q (want epoch seconds, epoch.nanos, or RFC3339)", s)
 }
 
 func isAllDigits(s string) bool {
@@ -1788,6 +1827,10 @@ func (n *TargetNode) executeScript() (string, bool) {
 // the runner type. If the rule has an `on` runner, the body is dispatched
 // through the runner's run function. Otherwise it runs the body locally.
 func (n *TargetNode) Run() error {
+	// Drop the cached Date once the body finishes — the artifact may have
+	// been rewritten, and a stale cache is what causes the cascade-after-
+	// in-run-rebuild skip. See invalidateDate's comment.
+	defer n.invalidateDate()
 	if n.resolveErr != nil {
 		return n.resolveErr
 	}

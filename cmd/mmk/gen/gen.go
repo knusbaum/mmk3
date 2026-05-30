@@ -62,13 +62,17 @@ func VerbTargetFunc(verb, target string) string { return "__mmk_verb_" + verb + 
 func DefaultVerbFunc(typeName, verb string) string { return "__mmk_default_" + verb + "_" + typeName }
 
 // statMtime is the bash body that prints the target's mtime to stdout.
-// stat's flags differ across platforms: -c %Y (GNU coreutils) vs -f %m (BSD).
-// Pick the right one based on the host OS where mmk runs.
+// stat's flags differ across platforms: -c %.Y (GNU coreutils, nanosecond
+// precision) vs -f %m (BSD, second precision). Pick the right one based on
+// the host OS where mmk runs. The sub-second form matters when a source file
+// and a freshly-built target share the same integer second — without it, the
+// source's high-precision Go mtime looks newer than the truncated target
+// mtime and causes a spurious rebuild on the next mmk run.
 var statMtime = func() string {
 	if runtime.GOOS == "darwin" || runtime.GOOS == "freebsd" || runtime.GOOS == "openbsd" || runtime.GOOS == "netbsd" {
 		return "\n\tstat -f %m \"$target\" 2>/dev/null || return 1\n"
 	}
-	return "\n\tstat -c %Y \"$target\" 2>/dev/null || return 1\n"
+	return "\n\tstat -c %.Y \"$target\" 2>/dev/null || return 1\n"
 }()
 
 // BuiltinDefTypes contains the built-in deftype body (bash printing a timestamp)

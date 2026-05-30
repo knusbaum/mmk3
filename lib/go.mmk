@@ -61,7 +61,7 @@ defbody go_module update {
 # ---- go_exe ------------------------------------------------------------------
 
 deftype go_exe {
-    [ -f "$target" ] && (stat -c "%Y" "$target" 2>/dev/null || stat -f "%m" "$target" 2>/dev/null)
+    [ -f "$target" ] && (stat -c "%.Y" "$target" 2>/dev/null || stat -f "%m" "$target" 2>/dev/null)
 }
 
 defbody go_exe {
