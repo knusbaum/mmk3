@@ -40,6 +40,13 @@ func Run(b *runtime.Build, target, verb string, parallelism int) error {
 
 	caps := &captures{m: map[string]*bytes.Buffer{}}
 	ring := newLogRing(2000)
+	// Bubbletea's raw mode swallows Ctrl+C as a keystroke, so the
+	// kernel's foreground-pgroup broadcast can't kill subprocess
+	// trees on its own. Tell the runtime to fork each subprocess
+	// into its own pgroup so SignalAll(-pgid, sig) — driven by the
+	// keystroke handler in update() — can reach descendants like
+	// `cc`, `docker exec`, or a dev server bash spawned.
+	b.SubprocessPgroups = true
 	b.OutputWriter = func(target, verb string) (io.Writer, io.Writer) {
 		w := &lineWriter{
 			key:     nodeKey(target, verb),

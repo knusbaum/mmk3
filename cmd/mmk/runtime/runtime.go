@@ -97,6 +97,29 @@ type Build struct {
 	// node's body execution. Used by the TUI to capture per-node output for
 	// later replay on failure. If nil, body output goes to os.Stdout/Stderr.
 	OutputWriter func(target string, verb string) (stdout, stderr io.Writer)
+	// SubprocessPgroups asks the runtime to launch every task subprocess
+	// (bash for body execution, runner binaries) with Setpgid:true so
+	// each subprocess and its descendants form their own process group.
+	// Set this when the caller plans to drive cancellation through
+	// SignalAll(sig) — `kill(-pgid, sig)` needs the subprocess to be a
+	// pgroup leader so the signal reaches descendants like cc, docker
+	// exec, or long-running dev servers without also affecting mmk
+	// itself.
+	//
+	// Leave false (the default) for interactive runs where the user's
+	// terminal Ctrl+C should naturally cascade to the subprocess via
+	// the kernel's foreground-pgroup broadcast — that only works if
+	// the subprocess shares mmk's pgroup.
+	//
+	// The TUI sets this to true because bubbletea's raw mode swallows
+	// Ctrl+C as a keystroke event (so the foreground-pgroup broadcast
+	// path never fires), making SignalAll the only way to kill the
+	// subprocess tree. The flag is deliberately separate from
+	// OutputWriter — OutputWriter is also installed by the failure-
+	// capture tee in Build.Execute even in interactive mode, and
+	// piggy-backing the pgroup choice on it would (and did) cause
+	// interactive Ctrl+C to leak subprocess trees.
+	SubprocessPgroups bool
 	concretes     map[string]*parse.TargetRule
 	verbConcretes map[verbNodeKey]*parse.TargetRule
 	patterns      []*patternEntry
@@ -1806,13 +1829,11 @@ func (n *TargetNode) runWithRunner(execute string) error {
 
 	script := `. "$MMK_GENFILE"; ` + gen.RunnerRunFunc(runnerType)
 	cmd := exec.Command("bash", "-c", script)
-	// Setpgid only under TUI. Under TUI the user can't Ctrl+C the terminal
-	// (bubbletea raw mode), so SignalAll(-pgid, sig) is the only kill path —
-	// it needs the subprocess to be in its own PG to reach descendants like
-	// docker exec without affecting mmk. Under interactive mode we want
-	// terminal Ctrl+C to cascade to the subprocess naturally, which only
-	// works if it shares mmk's foreground PG.
-	if n.build.OutputWriter != nil {
+	// See Build.SubprocessPgroups for the rationale: tree-kill via
+	// SignalAll(-pgid, sig) needs the subprocess to be its own pgroup
+	// leader, but Setpgid breaks the interactive-Ctrl+C cascade. The
+	// caller picks via the flag.
+	if n.build.SubprocessPgroups {
 		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	}
 	// For verb nodes, the default rule's options are layered in below the
@@ -3168,10 +3189,10 @@ func (n *TargetNode) runBash(execute string, output bool) error {
 	// aggregators can blow past via the env vector.
 	script := `. "$MMK_GENFILE"; target="$MMK_TARGET"; MMK_DEPS="$(cat "$MMK_DEPSFILE")"; export MMK_DEPS; deps="$MMK_DEPS"; read -ra dep <<< "$deps"; eval "$MMK_EXECUTE"`
 	c := exec.Command("bash", "-c", script)
-	// See runWithRunner: Setpgid only under TUI so SignalAll-based cancellation
-	// can target the subprocess's PG. Interactive mode shares mmk's PG so
-	// terminal Ctrl+C cascades.
-	if n.build.OutputWriter != nil {
+	// See Build.SubprocessPgroups: own pgroup is required when the
+	// caller drives cancellation via SignalAll; shared pgroup is
+	// required for interactive terminal Ctrl+C to cascade.
+	if n.build.SubprocessPgroups {
 		c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	}
 	c.Env = append(os.Environ(),
