@@ -224,10 +224,6 @@ type treeLine struct {
 	groupKeys []string
 }
 
-// collapseThreshold is the minimum group size that triggers collapsing a set
-// of pattern-instantiated siblings into a single line.
-const collapseThreshold = 10
-
 type treeData struct {
 	rootLabel string
 	rootKey   string
@@ -246,82 +242,34 @@ func buildTree(root *runtime.TargetNode) treeData {
 	return t
 }
 
-// emitChildren renders the deps of a node, collapsing any group of >10
-// pattern-instantiated siblings (sharing pattern + verb) into a single line.
+// emitChildren renders the deps of a node, collapsing pattern-instantiated
+// siblings into a single line via runtime.GroupSiblings.
 func emitChildren(t *treeData, children []*runtime.TargetNode, prefix string, visited map[string]bool) {
-	items := groupChildren(children)
+	items := runtime.GroupSiblings(children)
 	for i, it := range items {
 		isLast := i == len(items)-1
-		if it.isGroup {
+		if it.IsGroup() {
 			emitGroup(t, it, prefix, isLast, visited)
 			continue
 		}
-		appendChild(t, it.node, prefix, isLast, visited)
+		appendChild(t, it.Node, prefix, isLast, visited)
 	}
 }
 
-type childItem struct {
-	node    *runtime.TargetNode // individual line if non-nil
-	isGroup bool
-	pattern string
-	verb    string
-	members []*runtime.TargetNode // group members
-}
-
-// groupChildren returns the display order of `children`: individual nodes
-// where they come, and one entry per group of >threshold pattern-siblings
-// (placed at the position of the first sibling). Mixed pattern + concrete
-// siblings preserve their original order; the group collapses in place.
-func groupChildren(children []*runtime.TargetNode) []childItem {
-	counts := map[string]int{}
-	for _, c := range children {
-		if p := c.SourcePattern(); p != "" {
-			counts[c.Verb()+"\x00"+p]++
-		}
-	}
-	rendered := map[string]bool{}
-	var out []childItem
-	for _, c := range children {
-		p := c.SourcePattern()
-		if p == "" || counts[c.Verb()+"\x00"+p] <= collapseThreshold {
-			out = append(out, childItem{node: c})
-			continue
-		}
-		key := c.Verb() + "\x00" + p
-		if rendered[key] {
-			continue
-		}
-		rendered[key] = true
-		var members []*runtime.TargetNode
-		for _, c2 := range children {
-			if c2.SourcePattern() == p && c2.Verb() == c.Verb() {
-				members = append(members, c2)
-			}
-		}
-		out = append(out, childItem{
-			isGroup: true,
-			pattern: p,
-			verb:    c.Verb(),
-			members: members,
-		})
-	}
-	return out
-}
-
-func emitGroup(t *treeData, it childItem, prefix string, isLast bool, visited map[string]bool) {
+func emitGroup(t *treeData, it runtime.SiblingGroup, prefix string, isLast bool, visited map[string]bool) {
 	connector := "├── "
 	childPrefix := prefix + "│   "
 	if isLast {
 		connector = "└── "
 		childPrefix = prefix + "    "
 	}
-	keys := make([]string, len(it.members))
-	for i, m := range it.members {
+	keys := make([]string, len(it.Members))
+	for i, m := range it.Members {
 		keys[i] = nodeKey(m.Target(), m.Verb())
 	}
-	label := fmt.Sprintf("'%s' × %d", it.pattern, len(it.members))
-	if it.verb != "" {
-		label = fmt.Sprintf("[%s '%s'] × %d", it.verb, it.pattern, len(it.members))
+	label := fmt.Sprintf("'%s' × %d", it.Pattern, len(it.Members))
+	if it.Verb != "" {
+		label = fmt.Sprintf("[%s '%s'] × %d", it.Verb, it.Pattern, len(it.Members))
 	}
 	t.lines = append(t.lines, treeLine{
 		prefix:    prefix + connector,
@@ -329,15 +277,9 @@ func emitGroup(t *treeData, it childItem, prefix string, isLast bool, visited ma
 		groupKeys: keys,
 	})
 
-	// Surface the group's shared deps under the collapsed line, the way
-	// -graph does. Take the union of every member's DisplayDeps (in
-	// first-seen order, deduped by nodeKey) so $1-templated deps that
-	// differ across members all show up. Members of a typical pattern
-	// rule share an identical dep set; the union collapses to one entry
-	// per dep in that case.
 	seen := map[string]bool{}
 	var combined []*runtime.TargetNode
-	for _, m := range it.members {
+	for _, m := range it.Members {
 		for _, d := range m.DisplayDeps() {
 			k := nodeKey(d.Target(), d.Verb())
 			if seen[k] {

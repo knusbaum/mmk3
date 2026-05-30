@@ -307,6 +307,7 @@ These are set in every target body, `deftype`, and `defbody`:
 | each matrix `for V in [...]` | `$V` set to the combo's value. |
 | `$MMK_GENFILE` | Path to the generated bash script (rarely needed by user code). |
 | `$MMK_VERBOSE` | `1` if `mmk -v`; useful in custom runners. |
+| `$MMK_J` | Parallelism level (overrides the `-j` default); inherited by subproject invocations. |
 
 In **runner run-phase** bodies (custom `defrunner NAME { ... }`), additionally:
 

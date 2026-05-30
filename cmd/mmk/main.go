@@ -4,6 +4,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"strconv"
 	"syscall"
 
 	"github.com/knusbaum/mmk3/cmd/mmk/gen"
@@ -14,7 +15,13 @@ import (
 
 func main() {
 	raiseOpenFileLimit()
-	j := flag.Int("j", 100, "parallelism (0 = unlimited)")
+	jDefault := 100
+	if s := os.Getenv("MMK_J"); s != "" {
+		if n, err := strconv.Atoi(s); err == nil {
+			jDefault = n
+		}
+	}
+	j := flag.Int("j", jDefault, "parallelism (0 = unlimited; default overridden by $MMK_J)")
 	v := flag.Bool("v", false, "verbose: log each target as it runs or is skipped")
 	why := flag.Bool("why", false, "print the dep chain from root → target as each target starts")
 	dump := flag.Bool("dump", false, "print generated shell script and exit")
@@ -32,6 +39,12 @@ func main() {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+
+	flag.Visit(func(f *flag.Flag) {
+		if f.Name == "j" {
+			os.Setenv("MMK_J", strconv.Itoa(*j))
+		}
+	})
 
 	if *installSkill {
 		if err := runInstallSkill(); err != nil {

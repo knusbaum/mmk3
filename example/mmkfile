@@ -114,9 +114,6 @@ file consumer2 : [ numbers2 @ i ] {
     touch "$target";
 }
 
-
-many : consumer2 g_downstream downstream executable
-
 file top {
     echo building $target
     sleep 1;
@@ -135,7 +132,9 @@ file out for j in [ $(seq 1 100) ] : [intermediate2 @ j=$j] [other2 @ j=$j] {
     touch "$target";
 }
 
+bottom : out
 
+many : consumer2 g_downstream downstream executable bottom
 
 file outdir {
     mkdir outdir
@@ -154,6 +153,6 @@ file 'outdir/([a-zA-Z0-9]*)_([0-9]*)_([0-9]*)\.out' : outdir {
      fi;
 }
 
-outs for i in [ $(seq 1 100) ] for j in [ $(seq 1 1000) ] : outdir/out_$i_$j.out
+outs for i in [ $(seq 1 100) ] for j in [ $(seq 1 100) ] : outdir/out_$i_$j.out
 
 dooutdir : outs

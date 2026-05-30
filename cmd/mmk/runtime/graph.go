@@ -89,15 +89,72 @@ func (gp *graphPrinter) printChildren(n *TargetNode, prefix string) {
 		}
 	}
 
-	total := len(deps)
+	// Preserve the orderly flag per node before GroupSiblings reorders.
+	orderlyOf := make(map[*TargetNode]bool, len(deps))
+	nodes := make([]*TargetNode, len(deps))
+	for i, d := range deps {
+		nodes[i] = d.node
+		orderlyOf[d.node] = d.orderly
+	}
+
+	groups := GroupSiblings(nodes)
+	total := len(groups)
 	if subOutput != "" {
 		total++
 	}
-	for i, dep := range deps {
-		gp.printNode(dep, prefix, i == total-1)
+	for i, g := range groups {
+		isLast := i == total-1
+		if g.IsGroup() {
+			gp.printGroupNode(g, prefix, isLast)
+		} else {
+			gp.printNode(displayDep{node: g.Node, orderly: orderlyOf[g.Node]}, prefix, isLast)
+		}
 	}
 	if subOutput != "" {
 		spliceSubGraph(gp.w, subOutput, prefix, true)
+	}
+}
+
+// printGroupNode renders a collapsed group header line followed by the union
+// of deps from all members.
+func (gp *graphPrinter) printGroupNode(g SiblingGroup, prefix string, isLast bool) {
+	connector := "├── "
+	childPrefix := prefix + "│   "
+	if isLast {
+		connector = "└── "
+		childPrefix = prefix + "    "
+	}
+	label := fmt.Sprintf("'%s' × %d", g.Pattern, len(g.Members))
+	if g.Verb != "" {
+		label = fmt.Sprintf("[%s '%s'] × %d", g.Verb, g.Pattern, len(g.Members))
+	}
+	fmt.Fprintf(gp.w, "%s%s%s\n", prefix, connector, label)
+	gp.printGroupChildren(g.Members, childPrefix)
+}
+
+// printGroupChildren renders the union of DisplayDeps across all members,
+// applying GroupSiblings so nested pattern groups also collapse.
+func (gp *graphPrinter) printGroupChildren(members []*TargetNode, prefix string) {
+	seen := map[string]bool{}
+	var combined []*TargetNode
+	for _, m := range members {
+		for _, d := range m.DisplayDeps() {
+			k := nodeKey(d)
+			if seen[k] {
+				continue
+			}
+			seen[k] = true
+			combined = append(combined, d)
+		}
+	}
+	groups := GroupSiblings(combined)
+	for i, g := range groups {
+		isLast := i == len(groups)-1
+		if g.IsGroup() {
+			gp.printGroupNode(g, prefix, isLast)
+		} else {
+			gp.printNode(displayDep{node: g.Node}, prefix, isLast)
+		}
 	}
 }
 
@@ -258,4 +315,61 @@ func shouldPruneVerbSubgraph(n *TargetNode) bool {
 		return false
 	}
 	return !subgraphHasBody(n, make(map[*TargetNode]bool))
+}
+
+// SiblingGroup is either a single node or a collapsed group of
+// pattern-instantiated siblings sharing the same source pattern and verb.
+// Display layers call GroupSiblings to partition a sibling list, then render
+// groups as one summary line followed by their shared deps.
+type SiblingGroup struct {
+	Node    *TargetNode   // non-nil for individual (non-group) items
+	Pattern string        // source pattern (non-empty for groups)
+	Verb    string        // verb (for groups with a verb)
+	Members []*TargetNode // group members (non-empty for groups)
+}
+
+// IsGroup reports whether this item represents a collapsed pattern group.
+func (g SiblingGroup) IsGroup() bool { return g.Node == nil }
+
+// siblingCollapseThreshold is the minimum number of same-pattern siblings
+// that triggers collapsing them into a single summary line.
+const siblingCollapseThreshold = 10
+
+// GroupSiblings partitions children into individual nodes and collapsed groups.
+// Nodes that share the same source pattern (and verb) are grouped when there
+// are more than siblingCollapseThreshold of them. Groups are placed at the
+// position of their first member in the original order.
+func GroupSiblings(children []*TargetNode) []SiblingGroup {
+	counts := map[string]int{}
+	for _, c := range children {
+		if p := c.SourcePattern(); p != "" {
+			counts[c.Verb()+"\x00"+p]++
+		}
+	}
+	rendered := map[string]bool{}
+	var out []SiblingGroup
+	for _, c := range children {
+		p := c.SourcePattern()
+		if p == "" || counts[c.Verb()+"\x00"+p] <= siblingCollapseThreshold {
+			out = append(out, SiblingGroup{Node: c})
+			continue
+		}
+		key := c.Verb() + "\x00" + p
+		if rendered[key] {
+			continue
+		}
+		rendered[key] = true
+		var members []*TargetNode
+		for _, c2 := range children {
+			if c2.SourcePattern() == p && c2.Verb() == c.Verb() {
+				members = append(members, c2)
+			}
+		}
+		out = append(out, SiblingGroup{
+			Pattern: p,
+			Verb:    c.Verb(),
+			Members: members,
+		})
+	}
+	return out
 }
