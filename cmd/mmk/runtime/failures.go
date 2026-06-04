@@ -19,6 +19,18 @@ type FailureRecord struct {
 	Output string
 }
 
+func failureSummaryRecords(fs []FailureRecord, replayOutput bool) []FailureRecord {
+	if replayOutput {
+		return fs
+	}
+	out := make([]FailureRecord, len(fs))
+	copy(out, fs)
+	for i := range out {
+		out[i].Output = ""
+	}
+	return out
+}
+
 // FailureLabel returns "[verb target]" if verb is set, else target.
 func FailureLabel(f FailureRecord) string {
 	if f.Verb != "" {

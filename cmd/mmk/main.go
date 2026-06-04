@@ -24,6 +24,7 @@ func main() {
 	j := flag.Int("j", jDefault, "parallelism (0 = unlimited; default overridden by $MMK_J)")
 	v := flag.Bool("v", false, "verbose: log each target as it runs or is skipped")
 	why := flag.Bool("why", false, "print the dep chain from root → target as each target starts")
+	replayFailureOutput := flag.Bool("replay-failure-output", false, "replay the first failed target's captured stdout/stderr in the failure summary")
 	dump := flag.Bool("dump", false, "print generated shell script and exit")
 	builtins := flag.Bool("builtins", false, "print built-in type definitions as mmk syntax and exit")
 	list := flag.Bool("list", false, "list available targets and verbs, then exit")
@@ -35,7 +36,7 @@ func main() {
 	useTUI := flag.Bool("tui", false, "render the build as a live TUI tree with status updates")
 	installSkill := flag.Bool("install-skill", false, "install the mmk Claude Code skill via 'claude plugin' commands (Y/n prompt before running)")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: mmk [-j N] [-v] [-dump] [-builtins] [-list [-all]] [-graph [-full]] [[verb] target]\n")
+		fmt.Fprintf(os.Stderr, "usage: mmk [-j N] [-v] [-replay-failure-output] [-dump] [-builtins] [-list [-all]] [-graph [-full]] [[verb] target]\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -79,6 +80,7 @@ func main() {
 	// rewrite synthetic subproject bodies to pass -v explicitly.
 	b.Verbose = *v || os.Getenv("MMK_VERBOSE") == "1"
 	b.Why = *why
+	b.ReplayFailureOutput = *replayFailureOutput
 
 	if *list {
 		b.PrintList(os.Stdout, *all)

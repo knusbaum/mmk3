@@ -825,6 +825,23 @@ dep {
 	}
 }
 
+func TestFailureSummaryRecordsOmitReplayOutputByDefault(t *testing.T) {
+	fs := []FailureRecord{{Target: "bad", Output: "already printed\n"}}
+
+	got := failureSummaryRecords(fs, false)
+	if got[0].Output != "" {
+		t.Fatalf("Output = %q, want empty", got[0].Output)
+	}
+	if fs[0].Output == "" {
+		t.Fatal("failureSummaryRecords mutated input")
+	}
+
+	got = failureSummaryRecords(fs, true)
+	if got[0].Output != fs[0].Output {
+		t.Fatalf("Output = %q, want %q", got[0].Output, fs[0].Output)
+	}
+}
+
 func TestDefBodyUsedForBodylessTarget(t *testing.T) {
 	src := `
 deftype mytype {
@@ -2074,7 +2091,6 @@ extra :
 		}
 	}
 }
-
 
 func TestVerbPatternBodyRunsWhenDepHasRunner(t *testing.T) {
 	tmp := t.TempDir()

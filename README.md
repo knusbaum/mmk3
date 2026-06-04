@@ -801,6 +801,7 @@ mmk [flags] [[verb] target]
 |--------------|-------------|
 | `-j N`       | Parallelism. Default 0 = unlimited. |
 | `-v`         | Verbose: log each target as it runs or is skipped. Inherited by sub-mmk invocations via `MMK_VERBOSE=1`. |
+| `-replay-failure-output` | Replay the first failed target's captured stdout/stderr in the failure summary. By default, output is shown live only. |
 | `-list`      | List user-facing targets and verbs. By default, only targets with a `##` docstring are shown (plus `all`); use with `-all` to show everything. |
 | `-list -all` | With `-list`, also show internal/undocumented targets, plus pattern rules and matrix/group/runner aggregators. |
 | `-graph`     | Print the dependency tree (text) for the chosen target+verb. |
