@@ -25,6 +25,10 @@ import (
 	"github.com/knusbaum/mmk3/dag"
 )
 
+const (
+	envSuppressFailureSummary = "MMK_SUPPRESS_FAILURE_SUMMARY"
+)
+
 // ErrCancelled is returned from a node's Run when the build was cancelled
 // (Build.Cancel) before the node started executing. dag treats it like any
 // other failure — downstream nodes propagate it and skip their own work.
@@ -93,6 +97,10 @@ type Build struct {
 	// it starts running, so the user can see how a running node relates to
 	// the target they asked for.
 	Why bool
+	// ReplayFailureOutput makes the non-TUI failure summary include the first
+	// failed target's captured stdout/stderr. By default, command output is only
+	// shown live to avoid duplicating diagnostics at the end of the build.
+	ReplayFailureOutput bool
 	// OutputWriter, if non-nil, supplies the stdout/stderr writers for a
 	// node's body execution. Used by the TUI to capture per-node output for
 	// later replay on failure. If nil, body output goes to os.Stdout/Stderr.
@@ -120,18 +128,18 @@ type Build struct {
 	// piggy-backing the pgroup choice on it would (and did) cause
 	// interactive Ctrl+C to leak subprocess trees.
 	SubprocessPgroups bool
-	concretes     map[string]*parse.TargetRule
-	verbConcretes map[verbNodeKey]*parse.TargetRule
-	patterns      []*patternEntry
+	concretes         map[string]*parse.TargetRule
+	verbConcretes     map[verbNodeKey]*parse.TargetRule
+	patterns          []*patternEntry
 	// nodes / verbNodes / runnerNodes are populated lazily by Resolve,
 	// ResolveVerb, and runnerNode. dag.Build kicks off most of the writes,
 	// but in the TUI those happen in the executor goroutine while the View
 	// goroutine reads via NodeFor — so all four operations take nodesMu.
-	nodesMu     sync.RWMutex
-	nodes       map[string]*TargetNode
-	verbNodes   map[verbNodeKey]*TargetNode
-	runnerNodes map[string]*TargetNode // runner target name → synthetic runner init node
-	runnerDefs    map[string]runnerDefInfo
+	nodesMu            sync.RWMutex
+	nodes              map[string]*TargetNode
+	verbNodes          map[verbNodeKey]*TargetNode
+	runnerNodes        map[string]*TargetNode // runner target name → synthetic runner init node
+	runnerDefs         map[string]runnerDefInfo
 	defBodies          map[string]bool // type name → has default body (built-in or user defbody)
 	defVerbBodies      map[defVerbBodyKey]bool
 	userDefBodyOptions map[defVerbBodyKey][]parse.Option // user defbody options keyed by (type, verb)
@@ -139,12 +147,12 @@ type Build struct {
 	defRunnerDeps      map[string][]string               // defrunner dep tokens keyed by runner type name (nil means: type does not customize, use default)
 	defRunnerDepsCache map[string][]string               // resolved runner-instance dep names, keyed by runner target name; cached so the dep-clause bash runs once per runner instance
 	subprojects        map[string]*subprojectInfo        // subproject target → metadata for sub-path delegation
-	matrixInfo     map[string]*matrixRuleInfo // base target → matrix info (for aggregators and dep resolution)
-	matrixVars     map[string]matrixCombo     // internal combo target name → its variable assignments
-	declaredGroups map[string]bool            // group names from `group` directives
-	groups         map[string]*groupData      // populated during expansion
-	genPath        string
-	genFile        *os.File
+	matrixInfo         map[string]*matrixRuleInfo        // base target → matrix info (for aggregators and dep resolution)
+	matrixVars         map[string]matrixCombo            // internal combo target name → its variable assignments
+	declaredGroups     map[string]bool                   // group names from `group` directives
+	groups             map[string]*groupData             // populated during expansion
+	genPath            string
+	genFile            *os.File
 
 	runnerStatesMu sync.Mutex
 	runnerStates   map[string]string // runner target name → state from setup stdout
@@ -413,8 +421,8 @@ func newBuildFromAST(f *parse.File) (*Build, error) {
 		matrixVars:         make(map[string]matrixCombo),
 		declaredGroups:     make(map[string]bool),
 		groups:             make(map[string]*groupData),
-		runnerStates: make(map[string]string),
-		cancelCh:     make(chan struct{}),
+		runnerStates:       make(map[string]string),
+		cancelCh:           make(chan struct{}),
 	}
 
 	// Populate runnerDefs from built-in definitions.
@@ -887,9 +895,10 @@ func (b *Build) Execute(target, verb string, parallelism int) error {
 	execErr := dag.Execute(root, parallelism, b.cancelCh, hooks)
 	// Only render the summary when we installed capture ourselves. Callers
 	// like the TUI handle their own failure surface and don't want a second
-	// copy spilled to stderr.
-	if caps != nil {
-		WriteFailureSummary(os.Stderr, failures, nil)
+	// copy spilled to stderr. Nested mmk processes run from recipe bodies are
+	// suppressed so parent builds don't compose multiple summaries.
+	if caps != nil && os.Getenv(envSuppressFailureSummary) != "1" {
+		WriteFailureSummary(os.Stderr, failureSummaryRecords(failures, b.ReplayFailureOutput), nil)
 	}
 	return execErr
 }
@@ -1068,7 +1077,7 @@ const (
 type NodeState int32
 
 const (
-	NodePending   NodeState = iota
+	NodePending NodeState = iota
 	NodeRunning
 	NodeSkipped
 	NodeDone
@@ -1077,14 +1086,14 @@ const (
 )
 
 type TargetNode struct {
-	build     *Build
-	target    string
-	verb      string            // non-empty for verb nodes
-	rule      *parse.TargetRule // nil when kind != kindRule, or for inherited verb nodes
-	kind      targetKind
-	runnerFor *TargetNode // set when kind == kindRunner
-	deps      []*TargetNode
-	depsBuilt bool
+	build      *Build
+	target     string
+	verb       string            // non-empty for verb nodes
+	rule       *parse.TargetRule // nil when kind != kindRule, or for inherited verb nodes
+	kind       targetKind
+	runnerFor  *TargetNode // set when kind == kindRunner
+	deps       []*TargetNode
+	depsBuilt  bool
 	resolveErr error
 
 	dateMu    sync.Mutex
@@ -1891,6 +1900,7 @@ func (n *TargetNode) runWithRunner(execute string) error {
 
 	cmd.Env = append(os.Environ(),
 		"MMK_GENFILE="+n.build.genPath,
+		envSuppressFailureSummary+"=1",
 		"target="+runnerNode.target,
 		"deps="+strings.Join(runnerNode.explicitDepNames(), " "),
 		"MMK_RUNNER_STATE="+state,
@@ -3044,7 +3054,7 @@ func (b *Build) expandSubprojects(f *parse.File) error {
 			Target:      sp.Target,
 			Runner:      sp.Runner,
 			HasDepSep:   true,
-			Body:        fmt.Sprintf("\n\t(cd %q && mmk)\n", path),
+			Body:        fmt.Sprintf("\n\t(cd %q && MMK_SUPPRESS_FAILURE_SUMMARY= mmk)\n", path),
 			Description: sp.Description,
 		})
 
@@ -3055,7 +3065,7 @@ func (b *Build) expandSubprojects(f *parse.File) error {
 				Runner:    sp.Runner,
 				Verb:      verb,
 				HasDepSep: true,
-				Body:      fmt.Sprintf("\n\t(cd %q && mmk %s)\n", path, verb),
+				Body:      fmt.Sprintf("\n\t(cd %q && MMK_SUPPRESS_FAILURE_SUMMARY= mmk %s)\n", path, verb),
 			})
 		}
 	}
@@ -3101,9 +3111,9 @@ func (b *Build) ResolveSubpath(target, verb string) bool {
 			return false
 		}
 	}
-	body := fmt.Sprintf("\n\t(cd %q && mmk %s)\n", sp.path, suffix)
+	body := fmt.Sprintf("\n\t(cd %q && MMK_SUPPRESS_FAILURE_SUMMARY= mmk %s)\n", sp.path, suffix)
 	if verb != "" {
-		body = fmt.Sprintf("\n\t(cd %q && mmk %s %s)\n", sp.path, verb, suffix)
+		body = fmt.Sprintf("\n\t(cd %q && MMK_SUPPRESS_FAILURE_SUMMARY= mmk %s %s)\n", sp.path, verb, suffix)
 	}
 	rule := &parse.TargetRule{
 		Target:    target,
@@ -3240,6 +3250,7 @@ func (n *TargetNode) runBash(execute string, output bool) error {
 	}
 	c.Env = append(os.Environ(),
 		"MMK_GENFILE="+n.build.genPath,
+		envSuppressFailureSummary+"=1",
 		"MMK_TARGET="+n.target,
 		"MMK_DEPSFILE="+depsFile,
 		"MMK_EXECUTE="+execute,
@@ -3380,12 +3391,12 @@ func mergedRuleOptionKeys(defaultRule, overlay *parse.TargetRule) string {
 
 // subprojectSummary captures what's in a (sub-)mmkfile for -list display.
 type subprojectSummary struct {
-	path               string                 // path relative to the root invocation
-	prefix             string                 // accumulated subproject path, e.g. "src/lib"
-	targets            []string               // concrete (non-pattern, non-verb) target names
-	targetDescriptions map[string]string      // target name → description
-	verbs              []string               // harvested verbs
-	children           []*subprojectSummary   // nested subprojects
+	path               string               // path relative to the root invocation
+	prefix             string               // accumulated subproject path, e.g. "src/lib"
+	targets            []string             // concrete (non-pattern, non-verb) target names
+	targetDescriptions map[string]string    // target name → description
+	verbs              []string             // harvested verbs
+	children           []*subprojectSummary // nested subprojects
 }
 
 // firstLine returns the first line of s, or s itself if there's no newline.
@@ -3655,7 +3666,6 @@ func plural(n int, singular string) string {
 	return fmt.Sprintf("%d %ss", n, singular)
 }
 
-
 // verbToPatternsMap returns each verb's pattern rules.
 func (b *Build) verbToPatternsMap() map[string][]string {
 	out := make(map[string][]string)
@@ -3788,4 +3798,3 @@ func (b *Build) Verbs() []string {
 	sort.Strings(verbs)
 	return verbs
 }
-
