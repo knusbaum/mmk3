@@ -28,7 +28,7 @@ Options: `pkg=` (defaults to `./...`).
 
 ```bash
 include go.mmk
-go_module .
+go_module . :
 ```
 
 ### `go_exe`
@@ -36,14 +36,19 @@ go_module .
 A real file-artifact type: the target name *is* the output binary path.
 Freshness is just the binary's mtime — mmk doesn't track `.go` sources
 individually, so a rebuild after source changes needs `mmk clean <target>`
-or removing the binary.
+or removing the binary. Every `go_exe` build unconditionally depends on a
+`pre_build` group (whether or not anything registers into it), giving
+projects a hook point for codegen without editing generated lines — see
+below.
 
 ```bash
+group pre_build
+
 deftype go_exe {
     [ -f "$target" ] && (stat -c "%Y" "$target" 2>/dev/null || stat -f "%m" "$target" 2>/dev/null)
 }
 
-defbody go_exe {
+defbody go_exe : pre_build {
     mkdir -p "$(dirname "$target")"
     CGO_ENABLED=${cgo:-0} go build ${ldflags:+-ldflags="$ldflags"} -o "$target" "${pkg:-.}"
 }
@@ -56,7 +61,37 @@ Options: `pkg=` (default `.`), `ldflags=`, `cgo=` (default `0`).
 
 ```bash
 include go.mmk
-go_exe bin/myapp pkg=./cmd/myapp
+go_exe bin/myapp pkg=./cmd/myapp :
+```
+
+Note the trailing `:` — a rule line with only options and no dep list or
+body has no `:`/`{` marker for mmk's parser to commit on, so it's silently
+treated as inert passthrough bash rather than a target rule (see
+[language-extensions.md](language-extensions.md#pitfall-typed-rules-need-a--or--marker)).
+`: pre_build` (or any explicit dep list) satisfies this for free; a bare
+options-only line needs the empty `:`.
+
+## `pre_build` hook group
+
+**Status: shipped.** Generated (or hand-written) `go_exe` targets
+unconditionally depend on a `pre_build` group, whether or not anything is
+registered into it yet — this is viable as a default only because of the
+zero-member-group fix in
+[language-extensions.md](language-extensions.md#implemented-declared-groups-always-get-an-aggregator-zero-member-included);
+before that fix, an empty group had no target at all, so the dep would fail
+outright on a project with no codegen step.
+
+A project can hang a code-generation step (or any other pre-build step)
+off every `go_exe` target with no edits to `go.mmk` itself:
+
+```bash
+generate into pre_build : my_generate_tool {
+    my_generate_tool ...
+}
+
+tool my_generate_tool {
+    go install example.com/some/generator@v1.2.3
+}
 ```
 
 ## Planned extensions
@@ -87,7 +122,7 @@ defbody go_exe {
 ```
 
 ```bash
-go_exe bin/myapp pkg=./cmd/myapp version_pkg=main
+go_exe bin/myapp pkg=./cmd/myapp version_pkg=main :
 ```
 
 One option replaces the copy-pasted `git describe`/dirty-check/`-X` dance.
@@ -110,7 +145,7 @@ defbody go_exe {
 
 ```bash
 go_exe "bin/myapp-$goos-$arch" for goos in [darwin linux windows] for arch in [amd64 arm64] \
-    exclude [goos=windows arch=arm64]
+    exclude [goos=windows arch=arm64] :
 ```
 
 No loop-writing, no static-pattern-rule tricks — this is mmk's matrix
@@ -132,9 +167,10 @@ package emits a `go_exe` line into a generated `.mmk` fragment, then prints
 that fragment's path:
 
 ```bash
-go_exe bin/cmd/server pkg=./cmd/server into go_mains
-go_exe bin/cmd/worker pkg=./cmd/worker into go_mains
 group go_mains
+
+go_exe bin/cmd/server pkg=./cmd/server into go_mains :
+go_exe bin/cmd/worker pkg=./cmd/worker into go_mains :
 ```
 
 Target names mirror the package's path relative to the module root
@@ -162,36 +198,6 @@ can depend on "every discovered binary" without enumerating them:
 release : go_mains   # depends on every discovered main package's binary
 ```
 
-### `pre_build`/`post_build` hook groups
-
-**Status: proposed**, and now unblocked by the group fix in
-[language-extensions.md](language-extensions.md#implemented-declared-groups-always-get-an-aggregator-zero-member-included).
-Generated `go_exe` targets can unconditionally depend on a `pre_build`
-group (and similarly a `post_build` group for after-build steps), whether
-or not anything is registered into it yet:
-
-```bash
-go_exe bin/cmd/server pkg=./cmd/server into go_mains : pre_build
-group pre_build
-```
-
-A user writing a plain `Mmkfile` on top of `include go.mmk` can then hang a
-code-generation step (or any other pre-build step) off the discovered
-binaries without editing a single generated line:
-
-```bash
-generate into pre_build : my_generate_tool {
-    my_generate_tool ...
-}
-
-tool my_generate_tool {
-    go install example.com/some/generator@v1.2.3
-}
-```
-
-Before the group fix, this only worked once at least one thing was
-registered into `pre_build` — a group with no producers had no target at
-all, so every `go_exe`'s unconditional `: pre_build` dep would fail outright
-on a project with no codegen step. Fixing the zero-member case in core mmk
-is what makes this hook-point idiom viable as a default, rather than
-something users have to opt into.
+Since a discovered `go_exe` is a normal `go_exe` target, it automatically
+gets the `pre_build` dependency described above — no extra wiring needed
+for a codegen hook to apply to auto-discovered binaries too.

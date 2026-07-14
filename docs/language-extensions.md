@@ -188,3 +188,71 @@ setup : tools   # depends on controller-gen and kind, with no per-tool `into` cl
 This composes with the zero-member-group fix above: a project with zero
 `tool` targets still gets a valid (empty) `tools` aggregator, so `setup :
 tools` never fails to resolve just because nothing has been declared yet.
+
+## Pitfall: typed rules need a `:` or `{` marker
+
+**Status: existing behavior, documented here because it bit doc examples
+in this repo.** `parseDirectiveOrPassthrough`'s "commit and error" heuristic
+(`cmd/mmk/parse/parse.go`) decides whether a line is a target rule or raw
+passthrough bash by scanning for a `:` or `{` on the line (or `{` at the
+start of the next non-blank line). A rule with a type, target name, and
+options but *no* dep list and *no* body — e.g. `go_exe bin/myapp
+pkg=./cmd/myapp` or `c_library libcore.a source=./core` — has neither
+marker, so it's silently treated as inert passthrough bash: no parse error,
+no target registered, the line just does nothing.
+
+The fix is always the same: add a trailing `:` (empty dep list) if the rule
+has no deps of its own:
+
+```bash
+go_exe bin/myapp pkg=./cmd/myapp :
+```
+
+This is by design (see the "Parser ambiguities" section of
+`CLAUDE.md`), not a bug — but it's an easy trap when writing terse
+one-line type declarations (`tool`/`c_library`/`go_exe` style), since the
+failure mode is silence rather than an error. Worth revisiting whether
+`mmk` should warn (or `-dump` should flag) a passthrough line whose first
+word matches a known type name, since that's almost always a mistake
+rather than intentional bash.
+
+## Proposed, not yet implemented: type docstrings + a discoverability command
+
+**Status: design only.** `mmk -list` already distinguishes user-facing
+targets from internal ones via a `##` docstring convention on target rules.
+Types (`deftype`/`defbody`) have no equivalent: there's no way to attach a
+docstring or a declared parameter list to a `deftype`, and no command that
+dumps "every type available in this build — including ones pulled in via
+`include` — its docstring, and the options it reads."
+
+This matters most for the stdlib: a project that does `include go.mmk`
+today has no way to ask mmk what `go_exe` is, what options it takes, or
+what verbs it supports, short of reading `go.mmk`'s source (or this
+`docs/` directory). Sketch of the shape:
+
+```bash
+## Builds a Go binary. The target name is the output path.
+## Options: pkg= (default .), ldflags=, cgo= (default 0).
+deftype go_exe {
+    ...
+}
+```
+
+```
+$ mmk -types
+go_exe       Builds a Go binary. The target name is the output path.
+             Options: pkg= (default .), ldflags=, cgo= (default 0).
+             Verbs: build (default), clean, test
+tool         ...
+```
+
+Open questions, not yet resolved:
+
+- Docstring syntax: reuse `##` (parsed today only for target rules), or
+  something structured enough to extract an options table mechanically
+  rather than free text?
+- Whether `defbody TYPE VERB` needs its own docstring, or whether the verb
+  list is inferred from which `defbody`s exist (simpler, but loses
+  per-verb explanation).
+- How deeply to walk `include` — probably flatten to "every type reachable
+  from this Mmkfile," same scope as `-list`.

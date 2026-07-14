@@ -44,7 +44,7 @@ Options: `build_dir=` (required), `source=.` (default: current dir),
 `prefix=dist` (install prefix for `[install]`), `ctest_args=`.
 
 ```bash
-cmake_project windows on $WIN_IMAGE build_dir=$WIN_BUILD_DIR preset=$CMAKE_PRESET source=src/windows
+cmake_project windows on $WIN_IMAGE build_dir=$WIN_BUILD_DIR preset=$CMAKE_PRESET source=src/windows :
 [test windows]  on $WIN_IMAGE : windows { wine64 "$WIN_BUILD_DIR/widget-tests.exe"; }
 [shell windows] on $WIN_IMAGE { bash; }
 ```
@@ -90,7 +90,7 @@ Options: `repo=` (required), `tag=` — tag, branch, or commit hash
 (required).
 
 ```bash
-git_source build/deps/mjson repo=https://github.com/cesanta/mjson.git tag=032a2ea
+git_source build/deps/mjson repo=https://github.com/cesanta/mjson.git tag=032a2ea :
 
 file build/deps/mjson/mjson.o : build/deps/mjson/src/mjson.c { ... }
 ```
@@ -98,8 +98,8 @@ file build/deps/mjson/mjson.o : build/deps/mjson/src/mjson.c { ... }
 For cmake-based dependencies, `git_source` feeds into `cmake_project`:
 
 ```bash
-git_source build/deps/curl-src  repo=https://github.com/curl/curl.git       tag=curl-8_5_0
-git_source build/deps/pcre2-src repo=https://github.com/PCRE2Project/pcre2.git tag=pcre2-10.42
+git_source build/deps/curl-src  repo=https://github.com/curl/curl.git       tag=curl-8_5_0 :
+git_source build/deps/pcre2-src repo=https://github.com/PCRE2Project/pcre2.git tag=pcre2-10.42 :
 
 cmake_project build/deps/curl source=build/deps/curl-src build_dir=build/deps/curl-build : build/deps/curl-src {
     cmake -B "$build_dir" "$source" -DBUILD_CURL_EXE=OFF -DCURL_STATICLIB=ON ...
