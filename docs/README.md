@@ -30,7 +30,7 @@ boilerplate. A project should be able to say:
 
 ```bash
 include go.mmk
-go_exe bin/myapp pkg=./cmd/myapp
+go_exe bin/myapp pkg=./cmd/myapp :
 ```
 
 and have `mmk`, `mmk test`, `mmk fmt`, `mmk clean`, `mmk update` all work

@@ -82,9 +82,9 @@ Options: `source=DIR` (one or more space-separated directories, required),
 to their sources).
 
 ```bash
-c_library libcore.a     source=./core
-c_library libplatform.a source=./platform
-c_library liblang.a     source=./lang recursive=1
+c_library libcore.a     source=./core :
+c_library libplatform.a source=./platform :
+c_library liblang.a     source=./lang recursive=1 :
 ```
 
 The target name *is* the archive path — `$target` is `libcore.a`.

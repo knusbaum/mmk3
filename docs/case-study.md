@@ -111,11 +111,11 @@ file "$CONFIG_HEADER" : "$CONFIG_SRC" {
 }
 
 # Component libraries — defbody dep clause handles .o discovery per source=.
-c_library libcommon.a  source=./common
-c_library liblinux.a   source=./linux
-c_library libarch.a    source=./linux/$ARCH
-c_library liblang.a    source=./linux/lang recursive=1
-c_library libnginx.a   source=./linux/apps/nginx
+c_library libcommon.a  source=./common :
+c_library liblinux.a   source=./linux :
+c_library libarch.a    source=./linux/$ARCH :
+c_library liblang.a    source=./linux/lang recursive=1 :
+c_library libnginx.a   source=./linux/apps/nginx :
 
 # linux/entry.o is produced by the stdlib '(.*)\.o' pattern rule automatically.
 

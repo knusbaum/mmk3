@@ -19,6 +19,19 @@
 #                   go_module verbs and to . for go_exe build.
 #   ldflags=<str>   Value passed to -ldflags on go build (go_exe).
 #   cgo=0           CGO_ENABLED for the go_exe build (default: 0).
+#
+# Every go_exe build unconditionally depends on the pre_build group, whether
+# or not anything is registered into it. This gives a project a hook point
+# for codegen (or any other pre-build step) without editing generated lines:
+#
+#   generate into pre_build : my_generate_tool {
+#       my_generate_tool ...
+#   }
+#
+#   tool my_generate_tool {
+#       go install example.com/some/generator@v1.2.3
+#   }
+group pre_build
 
 # ---- go_module ---------------------------------------------------------------
 
@@ -64,7 +77,7 @@ deftype go_exe {
     [ -f "$target" ] && (stat -c "%Y" "$target" 2>/dev/null || stat -f "%m" "$target" 2>/dev/null)
 }
 
-defbody go_exe {
+defbody go_exe : pre_build {
     mkdir -p "$(dirname "$target")"
     CGO_ENABLED=${cgo:-0} go build ${ldflags:+-ldflags="$ldflags"} -o "$target" "${pkg:-.}"
 }
