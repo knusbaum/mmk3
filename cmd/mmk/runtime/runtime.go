@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -490,6 +491,36 @@ func newBuildFromAST(f *parse.File) (*Build, error) {
 		if g, ok := d.(*parse.Group); ok {
 			b.declaredGroups[g.Name] = true
 			b.groups[g.Name] = &groupData{description: g.Description}
+		}
+	}
+
+	// Propagate `deftype TYPE into GROUP` membership onto every concrete or
+	// matrix rule of that type (not pattern rules or verb rules), merging
+	// with (not replacing) any `into` clauses the rule itself declares.
+	typeGroups := make(map[string][]string)
+	for _, d := range f.Directives {
+		if dt, ok := d.(*parse.DefType); ok {
+			for _, groupName := range dt.Groups {
+				if !b.declaredGroups[groupName] {
+					b.genFile.Close()
+					os.Remove(b.genPath)
+					return nil, fmt.Errorf("deftype %s: into %s: group %q is not declared (add: group %s)", dt.Name, groupName, groupName, groupName)
+				}
+			}
+			typeGroups[dt.Name] = dt.Groups
+		}
+	}
+	if len(typeGroups) > 0 {
+		for _, d := range f.Directives {
+			r, ok := d.(*parse.TargetRule)
+			if !ok || r.Pattern != "" || r.Verb != "" {
+				continue
+			}
+			for _, groupName := range typeGroups[r.Type] {
+				if !slices.Contains(r.Groups, groupName) {
+					r.Groups = append(r.Groups, groupName)
+				}
+			}
 		}
 	}
 
@@ -2480,14 +2511,14 @@ func groupHasMember(gd *groupData, internalName string) bool {
 }
 
 // createGroupAggregators creates or updates a synthetic aggregator TargetRule
-// for each declared group that has at least one member.
+// for each declared group, regardless of member count. A consumer that
+// depends on a group shouldn't need to know or care how many producers (if
+// any) currently register into it — that's the point of the group/consumer
+// contract — so even a zero-member group gets a (zero-dep) aggregator.
 // It replaces any existing aggregator for the group in f.Directives, or appends
 // a new one if none exists.
 func (b *Build) createGroupAggregators(f *parse.File) error {
 	for groupName, gd := range b.groups {
-		if len(gd.members) == 0 {
-			continue
-		}
 		deps := make([]parse.Dep, len(gd.members))
 		for i, m := range gd.members {
 			deps[i] = parse.Dep{Target: m.internalName}

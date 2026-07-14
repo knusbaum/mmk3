@@ -4,7 +4,7 @@
 //
 //	file       := (directive | newline | comment)*
 //	directive  := deftype | defrunner | target_rule
-//	deftype    := 'deftype' name body
+//	deftype    := 'deftype' name ('into' group)* body
 //	defrunner  := 'defrunner' name ('setup' | 'cleanup')? (':' dep*)? body
 //	target_rule:= type? (target|pattern) ('on' runner)? (':' dep*)? body?
 //	body       := '{' ... '}' (balanced braces, arbitrary content)
@@ -40,9 +40,17 @@ type Directive interface {
 // Body is raw bash that prints the artifact's timestamp to stdout:
 // epoch seconds (all digits) or RFC3339/RFC3339Nano. Non-zero exit means the
 // artifact doesn't exist. $target and $deps are available.
+//
+// Groups is the optional list of `into GROUP` clauses on the deftype header
+// (`deftype TYPE into GROUP ... { body }`). Every non-verb rule of this type
+// is automatically registered into each named group, in addition to any
+// `into` clauses the rule itself declares — a type can make every instance
+// of itself a group member without each rule opting in individually. Each
+// named group must still be declared via a top-level `group` directive.
 type DefType struct {
-	Name string
-	Body string
+	Name   string
+	Body   string
+	Groups []string
 }
 
 // DefRunner defines one phase of a runner type's execution.
@@ -816,9 +824,7 @@ func (p *parser) parseDirective() (Directive, error) {
 
 	switch word {
 	case "deftype":
-		return p.parseDefBlock(word, func(name, body string) Directive {
-			return &DefType{Name: name, Body: body}
-		})
+		return p.parseDefType()
 	case "defrunner":
 		return p.parseDefRunner()
 	case "defbody":
@@ -834,15 +840,34 @@ func (p *parser) parseDirective() (Directive, error) {
 	}
 }
 
-func (p *parser) parseDefBlock(keyword string, make func(name, body string) Directive) (Directive, error) {
-	p.s.readWord() // consume keyword
+// parseDefType handles 'deftype NAME [into GROUP ...] { body }'. Each named
+// group is propagated onto every non-verb rule of this type (see DefType.Groups).
+func (p *parser) parseDefType() (Directive, error) {
+	p.s.readWord() // consume "deftype"
 	name, err := p.parseName()
 	if err != nil {
-		return nil, fmt.Errorf("%s: %w", keyword, err)
+		return nil, fmt.Errorf("deftype: %w", err)
+	}
+	var groups []string
+	for {
+		p.skipWhitespaceAndComments()
+		saved, savedLine := p.s.pos, p.s.line
+		word := p.s.readWord()
+		if word == "into" {
+			p.s.skipHorizontalSpace()
+			groupName, gnErr := p.parseName()
+			if gnErr != nil {
+				return nil, fmt.Errorf("deftype %s: into: %w", name, gnErr)
+			}
+			groups = append(groups, groupName)
+			continue
+		}
+		p.s.pos, p.s.line = saved, savedLine
+		break
 	}
 	p.skipWhitespaceAndComments()
 	if p.s.peek() != '{' {
-		return nil, fmt.Errorf("line %d: expected '{' after %s %s", p.s.line, keyword, name)
+		return nil, fmt.Errorf("line %d: expected '{' after deftype %s", p.s.line, name)
 	}
 	openedAt := p.s.line
 	p.s.advance() // consume {
@@ -850,7 +875,7 @@ func (p *parser) parseDefBlock(keyword string, make func(name, body string) Dire
 	if err != nil {
 		return nil, err
 	}
-	return make(name, body), nil
+	return &DefType{Name: name, Body: body, Groups: groups}, nil
 }
 
 // parseDefBody handles 'defbody type [verb]? [key=value...]? [: dep ...]? { body }'.
