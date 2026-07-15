@@ -24,9 +24,9 @@ This makes groups usable as **hook points** — declare a group, have some
 number of your own targets (zero or more) depend on it, and let other rules
 (possibly written later, possibly by someone else, possibly nonexistent)
 optionally plug into it via `into`. See
-[go-stdlib.md](go-stdlib.md#pre_build--post_build-hook-groups) for the
-motivating case (`pre_build`/`post_build` hooks that generated `go_exe`
-targets depend on unconditionally).
+[go-stdlib.md](go-stdlib.md#pre_build-hook-group) for the motivating case
+(the `pre_build` hook that every generated `go_exe` target depends on
+unconditionally).
 
 ## Existing mechanism: `include $(...)` for generated targets
 
@@ -188,6 +188,60 @@ setup : tools   # depends on controller-gen and kind, with no per-tool `into` cl
 This composes with the zero-member-group fix above: a project with zero
 `tool` targets still gets a valid (empty) `tools` aggregator, so `setup :
 tools` never fails to resolve just because nothing has been declared yet.
+
+## Implemented: matrix target names substitute their own loop variables
+
+**Status: done** (`cmd/mmk/runtime/runtime.go`, `computeComboTargetNames`,
+used by `expandMatrixRules` and `expandExplicitMatrixRules`). Built to make
+[go-stdlib.md](go-stdlib.md#goosgoarch-cross-compile-matrices)'s GOOS/GOARCH
+matrix actually work — the bug surfaced immediately on the first real test.
+
+### The bug
+
+A matrix rule generates one synthetic `TargetRule` per combo. Before this
+fix, that synthetic rule's deps, runner, and options were all substituted
+with the combo's variable bindings — but its *own target name* never was.
+The base name (dollar signs and all) was instead wrapped in bracket
+notation for uniqueness, e.g. `[bin/myapp-$goos-$goarch @ goarch=arm64
+goos=darwin]`, and that literal bracket string — never substituted — became
+`$target` inside the body. Fine for a phony matrix target that never reads
+`$target` (the body reads the loop vars directly), broken for a path-valued
+type like `go_exe`, whose body does `go build -o "$target"` and needs a
+real filesystem path, not a string containing `@`, spaces, and brackets.
+
+### The fix, and the constraint that shaped it
+
+The obvious fix — substitute the matrix vars into the target name before
+deciding on a DAG key — creates a new hazard: the target name (what deps
+and `mmk <target>` on the CLI refer to) and the DAG key (the aggregator's
+internal bookkeeping) could diverge, something that had never previously
+been possible in this codebase. That divergence risk was flagged before
+implementation, and the resolved design keeps a single namespace instead:
+
+`computeComboTargetNames` substitutes the loop variables into the base name
+for every combo in the set, then decides names for the *whole set as a
+unit* — not per-combo:
+
+- If every substituted name is pairwise-unique, **and** none collides with
+  the literal (unsubstituted) base name the aggregator itself always keeps,
+  every combo uses its substituted name directly. DAG key and `$target` are
+  the same string; no bracket notation at all. This is the normal case for
+  a base like `bin/myapp-$goos-$goarch` that embeds every loop variable.
+- If any collision exists — including the degenerate single-combo case,
+  where "unique among one item" would otherwise trivially hold while still
+  colliding with the aggregator's own name — **every** combo in that rule
+  falls back to bracket-notation naming, uniformly. A rule is never allowed
+  to mix bare names on some combos and bracketed names on others; the
+  decision is made once, for the whole matrix expansion, not combo-by-combo.
+  This is what a base like `bin/myapp-$goos` (varying `goarch` without
+  encoding it in the name) still gets today, same as before the fix.
+
+`matrixRuleInfo` gained a parallel `names []string` field (index-aligned
+with `combos`) so every other place that resolves a specific combo to its
+DAG name — explicit `[target @ k=v]` combo-dep fan-out, group-member
+registration — looks up the name that was actually decided for that combo,
+instead of independently recomputing `comboTargetName` and risking
+disagreement with what `computeComboTargetNames` chose.
 
 ## Pitfall: typed rules need a `:` or `{` marker
 

@@ -57,6 +57,9 @@ type matrixCombo map[string]string
 type matrixRuleInfo struct {
 	vars   []string      // variable names in declaration order
 	combos []matrixCombo // valid combos after applying excludes
+	names  []string      // DAG target name for combos[i]; parallel array. May be
+	// nil for info built outside computeComboTargetNames (group-projection
+	// cascading), which still always uses comboTargetName(base, combo) itself.
 }
 
 // groupMember is one registered member of a group.
@@ -1132,11 +1135,14 @@ func (n *TargetNode) Dependencies() []*TargetNode {
 			if info, ok := n.build.matrixInfo[dep.Target]; ok {
 				// Fan-out over combos that satisfy all constraints.
 				preFanOut := len(n.deps)
-				for _, combo := range info.combos {
+				for ci, combo := range info.combos {
 					if !comboMatchesConstraints(combo, constraints) {
 						continue
 					}
 					internalName := comboTargetName(dep.Target, combo)
+					if info.names != nil {
+						internalName = info.names[ci]
+					}
 					var depNode *TargetNode
 					if dep.Verb != "" {
 						depNode, err = n.build.ResolveVerb(internalName, dep.Verb)
@@ -1295,11 +1301,14 @@ func (n *TargetNode) verbDependencies() []*TargetNode {
 				var err error
 				if info, ok := n.build.matrixInfo[dep.Target]; ok {
 					preFanOut := len(n.deps)
-					for _, combo := range info.combos {
+					for ci, combo := range info.combos {
 						if !comboMatchesConstraints(combo, constraints) {
 							continue
 						}
 						internalName := comboTargetName(dep.Target, combo)
+						if info.names != nil {
+							internalName = info.names[ci]
+						}
 						var depNode *TargetNode
 						if dep.Verb != "" {
 							depNode, err = n.build.ResolveVerb(internalName, dep.Verb)
@@ -2137,6 +2146,43 @@ func comboTargetName(base string, combo matrixCombo) string {
 	return sb.String()
 }
 
+// computeComboTargetNames substitutes matrix vars into the base target name
+// for every combo in the set, then decides names for the whole set as a unit:
+// if the substituted names are already pairwise-unique — and none of them
+// collides with the literal, unsubstituted base itself, which the aggregator
+// rule always keeps as its own name (e.g. a base like "bin/myapp-$goos-$arch"
+// that embeds every matrix var) — they're used directly, so the DAG key and
+// the body's $target are the same string, with no synthetic wrapping needed.
+// If any collision exists (e.g. a base that doesn't vary, or only partially
+// varies, across combos — including the degenerate single-combo case, where
+// the substituted name would otherwise trivially look "unique" while still
+// colliding with the aggregator), every combo in the set falls back to
+// bracket-notation naming — uniformly, so a single matrix rule never mixes
+// bare and bracketed names across its own combos.
+func computeComboTargetNames(base string, combos []matrixCombo) []string {
+	substituted := make([]string, len(combos))
+	seen := map[string]int{base: 1} // aggregator reserves the literal base name
+	for i, combo := range combos {
+		substituted[i] = substituteMatrixVars(base, combo)
+		seen[substituted[i]]++
+	}
+	unique := true
+	for _, count := range seen {
+		if count > 1 {
+			unique = false
+			break
+		}
+	}
+	if unique {
+		return substituted
+	}
+	names := make([]string, len(combos))
+	for i, combo := range combos {
+		names[i] = comboTargetName(substituted[i], combo)
+	}
+	return names
+}
+
 // comboTemplateName returns the display name for a matrix aggregator in -list,
 // showing the dim names with blank values: "[base @ k= k2=]"
 func comboTemplateName(base string, info *matrixRuleInfo) string {
@@ -2237,14 +2283,16 @@ func (b *Build) expandMatrixRules(f *parse.File) error {
 			return fmt.Errorf("target %q: all matrix combinations excluded", r.Target)
 		}
 
+		// Generate one synthetic TargetRule per combo.
+		names := computeComboTargetNames(r.Target, validCombos)
+
 		// Store matrix metadata.
-		info := &matrixRuleInfo{vars: varNames, combos: validCombos}
+		info := &matrixRuleInfo{vars: varNames, combos: validCombos, names: names}
 		b.matrixInfo[r.Target] = info
 
-		// Generate one synthetic TargetRule per combo.
 		aggDeps := make([]parse.Dep, 0, len(validCombos))
-		for _, combo := range validCombos {
-			name := comboTargetName(r.Target, combo)
+		for ci, combo := range validCombos {
+			name := names[ci]
 			b.matrixVars[name] = combo
 
 			// Substitute matrix vars in runner and deps.
@@ -2404,12 +2452,14 @@ func (b *Build) expandExplicitMatrixRules(f *parse.File) error {
 			return fmt.Errorf("target %q: all matrix combinations excluded", r.Target)
 		}
 
-		info := &matrixRuleInfo{vars: varNames, combos: validCombos}
+		names := computeComboTargetNames(r.Target, validCombos)
+
+		info := &matrixRuleInfo{vars: varNames, combos: validCombos, names: names}
 		b.matrixInfo[r.Target] = info
 
 		aggDeps := make([]parse.Dep, 0, len(validCombos))
-		for _, combo := range validCombos {
-			name := comboTargetName(r.Target, combo)
+		for ci, combo := range validCombos {
+			name := names[ci]
 			b.matrixVars[name] = combo
 
 			runner := substituteMatrixVars(r.Runner, combo)
@@ -2466,8 +2516,11 @@ func (b *Build) registerGroupMembers(f *parse.File) {
 		}
 		if info, ok := b.matrixInfo[r.Target]; ok {
 			// Matrix rule: register each combo.
-			for _, combo := range info.combos {
+			for ci, combo := range info.combos {
 				internalName := comboTargetName(r.Target, combo)
+				if info.names != nil {
+					internalName = info.names[ci]
+				}
 				for _, groupName := range r.Groups {
 					gd := b.groups[groupName]
 					if gd == nil {

@@ -19,6 +19,10 @@
 #                   go_module verbs and to . for go_exe build.
 #   ldflags=<str>   Value passed to -ldflags on go build (go_exe).
 #   cgo=0           CGO_ENABLED for the go_exe build (default: 0).
+#   goos=<os>       GOOS for the go_exe build (default: unset, i.e. host OS).
+#   goarch=<arch>   GOARCH for the go_exe build (default: unset, i.e. host
+#                   arch). Meant to be driven by a `for goos in [...] for
+#                   goarch in [...]` matrix on the target, not set by hand.
 #
 # Every go_exe build unconditionally depends on the pre_build group, whether
 # or not anything is registered into it. This gives a project a hook point
@@ -79,7 +83,8 @@ deftype go_exe {
 
 defbody go_exe : pre_build {
     mkdir -p "$(dirname "$target")"
-    CGO_ENABLED=${cgo:-0} go build ${ldflags:+-ldflags="$ldflags"} -o "$target" "${pkg:-.}"
+    CGO_ENABLED=${cgo:-0} GOOS=${goos:-} GOARCH=${goarch:-} \
+        go build ${ldflags:+-ldflags="$ldflags"} -o "$target" "${pkg:-.}"
 }
 
 defbody go_exe clean {
