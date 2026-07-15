@@ -97,6 +97,9 @@ type subprojectInfo struct {
 // Set Why = true to print the dependency chain from root → target on every OnRun.
 type Build struct {
 	Verbose bool
+	// Description is the root mmkfile's file-level docstring (see
+	// parse.File.Description), printed as a header by PrintList.
+	Description string
 	// Why prints the dep chain from the build root down to each target as
 	// it starts running, so the user can see how a running node relates to
 	// the target they asked for.
@@ -147,6 +150,10 @@ type Build struct {
 	defBodies          map[string]bool // type name → has default body (built-in or user defbody)
 	defVerbBodies      map[defVerbBodyKey]bool
 	userDefBodyOptions map[defVerbBodyKey][]parse.Option // user defbody options keyed by (type, verb)
+	declaredTypes      map[string]bool                   // type name → has a user deftype (built-ins aren't included)
+	typeDoc            map[string]string                 // type name → deftype docstring
+	typeOptions        map[string][]parse.Option         // type name → deftype-header options
+	verbDoc            map[defVerbBodyKey]string          // defbody docstring keyed by (type, verb); verb "" is the default build body
 	defBodyDeps        map[defVerbBodyKey][]string       // user defbody dep tokens keyed by (type, verb)
 	defRunnerDeps      map[string][]string               // defrunner dep tokens keyed by runner type name (nil means: type does not customize, use default)
 	defRunnerDepsCache map[string][]string               // resolved runner-instance dep names, keyed by runner target name; cached so the dep-clause bash runs once per runner instance
@@ -231,11 +238,26 @@ type patternEntry struct {
 	re   *regexp.Regexp
 }
 
+// optionKeyExempt holds option keys that are engine-level and cross-cutting
+// rather than type-specific: legal on any rule of any type (or no type at
+// all) regardless of what that type declares. `order` is runner-scheduling
+// machinery (validated separately by validateOrderOption); `tty` opts a
+// runner-backed body into an interactive PTY and is read directly off
+// either the consumer rule or the runner rule (see ttyEnabled) — neither
+// is part of a type's own accepted-option vocabulary.
+var optionKeyExempt = map[string]bool{
+	"order": true,
+	"tty":   true,
+}
+
 // validateDirectives checks the AST against runtime constraints:
 //   - Each TargetRule's type is either built-in or has a deftype.
 //   - Each defrunner with a setup or cleanup phase also has a run phase.
 //   - Each TargetRule's `on` clause names an existing concrete target whose
 //     type has a defrunner run definition (built-in or user-defined).
+//   - Each TargetRule's plain options are all in its type's declared
+//     vocabulary (deftype.Options ∪ every verb's defbody.Options for that
+//     type, plus built-in equivalents), except the exempt engine-level keys.
 func validateDirectives(f *parse.File) error {
 	type defBodyKey struct{ typ, verb string }
 	deftypes := make(map[string]bool)
@@ -245,6 +267,27 @@ func validateDirectives(f *parse.File) error {
 	// Collect user defrunner phases to validate completeness and build valid runner set.
 	type runnerPhases struct{ hasRun, hasSetup, hasCleanup bool }
 	userRunners := make(map[string]runnerPhases)
+
+	// knownOptionKeys[type] is the full accepted-option vocabulary for that
+	// type: its deftype's Options plus every defbody's Options for it,
+	// across all verbs, plus built-in equivalents populated below.
+	knownOptionKeys := make(map[string]map[string]bool)
+	addKnownKeys := func(typ string, opts []parse.Option) {
+		if len(opts) == 0 {
+			return
+		}
+		set := knownOptionKeys[typ]
+		if set == nil {
+			set = make(map[string]bool)
+			knownOptionKeys[typ] = set
+		}
+		for _, opt := range opts {
+			set[opt.Key] = true
+		}
+	}
+	for key, opts := range gen.BuiltinDefBodyOptions {
+		addKnownKeys(key.Type, opts)
+	}
 
 	for _, d := range f.Directives {
 		switch d := d.(type) {
@@ -261,6 +304,7 @@ func validateDirectives(f *parse.File) error {
 			userRunners[d.Name] = info
 		case *parse.DefType:
 			deftypes[d.Name] = true
+			addKnownKeys(d.Name, d.Options)
 		case *parse.DefBody:
 			key := defBodyKey{d.Type, d.Verb}
 			if defbodies[key] {
@@ -270,6 +314,7 @@ func validateDirectives(f *parse.File) error {
 				return fmt.Errorf("duplicate defbody for type %q", d.Type)
 			}
 			defbodies[key] = true
+			addKnownKeys(d.Type, d.Options)
 			// Verb-specific defbody dep clauses parse but aren't yet honored
 			// by the runtime (verb deps inherit from the build defbody via
 			// existing verb-rule semantics). Reject up front rather than
@@ -332,6 +377,19 @@ func validateDirectives(f *parse.File) error {
 		if err := validateOrderOption(r.Options, fmt.Sprintf("target %q", name), r.Type, validRunnerTypes); err != nil {
 			return err
 		}
+		effType := r.Type
+		if r.Verb != "" {
+			if base, ok := concretes[r.Target]; ok {
+				effType = base.Type
+			} else {
+				effType = ""
+			}
+		}
+		if effType != "" {
+			if err := validateKnownOptions(r.Options, fmt.Sprintf("target %q", name), effType, knownOptionKeys[effType]); err != nil {
+				return err
+			}
+		}
 	}
 
 	// `order=` on a defbody is meaningful only when the type has a defrunner —
@@ -372,6 +430,34 @@ func validateOrderOption(options []parse.Option, ctx, typeName string, validRunn
 	return nil
 }
 
+// validateKnownOptions checks that every option key in options is either
+// engine-level (optionKeyExempt) or in known — the type's declared
+// accepted-option vocabulary (its deftype's Options plus every verb's
+// defbody Options, unioned; see validateDirectives). A type with an empty
+// vocabulary accepts no plain options at all: this is a hard error, not a
+// silent pass-through, so a typo'd or unintentionally-set option key never
+// becomes an invisible bash variable in a body.
+func validateKnownOptions(options []parse.Option, ctx, typeName string, known map[string]bool) error {
+	for _, opt := range options {
+		if optionKeyExempt[opt.Key] {
+			continue
+		}
+		if known[opt.Key] {
+			continue
+		}
+		if len(known) == 0 {
+			return fmt.Errorf("%s: unknown option %q — type %q declares no options (declare it on deftype %s or defbody %s)", ctx, opt.Key, typeName, typeName, typeName)
+		}
+		keys := make([]string, 0, len(known))
+		for k := range known {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		return fmt.Errorf("%s: unknown option %q for type %q — known options: %s", ctx, opt.Key, typeName, strings.Join(keys, ", "))
+	}
+	return nil
+}
+
 // NewBuild parses src (without resolving include directives), validates
 // names, generates the initial bash script, and returns a Build ready for
 // Execute. Use NewBuildFromFile when you want include resolution; this
@@ -408,6 +494,7 @@ func newBuildFromAST(f *parse.File) (*Build, error) {
 	}
 
 	b := &Build{
+		Description:        f.Description,
 		concretes:          make(map[string]*parse.TargetRule),
 		verbConcretes:      make(map[verbNodeKey]*parse.TargetRule),
 		nodes:              make(map[string]*TargetNode),
@@ -417,6 +504,10 @@ func newBuildFromAST(f *parse.File) (*Build, error) {
 		defBodies:          make(map[string]bool),
 		defVerbBodies:      make(map[defVerbBodyKey]bool),
 		userDefBodyOptions: make(map[defVerbBodyKey][]parse.Option),
+		declaredTypes:      make(map[string]bool),
+		typeDoc:            make(map[string]string),
+		typeOptions:        make(map[string][]parse.Option),
+		verbDoc:            make(map[defVerbBodyKey]string),
 		defBodyDeps:        make(map[defVerbBodyKey][]string),
 		defRunnerDeps:      make(map[string][]string),
 		defRunnerDepsCache: make(map[string][]string),
@@ -484,6 +575,9 @@ func newBuildFromAST(f *parse.File) (*Build, error) {
 			if len(d.Deps) > 0 {
 				b.defBodyDeps[defVerbBodyKey{d.Type, d.Verb}] = d.Deps
 			}
+			if d.Description != "" {
+				b.verbDoc[defVerbBodyKey{d.Type, d.Verb}] = d.Description
+			}
 			if d.Verb != "" {
 				b.defVerbBodies[defVerbBodyKey{d.Type, d.Verb}] = true
 			} else {
@@ -542,6 +636,13 @@ func newBuildFromAST(f *parse.File) (*Build, error) {
 				}
 			}
 			typeGroups[dt.Name] = dt.Groups
+			b.declaredTypes[dt.Name] = true
+			if dt.Description != "" {
+				b.typeDoc[dt.Name] = dt.Description
+			}
+			if len(dt.Options) > 0 {
+				b.typeOptions[dt.Name] = dt.Options
+			}
 		}
 	}
 	if len(typeGroups) > 0 {
@@ -3542,7 +3643,9 @@ func walkSubprojectTree(path, prefix string) []*subprojectSummary {
 }
 
 // PrintList renders a human-readable summary of targets and verbs to w.
-// Targets are grouped into sections with a brief annotation per target
+// If the root mmkfile has a file-level docstring (see parse.File.Description),
+// it's printed as a header before the "Targets:" section, regardless of
+// -all. Targets are grouped into sections with a brief annotation per target
 // (runner, type, or dep list for aggregators). Verbs are listed with the
 // targets each one applies to.
 //
@@ -3551,6 +3654,10 @@ func walkSubprojectTree(path, prefix string) []*subprojectSummary {
 // listed below it with full path-from-root prefixes. Recursion (subprojects
 // of subprojects) follows the same pattern.
 func (b *Build) PrintList(w io.Writer, all bool) {
+	if b.Description != "" {
+		fmt.Fprintln(w, b.Description)
+		fmt.Fprintln(w)
+	}
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "Targets:")
 	subSummaries := b.walkSubprojects()
@@ -3739,6 +3846,121 @@ func (b *Build) PrintList(w io.Writer, all bool) {
 		default:
 			fmt.Fprintf(w, "(%s hidden — use -all to see them)\n", plural(hiddenPatterns, "pattern"))
 		}
+	}
+}
+
+// typeKnownOptions returns the sorted, deduplicated list of option keys this
+// type's rules may set — the same vocabulary validateKnownOptions checks
+// against: the deftype's own Options, plus every verb's defbody Options
+// (user-declared and built-in). order/tty are omitted even if present in
+// that data (e.g. image's built-in `clean` order=after-consumers): they're
+// engine-wiring, not a key a caller of this type is meant to set.
+func (b *Build) typeKnownOptions(typeName string) []string {
+	seen := make(map[string]bool)
+	collect := func(opts []parse.Option) {
+		for _, o := range opts {
+			if !optionKeyExempt[o.Key] {
+				seen[o.Key] = true
+			}
+		}
+	}
+	collect(b.typeOptions[typeName])
+	for key, opts := range b.userDefBodyOptions {
+		if key.typeName == typeName {
+			collect(opts)
+		}
+	}
+	for key, opts := range gen.BuiltinDefBodyOptions {
+		if key.Type == typeName {
+			collect(opts)
+		}
+	}
+	keys := make([]string, 0, len(seen))
+	for k := range seen {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// typeVerbs returns every verb this type has a build body for, sorted, with
+// "" (the default build verb) always first regardless of sort order.
+func (b *Build) typeVerbs(typeName string) []string {
+	var verbs []string
+	for key := range b.defVerbBodies {
+		if key.typeName == typeName && key.verb != "" {
+			verbs = append(verbs, key.verb)
+		}
+	}
+	sort.Strings(verbs)
+	return append([]string{""}, verbs...)
+}
+
+// PrintTypes writes a docstring/options/verbs listing for every type
+// reachable from this build — built-in types plus every deftype declared in
+// the mmkfile (already flattened through includes by the time Build sees
+// them) — to w. Without all, only types with a docstring (a `##` comment
+// above their deftype, or a built-in's fixed one-liner) are shown; with all,
+// every type is included, documented or not.
+func (b *Build) PrintTypes(w io.Writer, all bool) {
+	names := make(map[string]bool)
+	for n := range gen.BuiltinDefTypes {
+		names[n] = true
+	}
+	for n := range b.declaredTypes {
+		names[n] = true
+	}
+	sorted := make([]string, 0, len(names))
+	for n := range names {
+		sorted = append(sorted, n)
+	}
+	sort.Strings(sorted)
+
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	hidden := 0
+	shown := 0
+	for _, name := range sorted {
+		doc := b.typeDoc[name]
+		if doc == "" {
+			doc = gen.BuiltinTypeDocs[name]
+		}
+		if !all && doc == "" {
+			hidden++
+			continue
+		}
+		if shown > 0 {
+			fmt.Fprintln(tw)
+		}
+		shown++
+		if doc != "" {
+			printedName := name
+			for _, line := range strings.Split(doc, "\n") {
+				fmt.Fprintf(tw, "%s\t%s\n", printedName, line)
+				printedName = "" // only the first line carries the type name
+			}
+		} else {
+			fmt.Fprintf(tw, "%s\t\n", name)
+		}
+		if opts := b.typeKnownOptions(name); len(opts) > 0 {
+			fmt.Fprintf(tw, "\tOptions: %s=\n", strings.Join(opts, "=, "))
+		}
+		fmt.Fprintf(tw, "\tVerbs:\n")
+		for _, verb := range b.typeVerbs(name) {
+			label := verb
+			if verb == "" {
+				label = "build (default)"
+			}
+			if vdoc := b.verbDoc[defVerbBodyKey{name, verb}]; vdoc != "" {
+				fmt.Fprintf(tw, "\t  %s — %s\n", label, vdoc)
+			} else {
+				fmt.Fprintf(tw, "\t  %s\n", label)
+			}
+		}
+	}
+	tw.Flush()
+	if !all && hidden > 0 {
+		fmt.Fprintln(w)
+		fmt.Fprintf(w, "(%s hidden — use -all to see them)\n", plural(hidden, "type"))
 	}
 }
 

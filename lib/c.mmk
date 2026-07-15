@@ -80,42 +80,51 @@ file '(.*)\.o' : $1.c {
 
 # ---- c_library ---------------------------------------------------------------
 
+## A static archive (.a). Sources are discovered from `source=DIR`
+## (flat by default; `recursive=1` for nested directories).
 deftype c_library {
     [ -f "$target" ] && (stat -c "%.Y" "$target" 2>/dev/null || stat -f "%m" "$target" 2>/dev/null)
 }
 
-defbody c_library : $(c_objects $source) {
+defbody c_library source= recursive= obj_path= : $(c_objects $source) {
     ${AR:-ar} -rcs "$target" "${dep[@]}"
 }
 
+## Removes the archive and its object files.
 defbody c_library clean {
     rm -f "$target" "${dep[@]}"
 }
 
 # ---- c_shared_lib ------------------------------------------------------------
 
+## A shared library (.so/.dylib/.dll), linked from explicit deps
+## (object files and/or static archives).
 deftype c_shared_lib {
     [ -f "$target" ] && (stat -c "%.Y" "$target" 2>/dev/null || stat -f "%m" "$target" 2>/dev/null)
 }
 
-defbody c_shared_lib {
+defbody c_shared_lib ldflags= {
     ${CC:-gcc} -shared -o "$target" "${dep[@]}" ${ldflags:-}
 }
 
+## Removes the shared library.
 defbody c_shared_lib clean {
     rm -f "$target"
 }
 
-# ---- c_executable ------------------------------------------------------------
+# ---- c_executable --------------------------------------------------------
 
+## An executable, linked from `source=DIR`-discovered objects and/or
+## explicit deps.
 deftype c_executable {
     [ -f "$target" ] && (stat -c "%.Y" "$target" 2>/dev/null || stat -f "%m" "$target" 2>/dev/null)
 }
 
-defbody c_executable : $([ -n "${source:-}" ] && c_objects $source) {
+defbody c_executable source= recursive= obj_path= ldflags= : $([ -n "${source:-}" ] && c_objects $source) {
     ${CC:-gcc} -o "$target" "${dep[@]}" ${ldflags:-}
 }
 
+## Removes the executable.
 defbody c_executable clean {
     rm -f "$target"
 }

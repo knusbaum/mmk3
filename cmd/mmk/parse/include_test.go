@@ -160,6 +160,17 @@ func TestParseFile_RelativePathFromIncludingFile(t *testing.T) {
 	}
 }
 
+func TestParseFile_RootDescriptionSurvivesInclude(t *testing.T) {
+	dir := t.TempDir()
+	writeFile(t, dir, "lib/build.mmk", "##! Included file's own blurb.\nbuild : { echo build; }\n")
+	root := writeFile(t, dir, "mmkfile", "##! Root project blurb.\ninclude lib/build.mmk\nall : build\n")
+	f, err := ParseFile(root)
+	if err != nil {
+		t.Fatalf("ParseFile: %v", err)
+	}
+	expect(t, "File.Description", f.Description, "Root project blurb.")
+}
+
 func TestParseFile_VariableExpansionInPath(t *testing.T) {
 	dir := t.TempDir()
 	writeFile(t, dir, "lib/build.mmk", "from_lib : { :; }\n")

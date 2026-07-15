@@ -35,7 +35,7 @@ inside each task's subprocess.
 [verb target] [on runner] [opt=val ...] :+ dep ...    # inherit + extend
 
 # Type definitions
-deftype TYPE { body that prints epoch-seconds, "epoch.nanos" (e.g. `stat -c %.Y`), or RFC3339 to stdout; non-zero = absent }
+deftype TYPE [opt=val ...] { body that prints epoch-seconds, "epoch.nanos" (e.g. `stat -c %.Y`), or RFC3339 to stdout; non-zero = absent }
 defbody TYPE [opt=val ...] [: dep ...] { default body for typed targets with no body }
 defbody TYPE VERB [opt=val ...] { default body for [VERB target] on TYPE }
 # Dep clause on the non-verb defbody: bash expressions evaluated per-target-instance
@@ -73,6 +73,11 @@ group NAME
 # deps, not just verb rules. Use when the prereq is an action, not an artifact.
 <consumer> : [verb target]
 
+# File-level description. Must be the very first thing in the file — before
+# any directive or passthrough bash. Printed as a header by `mmk -list`.
+##! project description line
+##! more lines concatenate
+
 # Passthrough
 ANY_OTHER_LINE                          # treated as raw bash
 ```
@@ -96,6 +101,8 @@ ANY_OTHER_LINE                          # treated as raw bash
 | Several producers feeding fan-out consumers without naming each producer | `group g`; `into g` on producers; `[g @ dim]` on consumer |
 | Split a growing mmkfile across files (same DAG, same namespace) | `include lib/foo.mmk` |
 | Delegate part of the build to a sub-directory mmkfile (separate DAG, isolated namespace) | `subproject NAME [path=DIR]` |
+| Give newcomers running `mmk -list` project-level orientation before the target list | Leading `##!` block at the very top of the file |
+| Document a `deftype`/`defbody` so `mmk -types` shows it | `##` comment immediately above the `deftype`/`defbody` |
 
 ## Idioms
 
@@ -194,6 +201,15 @@ file src.tar.gz : {
 }
 ```
 
+```bash
+##! A file-level description, printed as a header above `Targets:` by
+##! `mmk -list` (with or without -all). Must be the very first thing in
+##! the file — before any other directive or passthrough bash. Uses `##!`
+##! (not `##`) so it never competes with the first target's own docstring.
+
+all : release
+```
+
 ## Pitfalls
 
 These are real and have bitten users; check yourself against them before
@@ -211,6 +227,11 @@ shipping.
   pattern rule. Never use them as a dep, runner, or type.
 - Double-quoted target names are allowed but only useful when the name
   contains characters that need quoting. Most targets are bare words.
+- `##!` (file description) is only recognized in the leading run of
+  comments/blank lines at the very top of the file. Anywhere else it's
+  just a `##` docstring whose text happens to start with `!`. A leading
+  `##` block (no `!`) is never mistaken for a file description — it
+  always attaches to the first target rule as before.
 
 ### Naming
 
@@ -235,6 +256,16 @@ shipping.
   visible to that one body. Use options when a `deftype` / `defbody` /
   `defrunner` needs to read per-target config (their bodies run instead
   of, or before, the target body and can't see its locals).
+- **A typed rule may only set option keys its type has declared.** A
+  type's accepted vocabulary is the union of `key=val` tokens on its
+  `deftype` header and on every `defbody TYPE [VERB]` for that type.
+  Setting an undeclared key is a hard error — even a type that declares
+  no options accepts none. This is metadata only: declaring `pkg=` does
+  not inject a default, the body still reads `${pkg:-...}` itself. Two
+  keys are exempt from every type's vocabulary because they're
+  engine-level, not type-specific: `order=` (runner-scheduling hint) and
+  `tty=` (PTY allocation for `on <runner>` bodies). Untyped rules aren't
+  checked at all.
 
 ### Pattern rules
 
@@ -290,6 +321,12 @@ shipping.
   and undocumented intermediate targets are hidden. `mmk -list -all`
   shows everything. Add a `##` docstring above any target you want to
   surface as a user entry point.
+- `mmk -types` is the `deftype`/`defbody` analog of `-list`: it prints
+  every type reachable from the build (built-ins plus every `deftype`,
+  flattened through `include`) with its `##` docstring, declared
+  `key=value` options, and verbs (each verb showing its own docstring, if
+  a `defbody TYPE VERB` has one). Undocumented types are hidden unless
+  `-all` is passed, same rule as `-list`.
 - `mmk -graph` and `mmk -dag` show the dep graph.
 - `mmk -why` — print the dep chain from the build root down to each target as it starts running, so you can see why it's being built.
 

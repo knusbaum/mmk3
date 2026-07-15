@@ -277,7 +277,7 @@ func TestImageOptionShadowedByTargetOption(t *testing.T) {
 
 	// Custom image type whose runner just writes $platform to a file. No
 	// docker, no real container — the runner is just bash.
-	src := fmt.Sprintf(`deftype fake-image {
+	src := fmt.Sprintf(`deftype fake-image platform= {
     echo 1
 }
 defrunner fake-image setup {
@@ -967,7 +967,7 @@ func TestRunnerDepsClauseSeesRunnerOptions(t *testing.T) {
 	// bash variables. Different runner instances with the same type get
 	// different deps based on their options.
 	b := newBuild(t, `
-deftype custom_runner { echo 1 }
+deftype custom_runner flavor= { echo 1 }
 defrunner custom_runner : prereq_$flavor.bin { :; }
 custom_runner runner_a flavor=alpha :
 custom_runner runner_b flavor=beta :
@@ -2567,7 +2567,7 @@ func TestDefBodyDepClauseUsesOptions(t *testing.T) {
 	}
 	src := fmt.Sprintf(`
 deftype c_library { stat -f %%m "$target" 2>/dev/null }
-defbody c_library : $(find "$source" -name '*.c' | sed 's/\.c$/.o/') {
+defbody c_library source= : $(find "$source" -name '*.c' | sed 's/\.c$/.o/') {
     ar -rcs "$target" "${dep[@]}"
 }
 file '(.*)\.o' : $1.c { cc -c $1.c -o $target }
@@ -2893,7 +2893,7 @@ func TestOptionValueExpandsVar(t *testing.T) {
 mytype mytarget source=./dir/$SUFFIX {
     printf '%%s' "$source" > %q
 }
-deftype mytype { return 1; }
+deftype mytype source= { return 1; }
 defbody mytype {
     :
 }
@@ -2917,7 +2917,7 @@ func TestOptionValueLiteralPassesThroughUnchanged(t *testing.T) {
 	src := fmt.Sprintf(`mytype mytarget flags="--whole-archive  -lfoo" {
     printf '%%s' "$flags" > %q
 }
-deftype mytype { return 1; }
+deftype mytype flags= { return 1; }
 defbody mytype { :; }
 `, out)
 	b := newBuild(t, src)
@@ -2939,7 +2939,7 @@ func TestVerbBodyInheritsDefaultRuleOptions_InheritedVerb(t *testing.T) {
 	src := fmt.Sprintf(`
 deftype mytype { return 1; }
 defbody mytype { :; }
-defbody mytype clean {
+defbody mytype clean myopt= {
     printf '%%s' "$myopt" > %q
 }
 
@@ -2965,7 +2965,7 @@ func TestVerbBodyInheritsDefaultRuleOptions_ExplicitVerbRule(t *testing.T) {
 	dir := t.TempDir()
 	out := filepath.Join(dir, "out.txt")
 	src := fmt.Sprintf(`
-deftype mytype { return 1; }
+deftype mytype myopt= { return 1; }
 defbody mytype { :; }
 
 mytype mytarget myopt=fromtarget :
@@ -2991,7 +2991,7 @@ func TestVerbBodyInheritsDefaultRuleOptions_VerbRuleOverrides(t *testing.T) {
 	dir := t.TempDir()
 	out := filepath.Join(dir, "out.txt")
 	src := fmt.Sprintf(`
-deftype mytype { return 1; }
+deftype mytype myopt= { return 1; }
 defbody mytype { :; }
 
 mytype mytarget myopt=fromtarget :
@@ -3026,6 +3026,84 @@ defbody c_library clean : $(echo extra.o) {
 	}
 	if !strings.Contains(err.Error(), "verb") {
 		t.Errorf("error should mention verb: %v", err)
+	}
+}
+
+func TestUnknownOptionOnTypeWithDeclaredOptionsIsRejected(t *testing.T) {
+	// mytype declares only `myopt=`; setting an undeclared key on a target
+	// of that type must be a hard error.
+	src := `
+deftype mytype myopt= { return 1; }
+defbody mytype { :; }
+
+mytype mytarget bogus=1 :
+`
+	_, err := NewBuild([]byte(src))
+	if err == nil {
+		t.Fatal("expected error for unknown option key")
+	}
+	if !strings.Contains(err.Error(), "bogus") || !strings.Contains(err.Error(), "myopt") {
+		t.Errorf("error should name the unknown key and list known keys: %v", err)
+	}
+}
+
+func TestAnyOptionOnTypeWithNoDeclaredOptionsIsRejected(t *testing.T) {
+	// mytype declares no options at all; setting any option key on a
+	// target of that type must be a hard error, not silently accepted.
+	src := `
+deftype mytype { return 1; }
+defbody mytype { :; }
+
+mytype mytarget bogus=1 :
+`
+	_, err := NewBuild([]byte(src))
+	if err == nil {
+		t.Fatal("expected error for option on a type with no declared options")
+	}
+	if !strings.Contains(err.Error(), "bogus") || !strings.Contains(err.Error(), "no options") {
+		t.Errorf("error should name the key and say the type declares no options: %v", err)
+	}
+}
+
+func TestOrderAndTtyOptionsAreExemptFromTypeVocabulary(t *testing.T) {
+	// `order=` and `tty=` are engine-level, cross-cutting options — they
+	// must be accepted on any rule regardless of the type's declared
+	// option vocabulary, even a type that declares nothing.
+	src := `
+deftype mytype { return 1; }
+defbody mytype { :; }
+
+mytype mytarget tty=true :
+`
+	b := newBuild(t, src)
+	n, err := b.Resolve("mytarget")
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if err := runForTest(n); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+}
+
+func TestUnknownOptionOnVerbRuleResolvesBaseRuleType(t *testing.T) {
+	// A `[verb target]` rule has no Type of its own; validation must
+	// resolve the base concrete rule's type to find its known options.
+	src := `
+deftype mytype { return 1; }
+defbody mytype { :; }
+
+mytype mytarget :
+
+[clean mytarget] bogus=1 {
+    :
+}
+`
+	_, err := NewBuild([]byte(src))
+	if err == nil {
+		t.Fatal("expected error for unknown option on verb rule")
+	}
+	if !strings.Contains(err.Error(), "bogus") {
+		t.Errorf("error should name the unknown key: %v", err)
 	}
 }
 
@@ -3551,6 +3629,42 @@ internal_thing : { :; }
 	}
 }
 
+func TestPrintList_FileDescriptionPrintedAsHeader(t *testing.T) {
+	b := newBuild(t, `
+##! A tiny build.
+##! Second line of the blurb.
+all : public_thing
+
+## A target a user is meant to invoke.
+public_thing : { :; }
+`)
+	out := printListString(t, b, false)
+	if !strings.HasPrefix(out, "A tiny build.\nSecond line of the blurb.\n\nTargets:") {
+		t.Errorf("expected file description header before Targets:; got:\n%s", out)
+	}
+}
+
+func TestPrintList_FileDescriptionShownRegardlessOfAll(t *testing.T) {
+	b := newBuild(t, `
+##! A tiny build.
+all : { :; }
+`)
+	out := printListString(t, b, true)
+	if !strings.HasPrefix(out, "A tiny build.\n") {
+		t.Errorf("expected file description header with -all too; got:\n%s", out)
+	}
+}
+
+func TestPrintList_NoFileDescriptionNoHeader(t *testing.T) {
+	b := newBuild(t, `
+all : { :; }
+`)
+	out := printListString(t, b, false)
+	if !strings.HasPrefix(out, "Targets:") {
+		t.Errorf("expected no header when file has no description; got:\n%s", out)
+	}
+}
+
 func TestPrintList_AllShowsEverything(t *testing.T) {
 	b := newBuild(t, `
 all : public_thing
@@ -3704,5 +3818,86 @@ foo into tests : { :; }
 	out := printListString(t, b, false)
 	if !strings.Contains(out, "tests") || !strings.Contains(out, "A pool of test cases.") {
 		t.Errorf("docstringed group should appear with its description; got:\n%s", out)
+	}
+}
+
+func printTypesString(t *testing.T, b *Build, all bool) string {
+	t.Helper()
+	var buf strings.Builder
+	b.PrintTypes(&buf, all)
+	return buf.String()
+}
+
+func TestPrintTypes_ShowsDocOptionsAndVerbs(t *testing.T) {
+	b := newBuild(t, `
+## Builds a widget.
+deftype widget flavor= { echo 1 }
+
+defbody widget { true }
+
+## Removes the built widget.
+defbody widget clean { true }
+`)
+	out := printTypesString(t, b, false)
+	if !strings.Contains(out, "widget") || !strings.Contains(out, "Builds a widget.") {
+		t.Errorf("expected widget's docstring; got:\n%s", out)
+	}
+	if !strings.Contains(out, "Options: flavor=") {
+		t.Errorf("expected declared option flavor= listed; got:\n%s", out)
+	}
+	if !strings.Contains(out, "build (default)") {
+		t.Errorf("expected default build verb listed; got:\n%s", out)
+	}
+	if !strings.Contains(out, "clean") || !strings.Contains(out, "Removes the built widget.") {
+		t.Errorf("expected clean verb with its docstring; got:\n%s", out)
+	}
+}
+
+func TestPrintTypes_DefaultHidesUndocumented(t *testing.T) {
+	b := newBuild(t, `
+deftype widget { echo 1 }
+defbody widget { true }
+`)
+	out := printTypesString(t, b, false)
+	if strings.Contains(out, "widget") {
+		t.Errorf("undocumented type should be hidden by default; got:\n%s", out)
+	}
+	if !strings.Contains(out, "hidden") {
+		t.Errorf("expected a hidden-count footer; got:\n%s", out)
+	}
+}
+
+func TestPrintTypes_AllShowsUndocumentedTypesAndBuiltins(t *testing.T) {
+	b := newBuild(t, `
+deftype widget { echo 1 }
+defbody widget { true }
+`)
+	out := printTypesString(t, b, true)
+	if !strings.Contains(out, "widget") {
+		t.Errorf("expected undocumented type to show with -all; got:\n%s", out)
+	}
+	if !strings.Contains(out, "file") || !strings.Contains(out, "image") {
+		t.Errorf("expected built-in types 'file' and 'image' to be listed; got:\n%s", out)
+	}
+}
+
+func TestPrintTypes_BuiltinTypesShowBuiltinVerbs(t *testing.T) {
+	b := newBuild(t, `all : { :; }`)
+	out := printTypesString(t, b, true)
+	for _, name := range []string{"file", "image", "directory"} {
+		idx := strings.Index(out, name+" ")
+		if idx < 0 {
+			idx = strings.Index(out, name+"\t")
+		}
+		if idx < 0 {
+			t.Fatalf("expected built-in type %q in output; got:\n%s", name, out)
+		}
+		section := out[idx:]
+		if end := strings.Index(section[1:], "\n\n"); end >= 0 {
+			section = section[:end+1]
+		}
+		if !strings.Contains(section, "clean") {
+			t.Errorf("expected built-in type %q to list its 'clean' verb; got section:\n%s", name, section)
+		}
 	}
 }

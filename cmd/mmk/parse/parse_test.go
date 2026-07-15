@@ -186,6 +186,56 @@ func TestDefType(t *testing.T) {
 	}
 }
 
+func TestDefTypeOptions(t *testing.T) {
+	f := mustParse(t, `deftype s3_object bucket= { return 1; }`)
+	requireRules(t, f, 1)
+	dt, ok := f.Directives[0].(*DefType)
+	if !ok {
+		t.Fatalf("expected *DefType, got %T", f.Directives[0])
+	}
+	if len(dt.Options) != 1 || dt.Options[0].Key != "bucket" || dt.Options[0].Value != "" {
+		t.Errorf("Options: got %v, want [{bucket }]", dt.Options)
+	}
+}
+
+func TestDefTypeOptionsWithDefaultAndIntoInAnyOrder(t *testing.T) {
+	f := mustParse(t, `deftype go_exe cgo=0 into tools goos= { return 1; }`)
+	dt := f.Directives[0].(*DefType)
+	if len(dt.Groups) != 1 || dt.Groups[0] != "tools" {
+		t.Errorf("Groups: got %v, want [tools]", dt.Groups)
+	}
+	if len(dt.Options) != 2 || dt.Options[0].Key != "cgo" || dt.Options[0].Value != "0" ||
+		dt.Options[1].Key != "goos" || dt.Options[1].Value != "" {
+		t.Errorf("Options: got %v, want [{cgo 0} {goos }]", dt.Options)
+	}
+}
+
+func TestDefTypeOptionsReservedKeyError(t *testing.T) {
+	expectError(t, `deftype mytype target= { return 1; }`, "reserved")
+}
+
+func TestDefTypeDocstring(t *testing.T) {
+	f := mustParse(t, `## Builds a Go binary.
+## The target name is the output path.
+deftype go_exe pkg= { return 1; }`)
+	dt := f.Directives[0].(*DefType)
+	want := "Builds a Go binary.\nThe target name is the output path."
+	if dt.Description != want {
+		t.Errorf("Description: got %q, want %q", dt.Description, want)
+	}
+}
+
+func TestDefBodyDocstring(t *testing.T) {
+	f := mustParse(t, `## Removes the built binary.
+defbody go_exe clean {
+    rm -f "$target"
+}`)
+	db := f.Directives[0].(*DefBody)
+	if db.Description != "Removes the built binary." {
+		t.Errorf("Description: got %q, want %q", db.Description, "Removes the built binary.")
+	}
+}
+
 func TestDefRunner(t *testing.T) {
 	f := mustParse(t, `defrunner ubuntu {
 	docker run --rm ubuntu:latest "$@"
@@ -641,6 +691,67 @@ bar : { :; }
 	if bar.Description != "" {
 		t.Errorf("bar.Description should be empty; got %q", bar.Description)
 	}
+}
+
+func TestFileDescriptionSingleLine(t *testing.T) {
+	src := `
+##! A tiny build.
+foo : { :; }
+`
+	f := mustParse(t, src)
+	expect(t, "File.Description", f.Description, "A tiny build.")
+	r := asRule(t, f.Directives[0])
+	expect(t, "foo.Description", r.Description, "")
+}
+
+func TestFileDescriptionMultilineConcatenates(t *testing.T) {
+	src := `
+##! First line.
+##! Second line.
+foo : { :; }
+`
+	f := mustParse(t, src)
+	want := "First line.\nSecond line."
+	expect(t, "File.Description", f.Description, want)
+}
+
+func TestFileDescriptionSurvivesBlankLines(t *testing.T) {
+	src := `
+##! Doc.
+
+foo : { :; }
+`
+	f := mustParse(t, src)
+	expect(t, "File.Description", f.Description, "Doc.")
+}
+
+func TestFileDescriptionDoesNotStealFirstRuleDocstring(t *testing.T) {
+	src := `
+##! Project blurb.
+
+## Build foo.
+foo : { :; }
+`
+	f := mustParse(t, src)
+	expect(t, "File.Description", f.Description, "Project blurb.")
+	r := asRule(t, f.Directives[0])
+	expect(t, "foo.Description", r.Description, "Build foo.")
+}
+
+func TestPlainDocstringIsNotFileDescription(t *testing.T) {
+	src := `
+## Build foo.
+foo : { :; }
+`
+	f := mustParse(t, src)
+	expect(t, "File.Description", f.Description, "")
+	r := asRule(t, f.Directives[0])
+	expect(t, "foo.Description", r.Description, "Build foo.")
+}
+
+func TestFileDescriptionAbsentByDefault(t *testing.T) {
+	f := mustParse(t, `foo : { :; }`)
+	expect(t, "File.Description", f.Description, "")
 }
 
 func TestSubprojectBare(t *testing.T) {

@@ -95,7 +95,7 @@ func resolveIncludes(f *File, baseDir string, seen map[string]bool, parentPT []s
 			out = append(out, d)
 		}
 	}
-	return &File{Directives: out}, pt, nil
+	return &File{Directives: out, Description: f.Description}, pt, nil
 }
 
 // resolveIncludePath turns a raw include path (which may contain `$VAR`,
