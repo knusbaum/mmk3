@@ -94,7 +94,7 @@ var BuiltinDefTypes = map[string]string{
 // `mmk -types` the same way a `##` comment above a user deftype would be.
 var BuiltinTypeDocs = map[string]string{
 	"file":      "A file on disk. Freshness is the file's mtime.",
-	"image":     "Runs a target's body inside a container, on a runner backed by that image.",
+	"image":     "A container image, built from a Dockerfile (or pulled if the target has no deps). Also usable as a runner (`on I`) to run a target's body inside a container backed by it.",
 	"source":    "An existing file mmk doesn't build. Inferred automatically for deps with no rule of their own.",
 	"directory": "A directory on disk, created on demand.",
 }
