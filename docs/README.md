@@ -10,9 +10,9 @@ rot in a single monolithic doc.
   ones not yet built.
 - [tool-stdlib.md](tool-stdlib.md) — `tool`, a generic type for "ensure some
   versioned CLI is available," independent of any particular language.
-- [go-stdlib.md](go-stdlib.md) — `go.mmk`: wrapping the Go toolchain and
-  GOOS/GOARCH cross-compile matrices, plus a planned extension (automatic
-  discovery of `main` packages).
+- [go-stdlib.md](go-stdlib.md) — `go.mmk`: wrapping the Go toolchain,
+  GOOS/GOARCH cross-compile matrices, and automatic discovery of `main`
+  packages.
 - [c-stdlib.md](c-stdlib.md) — `c.mmk`: types for C libraries, shared
   libraries, and executables.
 - [cmake-stdlib.md](cmake-stdlib.md) — `cmake.mmk`: wrapping cmake-based
@@ -34,8 +34,8 @@ go_exe bin/myapp pkg=./cmd/myapp :
 ```
 
 and have `mmk`, `mmk test`, `mmk fmt`, `mmk clean`, `mmk update` all work
-correctly — and ideally not even need the `go_exe` line, if `myapp`'s `main`
-package can be discovered automatically.
+correctly — and not even need the `go_exe` line, since `myapp`'s `main`
+package is discovered automatically.
 
 The design throughout is grounded in real project shapes (mixed-language
 builds, cross-compilation matrices, generated code, pinned local tooling),

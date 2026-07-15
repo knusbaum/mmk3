@@ -112,50 +112,58 @@ go_exe "bin/myapp-$goos-$goarch" for goos in [darwin linux windows] for goarch i
     exclude [goos=windows goarch=arm64] :
 ```
 
-## Planned extensions
+## Automatic `main`-package discovery
 
-Grounded in the same Makefile survey: the plain-build/test/vet/fmt wrapper
-above and the GOOS/GOARCH matrix are the cases nobody needs further help
-with. The remaining recurring pain point:
-
-### Automatic `main`-package discovery
-
-**Status: proposed.** The goal: a blank `Mmkfile` containing only
-`include go.mmk` should list every buildable program in the current
-directory's module via `mmk -list`, with no `go_exe` line written by hand.
+**Status: shipped.** A blank `Mmkfile` containing only `include go.mmk`
+lists every buildable program in the current directory's module via `mmk
+-list`, with no `go_exe` line written by hand.
 
 This needs no parser changes — `include $(...)` (see
 [language-extensions.md](language-extensions.md#existing-mechanism-include--for-generated-targets))
-already lets an include path be the output of an arbitrary command. A
-discovery script walks the module scoped to the current directory (which is
-always the `Mmkfile`'s directory — mmk never `chdir`s), and for each `main`
-package emits a `go_exe` line into a generated `.mmk` fragment, then prints
-that fragment's path:
-
-```bash
-group go_mains
-
-go_exe bin/cmd/server pkg=./cmd/server into go_mains :
-go_exe bin/cmd/worker pkg=./cmd/worker into go_mains :
-```
-
-Target names mirror the package's path relative to the module root
-(`bin/<relpath>`, not just the basename) since two `main` packages can share
-a directory name across different subtrees, and target names must be
-unique. `/` is a legal target-name character, so this needs no escaping. A
-`main` package living at the module root itself (no subdirectory to name it
-from) falls back to `bin/<module-basename>`.
-
-`go.mmk` includes this generator itself, so it fires automatically:
+already lets an include path be the output of an arbitrary command.
+`go.mmk` defines a passthrough bash function, `_mmk_go_mains`, and includes
+its own output:
 
 ```bash
 include $(_mmk_go_mains)   # inside go.mmk
 ```
 
-Then any concrete `go_exe` rule a user writes for one of these target names
-(e.g. one that needs custom `ldflags` or a GOOS/GOARCH matrix) simply wins —
-concrete rules override whatever was spliced in, no override mechanism
-needed.
+`_mmk_go_mains` resolves the current module with `go list -m`, lists every
+`main` package under the current directory with `go list -e -f '{{if eq
+.Name "main"}}{{.ImportPath}}{{end}}' ./...` (`-e` so one broken package
+doesn't abort discovery of the rest), and for each one writes a `go_exe`
+line into a generated `.mmk` fragment, then prints that fragment's path:
+
+```bash
+group go_mains
+
+go_exe bin/cmd/server pkg=example.com/org/foo/cmd/server into go_mains :
+go_exe bin/cmd/worker pkg=example.com/org/foo/cmd/worker into go_mains :
+```
+
+Target names mirror the package's import path relative to the module root
+(`bin/<relpath>`, not just the basename) since two `main` packages can share
+a directory name across different subtrees, and target names must be
+unique. `/` is a legal target-name character, so this needs no escaping.
+`pkg=` is set to the full import path rather than a `./`-relative path —
+`go build` treats both identically, and the import path falls straight out
+of `go list` with no relative-path computation needed. A `main` package
+living at the module root itself (no subdirectory to name it from) falls
+back to `bin/<module-basename>`, the last segment of the module's import
+path. If there's no `go.mod` (or no `go` binary), discovery degrades to an
+empty `go_mains` group rather than erroring — `go_module`/`go_exe` and any
+hand-written `go_exe` rules keep working regardless.
+
+The fragment is written to a path deterministic in the project's directory
+(`${TMPDIR:-/tmp}/mmk-go-mains-<hash of pwd>.mmk`) and overwritten wholesale
+on every parse, so there's no accumulation to clean up and nothing is ever
+written into the project tree.
+
+Any concrete `go_exe` rule a user writes for one of these target names (e.g.
+one that needs custom `ldflags` or a GOOS/GOARCH matrix) simply wins — the
+later declaration in file order overrides the earlier, spliced-in one, no
+override syntax needed (see
+[language-extensions.md](language-extensions.md#implemented-later-target-rule-wins-on-duplicate-non-verb-target)).
 
 Each discovered binary is registered `into go_mains`, so downstream targets
 can depend on "every discovered binary" without enumerating them:
@@ -167,3 +175,9 @@ release : go_mains   # depends on every discovered main package's binary
 Since a discovered `go_exe` is a normal `go_exe` target, it automatically
 gets the `pre_build` dependency described above — no extra wiring needed
 for a codegen hook to apply to auto-discovered binaries too.
+
+Known limitations, not fixed: `go list ./...` resolves against the host's
+GOOS/GOARCH, so a `main` package gated to a different OS/ARCH by build
+constraints won't be discovered on this host. Nested modules (a
+subdirectory with its own `go.mod`) are naturally excluded, since `go list
+./...` doesn't cross module boundaries.
