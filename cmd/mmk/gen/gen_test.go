@@ -219,14 +219,24 @@ all : { helper }`)
 }
 
 func TestValidateDuplicates(t *testing.T) {
-	f, _ := parse.Parse([]byte("foo {}\nfoo {}"))
+	f, _ := parse.Parse([]byte("[clean foo] {}\n[clean foo] {}"))
 	if err := ValidateDuplicates(f); err == nil {
-		t.Fatal("expected duplicate error")
+		t.Fatal("expected duplicate verb rule error")
 	}
 }
 
 func TestValidateNoDuplicates(t *testing.T) {
 	f, _ := parse.Parse([]byte("foo {}\nbar {}"))
+	if err := ValidateDuplicates(f); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestValidateDuplicateTargetsAllowed(t *testing.T) {
+	// A later plain target rule overrides an earlier one with the same name
+	// (e.g. a hand-written rule overriding one spliced in via `include
+	// $(...)`) rather than erroring — last declaration wins.
+	f, _ := parse.Parse([]byte("foo {}\nfoo {}"))
 	if err := ValidateDuplicates(f); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}

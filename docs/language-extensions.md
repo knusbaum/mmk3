@@ -243,6 +243,76 @@ registration — looks up the name that was actually decided for that combo,
 instead of independently recomputing `comboTargetName` and risking
 disagreement with what `computeComboTargetNames` chose.
 
+## Implemented: later target rule wins on duplicate non-verb target
+
+**Status: done** (`cmd/mmk/gen/gen.go`, `ValidateDuplicates`). Built for
+[go-stdlib.md](go-stdlib.md#automatic-main-package-discovery): a hand-written
+`go_exe` rule needs to be able to override one spliced in by
+`include $(_mmk_go_mains)` with the same target name, the same way a project
+already overrides a built-in `deftype`/`defbody`/`defrunner` just by
+declaring its own.
+
+Previously, `ValidateDuplicates` hard-errored (`duplicate target %q`) on
+*any* repeated `(target, verb)` pair among concrete `TargetRule`s, verb
+rules and plain rules alike. Testing the discovery feature surfaced this
+immediately: writing a `go_exe bin/cmd/server ...` rule to customize
+`ldflags` for an already-discovered binary failed the whole build with
+`duplicate target "bin/cmd/server"`, even though the doc draft had assumed
+"concrete rules just win."
+
+The fix only relaxes the non-verb case. `runtime.go`'s registration loop
+already stores concrete rules in a map keyed by target name
+(`b.concretes[r.Target] = r`), built by a single forward pass over
+`f.Directives` in file order — so once the early-return error for a
+duplicate *plain* target is removed, "last declaration wins" falls out for
+free with no other code change: whichever `TargetRule` for that name comes
+later in the resolved directive list (the user's own line always comes
+after anything spliced in via an `include` that precedes it) is the one
+left in the map. Duplicate *verb* rules (`[clean foo]` declared twice) are
+still a hard error — there's no legitimate reason to declare the same verb
+rule for the same target twice, so this class is kept as a typo safety net.
+
+An alternative considered and rejected: have the discovery script itself
+scan the project's `Mmkfile` for names it's about to generate and skip
+those. Rejected because it means re-implementing a chunk of mmk's own line
+parser in bash (quoted vs. bare target names, verb rules, multi-line rules,
+matrix/pattern rules, nested includes) with silent-failure risk if the
+heuristic mis-detects, versus a two-line change in the one place duplicate
+detection already lives.
+
+## Pitfall: a bare `{` on its own line is a target-rule body opener, even inside a passthrough bash function
+
+**Status: existing behavior, documented here because it bit
+`_mmk_go_mains`** (the discovery function backing
+[go-stdlib.md](go-stdlib.md#automatic-main-package-discovery)) **while
+writing it.** `parseDirectiveOrPassthrough` (`cmd/mmk/parse/parse.go`) scans
+every physical line independently, including lines inside an already-open
+bash function body — the parser has no notion of "we're inside a `name() {
+... }` block, treat everything until the matching `}` as passthrough." Only
+the function's own declaration line (`name() {`) is special-cased via
+`firstWordFollowedByParen`; every line after that is re-examined from
+scratch by the same passthrough-vs-directive heuristic used everywhere else.
+
+A line whose first non-whitespace character is `{` — e.g. `{ ... } >
+"$file"`, ordinary bash grouping-for-redirection — hits
+`lineHasDirectiveMarker`'s very first check and is unconditionally
+committed as a target-rule body opener, with no target name before it,
+producing `expected target name`. The fix is mechanical: never let bash
+block-grouping syntax (`{ cmds; } > file`) start a line on its own inside
+mmkfile passthrough bash. A subshell (`( cmds ) > file`) is safe instead —
+`firstWordFollowedByParen` catches the bare `(` and treats the whole line
+as passthrough — but simplest is usually to avoid multi-command grouping
++ redirection entirely and build output incrementally with `>`/`>>` per
+line, which is what `_mmk_go_mains` does.
+
+A related trap in the same function while it still used `local modpath
+frag` (declaring multiple locals on one line): a two-bare-word passthrough
+line followed *immediately* by a line starting with `{` triggers
+`lineHasDirectiveMarker`'s next-non-blank-line lookahead (the "body on the
+next line" syntax), misparsing the `local` line itself as a `[type]
+target` header. Not `local` specifically — any two-bare-word line
+immediately followed by a bare `{` line is at risk.
+
 ## Pitfall: typed rules need a `:` or `{` marker
 
 **Status: existing behavior, documented here because it bit doc examples

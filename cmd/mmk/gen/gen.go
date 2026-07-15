@@ -496,22 +496,30 @@ func NormalizeBody(body string) string {
 	return body
 }
 
-// ValidateDuplicates returns an error if any concrete (target, verb) pair appears more than once.
-// Pattern rules are skipped; duplicate patterns can only be detected at match time.
+// ValidateDuplicates returns an error if any duplicate verb rule ([verb
+// target]) appears more than once — almost always a typo, since there's no
+// legitimate reason to declare the same verb rule twice.
+//
+// Duplicate plain target rules (no verb) are NOT an error: the later
+// declaration simply wins, since the caller registers concrete rules into a
+// map keyed by target name (b.concretes in runtime.go) and a later entry
+// naturally overwrites an earlier one. This lets a hand-written rule override
+// one spliced in by an `include $(...)`-generated fragment (e.g. go.mmk's
+// main-package discovery) without any special override syntax.
+//
+// Pattern rules are skipped; duplicate patterns can only be detected at
+// match time.
 func ValidateDuplicates(f *parse.File) error {
 	type tvKey struct{ target, verb string }
 	seen := make(map[tvKey]bool)
 	for _, d := range f.Directives {
 		r, ok := d.(*parse.TargetRule)
-		if !ok || r.Pattern != "" {
+		if !ok || r.Pattern != "" || r.Verb == "" {
 			continue
 		}
 		key := tvKey{r.Target, r.Verb}
 		if seen[key] {
-			if r.Verb != "" {
-				return fmt.Errorf("duplicate verb rule [%s %s]", r.Verb, r.Target)
-			}
-			return fmt.Errorf("duplicate target %q", r.Target)
+			return fmt.Errorf("duplicate verb rule [%s %s]", r.Verb, r.Target)
 		}
 		seen[key] = true
 	}

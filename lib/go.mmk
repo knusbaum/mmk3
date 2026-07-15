@@ -37,6 +37,36 @@
 #   }
 group pre_build
 
+# ---- main-package discovery ---------------------------------------------------
+#
+# Every main package under the current directory's module gets a go_exe
+# target for free, named bin/<path-relative-to-module-root> (or
+# bin/<module-basename> for a main package at the module root itself), and
+# registered into the go_mains group. A hand-written go_exe rule for the same
+# target name simply overrides the generated one. If there's no go.mod (or no
+# `go` binary), this degrades to an empty go_mains group rather than erroring
+# — go_module/go_exe keep working regardless.
+_mmk_go_mains() {
+    modpath=$(go list -m -f '{{.Path}}' 2>/dev/null)
+    frag="${TMPDIR:-/tmp}/mmk-go-mains-$(pwd -P | cksum | cut -d' ' -f1).mmk"
+    printf 'group go_mains\n\n' > "$frag"
+    if [ -n "$modpath" ]; then
+        go list -e -f '{{if eq .Name "main"}}{{.ImportPath}}{{end}}' ./... 2>/dev/null |
+        while IFS= read -r importpath; do
+            [ -z "$importpath" ] && continue
+            if [ "$importpath" = "$modpath" ]; then
+                rel="${modpath##*/}"
+            else
+                rel="${importpath#$modpath/}"
+            fi
+            printf 'go_exe bin/%s pkg=%s into go_mains :\n' "$rel" "$importpath" >> "$frag"
+        done
+    fi
+    echo "$frag"
+}
+
+include $(_mmk_go_mains)
+
 # ---- go_module ---------------------------------------------------------------
 
 deftype go_module { return 1; }
