@@ -92,9 +92,10 @@ go_exe bin/hello pkg=./cmd/hello :
 	}
 }
 
-func TestStdlib_GoExe_FreshnessSkipsRebuild(t *testing.T) {
-	// After a successful build, NeedsRun should report false because the
-	// binary's mtime is set.
+func TestStdlib_GoExe_AlwaysNeedsRun(t *testing.T) {
+	// go_exe defers to the go tool's own incremental cache, so mmk's
+	// freshness check should always report NeedsRun=true — even after a
+	// successful build — rather than tracking the binary's mtime.
 	withStdlib(t)
 	dir := makeGoFixture(t)
 	t.Chdir(dir)
@@ -114,8 +115,8 @@ go_exe bin/hello pkg=./cmd/hello :
 	if err != nil {
 		t.Fatalf("NeedsRun: %v", err)
 	}
-	if needs {
-		t.Errorf("after build, go_exe should report NeedsRun=false")
+	if !needs {
+		t.Errorf("after build, go_exe should still report NeedsRun=true (defers to `go build`'s own cache)")
 	}
 }
 
