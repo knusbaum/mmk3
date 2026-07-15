@@ -3901,3 +3901,192 @@ func TestPrintTypes_BuiltinTypesShowBuiltinVerbs(t *testing.T) {
 		}
 	}
 }
+
+// --- ApplyOverrides (CLI-invocation key=value overrides) ---
+
+func matrixOverrideSrc(logDir string) string {
+	return fmt.Sprintf(`
+deftype svc cache= { return 1; }
+defbody svc {
+    echo "tracing=$tracing region=$region cache=${cache:-unset}" >> %q
+}
+defbody svc clean {
+    echo "clean tracing=$tracing region=$region cache=${cache:-unset}" >> %q
+}
+svc webapp for tracing in [on off] for region in [us eu] cache=default {
+    echo "tracing=$tracing region=$region cache=${cache:-unset}" >> %q
+}
+`, filepath.Join(logDir, "log"), filepath.Join(logDir, "log"), filepath.Join(logDir, "log"))
+}
+
+func readLogLines(t *testing.T, dir string) []string {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(dir, "log"))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		t.Fatalf("read log: %v", err)
+	}
+	return strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+}
+
+func TestApplyOverrides_MatrixNarrowSingleCombo(t *testing.T) {
+	dir := t.TempDir()
+	b := newBuild(t, matrixOverrideSrc(dir))
+	target, err := b.ApplyOverrides("webapp", map[string]string{"tracing": "on", "region": "us"})
+	if err != nil {
+		t.Fatalf("ApplyOverrides: %v", err)
+	}
+	if err := b.Execute(target, "", 1); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := readLogLines(t, dir)
+	want := []string{"tracing=on region=us cache=default"}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestApplyOverrides_MatrixNarrowPlusOption(t *testing.T) {
+	dir := t.TempDir()
+	b := newBuild(t, matrixOverrideSrc(dir))
+	target, err := b.ApplyOverrides("webapp", map[string]string{"tracing": "on", "region": "us", "cache": "off"})
+	if err != nil {
+		t.Fatalf("ApplyOverrides: %v", err)
+	}
+	if err := b.Execute(target, "", 1); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := readLogLines(t, dir)
+	want := []string{"tracing=on region=us cache=off"}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestApplyOverrides_OptionNoNarrowingAppliesToAllCombos(t *testing.T) {
+	dir := t.TempDir()
+	b := newBuild(t, matrixOverrideSrc(dir))
+	target, err := b.ApplyOverrides("webapp", map[string]string{"cache": "off"})
+	if err != nil {
+		t.Fatalf("ApplyOverrides: %v", err)
+	}
+	if err := b.Execute(target, "", 1); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := readLogLines(t, dir)
+	if len(got) != 4 {
+		t.Fatalf("expected all 4 combos to run, got %v", got)
+	}
+	for _, line := range got {
+		if !strings.Contains(line, "cache=off") {
+			t.Errorf("expected every combo to see cache=off override, got line %q", line)
+		}
+	}
+}
+
+func TestApplyOverrides_UnderspecifiedFanOut(t *testing.T) {
+	dir := t.TempDir()
+	b := newBuild(t, matrixOverrideSrc(dir))
+	target, err := b.ApplyOverrides("webapp", map[string]string{"tracing": "on"})
+	if err != nil {
+		t.Fatalf("ApplyOverrides: %v", err)
+	}
+	if err := b.Execute(target, "", 1); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := readLogLines(t, dir)
+	if len(got) != 2 {
+		t.Fatalf("expected fan-out across both regions, got %v", got)
+	}
+	for _, line := range got {
+		if !strings.Contains(line, "tracing=on") {
+			t.Errorf("expected every fanned-out combo to have tracing=on, got line %q", line)
+		}
+	}
+}
+
+func TestApplyOverrides_PlainTargetOption(t *testing.T) {
+	dir := t.TempDir()
+	src := fmt.Sprintf(`
+deftype svc cache= { return 1; }
+defbody svc {
+    echo "cache=${cache:-unset}" >> %q
+}
+svc plain cache=default :
+`, filepath.Join(dir, "log"))
+	b := newBuild(t, src)
+	target, err := b.ApplyOverrides("plain", map[string]string{"cache": "off"})
+	if err != nil {
+		t.Fatalf("ApplyOverrides: %v", err)
+	}
+	if err := b.Execute(target, "", 1); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := readLogLines(t, dir)
+	want := []string{"cache=off"}
+	if strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Errorf("got %v, want %v", got, want)
+	}
+}
+
+func TestApplyOverrides_VerbFanOut(t *testing.T) {
+	dir := t.TempDir()
+	b := newBuild(t, matrixOverrideSrc(dir))
+	target, err := b.ApplyOverrides("webapp", map[string]string{"tracing": "on"})
+	if err != nil {
+		t.Fatalf("ApplyOverrides: %v", err)
+	}
+	if err := b.Execute(target, "clean", 1); err != nil {
+		t.Fatalf("Execute clean: %v", err)
+	}
+	got := readLogLines(t, dir)
+	if len(got) != 2 {
+		t.Fatalf("expected clean to fan out across both regions, got %v", got)
+	}
+	for _, line := range got {
+		if !strings.HasPrefix(line, "clean ") || !strings.Contains(line, "tracing=on") {
+			t.Errorf("expected clean-prefixed line with tracing=on, got %q", line)
+		}
+	}
+}
+
+func TestApplyOverrides_UnrecognizedKeyError(t *testing.T) {
+	dir := t.TempDir()
+	b := newBuild(t, matrixOverrideSrc(dir))
+	_, err := b.ApplyOverrides("webapp", map[string]string{"bogus": "1"})
+	if err == nil {
+		t.Fatal("expected error for unrecognized key")
+	}
+	if !strings.Contains(err.Error(), `unrecognized option "bogus"`) {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if !strings.Contains(err.Error(), "tracing") || !strings.Contains(err.Error(), "region") {
+		t.Errorf("expected error to name matrix dims: %v", err)
+	}
+	if !strings.Contains(err.Error(), "cache=") {
+		t.Errorf("expected error to name known options in -types style: %v", err)
+	}
+}
+
+func TestApplyOverrides_ExcludedComboReusesNoMatchError(t *testing.T) {
+	dir := t.TempDir()
+	src := fmt.Sprintf(`
+deftype svc { return 1; }
+defbody svc {
+    echo "tracing=$tracing region=$region" >> %q
+}
+svc webapp for tracing in [on off] for region in [us eu] exclude [tracing=on region=eu] {
+    echo "tracing=$tracing region=$region" >> %q
+}
+`, filepath.Join(dir, "log"), filepath.Join(dir, "log"))
+	b := newBuild(t, src)
+	_, err := b.ApplyOverrides("webapp", map[string]string{"tracing": "on", "region": "eu"})
+	if err == nil {
+		t.Fatal("expected error for excluded combo")
+	}
+	if !strings.Contains(err.Error(), "matched no combos") {
+		t.Errorf("expected generic no-match error, got: %v", err)
+	}
+}

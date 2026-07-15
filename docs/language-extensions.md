@@ -520,17 +520,22 @@ there is now a real, structured, per-type source of truth for "what
 options does this type accept," recoverable from the AST without reading
 body source.
 
-## Proposed, not yet implemented: CLI-invocation option overrides for matrix dimensions and plain options
+## Implemented: CLI-invocation option overrides for matrix dimensions and plain options
 
-**Status: design only.** This previously waited on a structured, per-type
-source of truth for "known option keys" — that groundwork has landed (see
-"Implemented: `deftype`/`defbody` option declaration" above): every typed
-rule's accepted vocabulary is now recoverable from the AST via
-`DefType.Options`/`DefBody.Options`, and unknown keys are already rejected
-at declaration time. What's proposed below is a separate, additive
-surface — overriding an already-declared option's value from argv at
-invocation time — not a new validation mechanism; the design is otherwise
-unchanged from the original sketch.
+**Status: done** (`cmd/mmk/main.go`, trailing-`key=value` argv parsing;
+`cmd/mmk/runtime/runtime.go`, `Build.ApplyOverrides`). This previously
+waited on a structured, per-type source of truth for "known option keys"
+— that groundwork landed first (see "Implemented: `deftype`/`defbody`
+option declaration" above): every typed rule's accepted vocabulary is
+recoverable from the AST via `DefType.Options`/`DefBody.Options`, and
+unknown keys are already rejected at declaration time. This feature is a
+separate, additive surface on top of that — overriding an already-declared
+option's value from argv at invocation time — not a new validation
+mechanism. Every design question below was resolved before implementation
+(see "Decided, not open") and the implementation followed it as written,
+including reusing `typeKnownOptions()` for error formatting and resolving
+matrix overrides structurally via `comboMatchesConstraints`, never through
+`comboTargetName` string construction.
 
 Requested by a downstream project that stands up
 the same environment in a handful of intentional variants — e.g. a service
@@ -580,11 +585,22 @@ Resolution semantics, unifying two cases so callers don't need to know
 which one applies:
 
 - If `key` matches one of the target's matrix dimensions, treat it as
-  selecting (narrowing) a specific combo — sugar for
-  `mmk '[webapp @ cache=off tracing=on]'`, minus the brackets and minus
-  the sorted-key trap above once that's fixed. Under-specifying still
-  fans out exactly like today's `[T @ k=v]` dep syntax does when some
-  keys are unconstrained.
+  selecting (narrowing) a specific combo. **This must not be implemented
+  by constructing a bracket-style name and re-resolving it as a string**
+  — that's the mechanism behind the sorted-key pitfall above, and it's an
+  accident of how matrix combos happen to be named internally, not a
+  contract worth building new surface on. Instead, resolve the base
+  target by its plain name as usual, then select the matching combo the
+  same way dep-list resolution already does it correctly: build a
+  constraints map from the CLI's `key=value` pairs and match it
+  structurally against each combo's `matrixCombo`, key-by-key, independent
+  of key order or any generated name string. Under-specifying still fans
+  out exactly like today's `[T @ k=v]` dep syntax does when some keys are
+  unconstrained. This is fully independent of the sorted-key pitfall —
+  this path never touches `comboTargetName` or a raw string lookup, so
+  that bug is neither a blocker nor something this feature needs to fix
+  (though it's still worth fixing separately for literal bracket CLI
+  invocation, `mmk '[build @ k=v]'`, which is untouched by this proposal).
 - If `key` matches a plain declared option instead, override that
   option's value for this invocation only — not cached, not a new named
   target, just a one-off bash-variable override for the body about to
@@ -625,18 +641,24 @@ which one applies:
   case, and a second argv-level way to do what a one-line aggregator
   (`all2 : a b`) already does is more confusion than it's worth. Out of
   scope, not a future addition.
-
-### Open questions, not yet resolved
-
-- Interaction with matrix `exclude`: if an override selects a combo that
-  `exclude` has pruned, should that be "no such combo" (consistent with
-  today's `[T @ k=v]` dep behavior) or a clearer override-specific error?
-  Leaning toward reusing the existing error for consistency, but flagging
-  it since the message would need to explain *why* the combo doesn't
-  exist, not just that it doesn't.
-- Once the type-docstring proposal above lands `mmk -types`, revisit this
-  proposal's error messages to make sure the two designs' "known options"
-  presentation actually compose (e.g. reuse whatever
-  key/description/legal-values shape `-types` ends up defining, rather
-  than inventing its own) — not blocking, since the underlying vocabulary
-  is now shared regardless of how each surfaces it.
+- **Matrix-dimension overrides resolve structurally, never through
+  `comboTargetName`/bracket-name emulation.** See the sketch above — the
+  CLI path builds a constraints map and matches it against each combo the
+  same way dep-list `[T @ k=v]` resolution already does, key-order-
+  independent by construction. Fixing the sorted-key pitfall in literal
+  bracket CLI invocation (`mmk '[build @ k=v]'`) remains worth doing, but
+  it's a separate, independent bug — not a prerequisite for or a
+  consequence of this feature.
+- **Interaction with matrix `exclude`:** if an override selects a combo
+  that `exclude` has pruned, reuse the existing "no such combo" error
+  (the same one today's `[T @ k=v]` dep behavior produces) rather than
+  inventing an override-specific message. Consistency over a more
+  tailored explanation.
+- **Unrecognized-option errors reuse `typeKnownOptions()` verbatim** — the
+  same helper `mmk -types` already uses to enumerate a type's option
+  vocabulary (deftype options ∪ every verb's defbody options ∪ built-ins,
+  minus the `order=`/`tty=` exempt keys), formatted the same way `-types`
+  already does (`Options: skip_if=, user=`). There's no richer
+  description/legal-values data anywhere in the codebase to reuse — that
+  was aspirational, not real — so this is "don't duplicate a helper that
+  already does exactly this," not a design fork.

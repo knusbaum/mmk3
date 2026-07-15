@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/knusbaum/mmk3/cmd/mmk/gen"
@@ -37,7 +38,7 @@ func main() {
 	useTUI := flag.Bool("tui", false, "render the build as a live TUI tree with status updates")
 	installSkill := flag.Bool("install-skill", false, "install the mmk Claude Code skill via 'claude plugin' commands (Y/n prompt before running)")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: mmk [-j N] [-v] [-replay-failure-output] [-dump] [-builtins] [-list [-all]] [-types [-all]] [-graph [-full]] [[verb] target]\n")
+		fmt.Fprintf(os.Stderr, "usage: mmk [-j N] [-v] [-replay-failure-output] [-dump] [-builtins] [-list [-all]] [-types [-all]] [-graph [-full]] [[verb] target] [key=value ...]\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -93,27 +94,50 @@ func main() {
 		return
 	}
 
+	// Trailing `key=value` args override a matrix dimension or a declared
+	// option on the invoked target for this invocation only. `=` is illegal
+	// in target/verb/runner names, so any arg containing it is unambiguously
+	// an override, regardless of where it falls among the positional args.
+	var positional []string
+	overrides := make(map[string]string)
+	for _, arg := range flag.Args() {
+		if k, v, ok := strings.Cut(arg, "="); ok {
+			overrides[k] = v
+		} else {
+			positional = append(positional, arg)
+		}
+	}
+
 	verb := ""
 	target := "all"
-	switch flag.NArg() {
+	switch len(positional) {
 	case 0:
 		// defaults
 	case 1:
-		arg := flag.Arg(0)
+		arg := positional[0]
 		if b.HasTarget(arg) || b.ResolveSubpath(arg, "") {
 			target = arg
 		} else {
 			verb = arg
 		}
 	case 2:
-		verb = flag.Arg(0)
-		target = flag.Arg(1)
+		verb = positional[0]
+		target = positional[1]
 		// If target has the form `subproject/rest`, register a delegating
 		// rule so the rest of the pipeline can resolve it normally.
 		b.ResolveSubpath(target, verb)
 	default:
-		fmt.Fprintf(os.Stderr, "usage: mmk [-j N] [-v] [[verb] target]\n")
+		fmt.Fprintf(os.Stderr, "usage: mmk [-j N] [-v] [[verb] target] [key=value ...]\n")
 		os.Exit(1)
+	}
+
+	if len(overrides) > 0 {
+		var err error
+		target, err = b.ApplyOverrides(target, overrides)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "mmk: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	if verb != "" && !b.HasVerb(verb) {

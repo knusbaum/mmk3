@@ -864,6 +864,184 @@ func (b *Build) HasTarget(name string) bool {
 	return false
 }
 
+// ApplyOverrides resolves CLI-invocation `key=value` overrides for the
+// top-level target `mmk` was invoked on, returning the target name the rest
+// of the pipeline (Resolve/Execute/Prepare/Graph/etc.) should use in its
+// place. Overrides never cascade into dependencies — this only ever touches
+// the invoked target itself, mirroring what writing the same key=value
+// directly on that target's own rule header would do.
+//
+// Each override key is resolved against exactly one of two vocabularies:
+//   - If target is a matrix target and key names one of its ForClauses
+//     variables, it narrows the matrix the same way a dep-list [T @ k=v]
+//     specifier does: build a constraints map and match it structurally
+//     against each combo's matrixCombo, never via comboTargetName string
+//     construction. Under-specifying still fans out across every matching
+//     combo, via a private synthetic aggregator (never registered in
+//     b.concretes under a name a user could otherwise reach).
+//   - Otherwise, if key is in the target's type's declared option
+//     vocabulary (typeKnownOptions), it overrides that option's value for
+//     this invocation only, on a private copy of the rule (matrix combos
+//     share their base rule's Options slice, so mutating in place would
+//     leak the override to sibling combos).
+//
+// An unrecognized key is a hard error naming the target's known dimensions
+// and options. A matrix override that matches no surviving combo (e.g. one
+// excluded via `exclude`) reuses the same "matched no combos" error dep-list
+// resolution already produces for the analogous case.
+func (b *Build) ApplyOverrides(target string, overrides map[string]string) (string, error) {
+	if len(overrides) == 0 {
+		return target, nil
+	}
+	b.nodesMu.Lock()
+	defer b.nodesMu.Unlock()
+
+	rule, err := b.findRule(target)
+	if err != nil {
+		return "", err
+	}
+	info, isMatrix := b.matrixInfo[target]
+	matrixDims := make(map[string]bool)
+	typeName := rule.Type
+	if isMatrix {
+		for _, v := range info.vars {
+			matrixDims[v] = true
+		}
+		// The base target's own rule is a synthetic aggregator with no Type
+		// of its own once matrix expansion replaces it — the real type lives
+		// on each combo's rule instead. Any combo carries the same Type, so
+		// the first one is representative.
+		if len(info.combos) > 0 {
+			firstName := comboTargetName(target, info.combos[0])
+			if info.names != nil {
+				firstName = info.names[0]
+			}
+			if r, err := b.findRule(firstName); err == nil {
+				typeName = r.Type
+			}
+		}
+	}
+	known := b.typeKnownOptions(typeName)
+	knownSet := make(map[string]bool, len(known))
+	for _, k := range known {
+		knownSet[k] = true
+	}
+
+	matrixConstraints := make(matrixCombo)
+	optionOverrides := make(map[string]string)
+	for k, v := range overrides {
+		switch {
+		case matrixDims[k]:
+			matrixConstraints[k] = v
+		case knownSet[k]:
+			optionOverrides[k] = v
+		default:
+			var msg strings.Builder
+			fmt.Fprintf(&msg, "target %q: unrecognized option %q", target, k)
+			if isMatrix && len(info.vars) > 0 {
+				dims := append([]string(nil), info.vars...)
+				sort.Strings(dims)
+				fmt.Fprintf(&msg, " (matrix dims: %s)", strings.Join(dims, ", "))
+			}
+			if len(known) > 0 {
+				fmt.Fprintf(&msg, " (Options: %s=)", strings.Join(known, "=, "))
+			}
+			return "", errors.New(msg.String())
+		}
+	}
+
+	// names is every concrete combo (or, for a non-matrix target, just the
+	// target itself) this invocation actually touches — narrowed by
+	// matrixConstraints if any were given, otherwise every combo, since an
+	// option override with no narrowing still has to reach every combo the
+	// real aggregator is about to build.
+	comboName := func(ci int, combo matrixCombo) string {
+		if info.names != nil {
+			return info.names[ci]
+		}
+		return comboTargetName(target, combo)
+	}
+	var names []string
+	narrowed := false
+	if isMatrix {
+		if len(matrixConstraints) > 0 {
+			for ci, combo := range info.combos {
+				if comboMatchesConstraints(combo, matrixConstraints) {
+					names = append(names, comboName(ci, combo))
+				}
+			}
+			if len(names) == 0 {
+				return "", fmt.Errorf("target %q: [%s @ %v] matched no combos", target, target, matrixConstraints)
+			}
+			narrowed = len(names) < len(info.combos)
+		} else {
+			for ci, combo := range info.combos {
+				names = append(names, comboName(ci, combo))
+			}
+		}
+	} else {
+		names = []string{target}
+	}
+
+	if len(optionOverrides) > 0 {
+		for _, name := range names {
+			r, err := b.findRule(name)
+			if err != nil {
+				return "", err
+			}
+			clone := *r
+			clone.Options = append([]parse.Option(nil), r.Options...)
+			for k, v := range optionOverrides {
+				found := false
+				for i := range clone.Options {
+					if clone.Options[i].Key == k {
+						clone.Options[i].Value = v
+						found = true
+						break
+					}
+				}
+				if !found {
+					clone.Options = append(clone.Options, parse.Option{Key: k, Value: v})
+				}
+			}
+			b.concretes[name] = &clone
+		}
+	}
+
+	if !isMatrix {
+		return target, nil
+	}
+	if !narrowed {
+		// Every combo was touched (no narrowing) — the real aggregator
+		// already depends on all of them, and any option overrides were
+		// just applied in place above, so the original target still
+		// resolves correctly.
+		return target, nil
+	}
+	if len(names) == 1 {
+		return names[0], nil
+	}
+
+	// Under-specified matrix override matched more than one but fewer than
+	// all combos: fan out via a private synthetic aggregator, the same role
+	// the real matrix aggregator plays, but never exposed under a name a
+	// plain `mmk <name>` invocation could collide with (bracket syntax is
+	// illegal in a hand-written target name).
+	aggName := fmt.Sprintf("[%s @ override %v]", target, matrixConstraints)
+	if _, exists := b.concretes[aggName]; !exists {
+		deps := make([]parse.Dep, len(names))
+		for i, n := range names {
+			deps[i] = parse.Dep{Target: n}
+		}
+		b.concretes[aggName] = &parse.TargetRule{
+			Target:    aggName,
+			HasDepSep: true,
+			Deps:      deps,
+		}
+	}
+	return aggName, nil
+}
+
 // Prepare resolves all transitive dependencies of target+verb, fully populating
 // the generated bash script, without running any nodes.
 func (b *Build) Prepare(target, verb string) error {
