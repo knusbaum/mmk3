@@ -135,11 +135,24 @@ doesn't abort discovery of the rest), and for each one writes a `go_exe`
 line into a generated `.mmk` fragment, then prints that fragment's path:
 
 ```bash
+## Every auto-discovered main package.
 group go_mains
 
+## Auto-discovered main package: example.com/org/foo/cmd/server
 go_exe bin/cmd/server pkg=example.com/org/foo/cmd/server into go_mains :
+## Auto-discovered main package: example.com/org/foo/cmd/worker
 go_exe bin/cmd/worker pkg=example.com/org/foo/cmd/worker into go_mains :
 ```
+
+Each generated line carries a `##` docstring so discovered binaries actually
+show up in a plain `mmk -list` (no `-all`) — `mmk -list` only shows targets
+with a docstring plus the literal `all` target; without one, every
+discovered binary would be invisible without `-all`, defeating the whole
+point of discovery (this was missed at first — caught by testing against a
+real project, not by re-reading the spec). A hand-written override rule has
+no docstring of its own unless the user adds one, so it's hidden from plain
+`-list` like any other undocumented target — same behavior as writing
+`go_exe` by hand always had.
 
 Target names mirror the package's import path relative to the module root
 (`bin/<relpath>`, not just the basename) since two `main` packages can share

@@ -49,7 +49,7 @@ group pre_build
 _mmk_go_mains() {
     modpath=$(go list -m -f '{{.Path}}' 2>/dev/null)
     frag="${TMPDIR:-/tmp}/mmk-go-mains-$(pwd -P | cksum | cut -d' ' -f1).mmk"
-    printf 'group go_mains\n\n' > "$frag"
+    printf '## Every auto-discovered main package.\ngroup go_mains\n\n' > "$frag"
     if [ -n "$modpath" ]; then
         go list -e -f '{{if eq .Name "main"}}{{.ImportPath}}{{end}}' ./... 2>/dev/null |
         while IFS= read -r importpath; do
@@ -59,7 +59,7 @@ _mmk_go_mains() {
             else
                 rel="${importpath#$modpath/}"
             fi
-            printf 'go_exe bin/%s pkg=%s into go_mains :\n' "$rel" "$importpath" >> "$frag"
+            printf '## Auto-discovered main package: %s\ngo_exe bin/%s pkg=%s into go_mains :\n' "$importpath" "$rel" "$importpath" >> "$frag"
         done
     fi
     echo "$frag"
