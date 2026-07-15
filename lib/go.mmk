@@ -16,7 +16,11 @@
 #
 # Options (both types accept):
 #   pkg=<path>      Go package(s) to operate on. Defaults to ./... for
-#                   go_module verbs and to . for go_exe build.
+#                   go_module verbs. Mandatory for go_exe (build and test) —
+#                   there is no default, since a target name alone (e.g.
+#                   bin/cmd/server) doesn't reliably imply which package to
+#                   build; omitting it is a build-time error, not a silent
+#                   fallback to ".".
 #   ldflags=<str>   Value passed to -ldflags on go build (go_exe).
 #   cgo=0           CGO_ENABLED for the go_exe build (default: 0).
 #   goos=<os>       GOOS for the go_exe build (default: unset, i.e. host OS).
@@ -112,9 +116,13 @@ deftype go_exe {
 }
 
 defbody go_exe : pre_build {
+    if [ -z "$pkg" ]; then
+        echo "go_exe $target: pkg= is required (e.g. pkg=./cmd/myapp)" >&2
+        exit 1
+    fi
     mkdir -p "$(dirname "$target")"
     CGO_ENABLED=${cgo:-0} GOOS=${goos:-} GOARCH=${goarch:-} \
-        go build ${ldflags:+-ldflags="$ldflags"} -o "$target" "${pkg:-.}"
+        go build ${ldflags:+-ldflags="$ldflags"} -o "$target" "$pkg"
 }
 
 defbody go_exe clean {
@@ -122,5 +130,9 @@ defbody go_exe clean {
 }
 
 defbody go_exe test {
-    go test "${pkg:-.}"
+    if [ -z "$pkg" ]; then
+        echo "go_exe $target: pkg= is required (e.g. pkg=./cmd/myapp)" >&2
+        exit 1
+    fi
+    go test "$pkg"
 }
