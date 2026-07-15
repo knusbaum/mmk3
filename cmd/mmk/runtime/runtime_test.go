@@ -680,7 +680,7 @@ func TestUserDeftypeNanoStatNoSpuriousRebuild(t *testing.T) {
 	touchAt(t, out, t0.Add(500*time.Millisecond))
 
 	mmkSrc := fmt.Sprintf(`
-deftype mypkg { stat -c %%.Y "$target" 2>/dev/null || return 1 }
+deftype mypkg { stat -c %%.Y "$target" 2>/dev/null || stat -f %%m "$target" 2>/dev/null || return 1 }
 mypkg %q : %q { cp %q %q }
 file %q :
 `, out, src, src, out, src)
