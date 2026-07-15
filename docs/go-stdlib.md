@@ -33,20 +33,17 @@ go_module . :
 
 ### `go_exe`
 
-A real file-artifact type: the target name *is* the output binary path.
-Freshness is just the binary's mtime — mmk doesn't track `.go` sources
-individually, so a rebuild after source changes needs `mmk clean <target>`
-or removing the binary. Every `go_exe` build unconditionally depends on a
-`pre_build` group (whether or not anything registers into it), giving
-projects a hook point for codegen without editing generated lines — see
-below.
+The target name is the output binary path. Like `go_module`, its `deftype`
+always reports "needs run" — mmk defers to the go tool's own incremental
+build cache, which makes rebuilding an already-built binary cheap. Every
+`go_exe` build unconditionally depends on a `pre_build` group (whether or
+not anything registers into it), giving projects a hook point for codegen
+without editing generated lines — see below.
 
 ```bash
 group pre_build
 
-deftype go_exe {
-    [ -f "$target" ] && (stat -c "%Y" "$target" 2>/dev/null || stat -f "%m" "$target" 2>/dev/null)
-}
+deftype go_exe { return 1; }
 
 defbody go_exe : pre_build {
     if [ -z "$pkg" ]; then
@@ -127,14 +124,14 @@ lists every buildable program in the current directory's module via `mmk
 This needs no parser changes — `include $(...)` (see
 [language-extensions.md](language-extensions.md#existing-mechanism-include--for-generated-targets))
 already lets an include path be the output of an arbitrary command.
-`go.mmk` defines a passthrough bash function, `_mmk_go_mains`, and includes
+`go.mmk` defines a passthrough bash function, `_mmk_go_exes`, and includes
 its own output:
 
 ```bash
-include $(_mmk_go_mains)   # inside go.mmk
+include $(_mmk_go_exes)   # inside go.mmk
 ```
 
-`_mmk_go_mains` resolves the current module with `go list -m`, lists every
+`_mmk_go_exes` resolves the current module with `go list -m`, lists every
 `main` package under the current directory with `go list -e -f '{{if eq
 .Name "main"}}{{.ImportPath}}{{end}}' ./...` (`-e` so one broken package
 doesn't abort discovery of the rest), and for each one writes a `go_exe`
@@ -142,12 +139,12 @@ line into a generated `.mmk` fragment, then prints that fragment's path:
 
 ```bash
 ## Every auto-discovered main package.
-group go_mains
+group go_exes
 
 ## Auto-discovered main package: example.com/org/foo/cmd/server
-go_exe bin/cmd/server pkg=example.com/org/foo/cmd/server into go_mains :
+go_exe bin/cmd/server pkg=example.com/org/foo/cmd/server into go_exes :
 ## Auto-discovered main package: example.com/org/foo/cmd/worker
-go_exe bin/cmd/worker pkg=example.com/org/foo/cmd/worker into go_mains :
+go_exe bin/cmd/worker pkg=example.com/org/foo/cmd/worker into go_exes :
 ```
 
 Each generated line carries a `##` docstring so discovered binaries actually
@@ -170,7 +167,7 @@ of `go list` with no relative-path computation needed. A `main` package
 living at the module root itself (no subdirectory to name it from) falls
 back to `bin/<module-basename>`, the last segment of the module's import
 path. If there's no `go.mod` (or no `go` binary), discovery degrades to an
-empty `go_mains` group rather than erroring — `go_module`/`go_exe` and any
+empty `go_exes` group rather than erroring — `go_module`/`go_exe` and any
 hand-written `go_exe` rules keep working regardless.
 
 The fragment is written to a path deterministic in the project's directory
@@ -196,11 +193,11 @@ because its `main` package lived at the module root, so `.` was accidentally
 correct — a multi-binary project overriding a subdirectory binary would have
 silently built the wrong source.
 
-Each discovered binary is registered `into go_mains`, so downstream targets
+Each discovered binary is registered `into go_exes`, so downstream targets
 can depend on "every discovered binary" without enumerating them:
 
 ```bash
-release : go_mains   # depends on every discovered main package's binary
+release : go_exes   # depends on every discovered main package's binary
 ```
 
 Since a discovered `go_exe` is a normal `go_exe` target, it automatically
