@@ -50,14 +50,17 @@ deftype go_exe {
 
 defbody go_exe : pre_build {
     mkdir -p "$(dirname "$target")"
-    CGO_ENABLED=${cgo:-0} go build ${ldflags:+-ldflags="$ldflags"} -o "$target" "${pkg:-.}"
+    CGO_ENABLED=${cgo:-0} GOOS=${goos:-} GOARCH=${goarch:-} \
+        go build ${ldflags:+-ldflags="$ldflags"} -o "$target" "${pkg:-.}"
 }
 
 defbody go_exe clean { rm -f "$target"; }
 defbody go_exe test  { go test "${pkg:-.}"; }
 ```
 
-Options: `pkg=` (default `.`), `ldflags=`, `cgo=` (default `0`).
+Options: `pkg=` (default `.`), `ldflags=`, `cgo=` (default `0`), `goos=`/`goarch=`
+(default: unset, i.e. host OS/arch — see [GOOS/GOARCH cross-compile
+matrices](#goosgoarch-cross-compile-matrices) below).
 
 ```bash
 include go.mmk
@@ -94,63 +97,26 @@ tool my_generate_tool {
 }
 ```
 
+## GOOS/GOARCH cross-compile matrices
+
+**Status: shipped.** A survey of Makefiles across a range of existing Go
+projects (see [case-study.md](case-study.md)) found five of thirteen
+cross-compiling via either a hand-written shell `for os/arch` loop or a Make
+static-pattern rule over `GOOS`×`GOARCH`. mmk already generalizes this with
+its `for ... in [...]` matrix clause — `go_exe` just reads `$goos`/`$goarch`
+if the matrix sets them (shown above); no loop-writing, no
+static-pattern-rule tricks needed:
+
+```bash
+go_exe "bin/myapp-$goos-$goarch" for goos in [darwin linux windows] for goarch in [amd64 arm64] \
+    exclude [goos=windows goarch=arm64] :
+```
+
 ## Planned extensions
 
-Grounded in a survey of Makefiles across a range of existing Go projects
-(see [case-study.md](case-study.md)): the plain-build/test/vet/fmt wrapper
-above is the case nobody actually needs help with. The real recurring pain
-points, ranked by how often they showed up and how much boilerplate they
-currently cost:
-
-### Version/ldflags injection
-
-**Status: proposed.** Six out of a baseline of thirteen surveyed projects
-hand-rolled the same shape: `git describe --tags --always --dirty` (or a
-short SHA plus a dirty-check), baked into the binary via `-X pkg.Var=value`.
-
-Since target bodies re-run on every invocation (not just at parse time),
-`go_exe`'s body can compute this itself. Proposed: an opt-in option,
-`version_pkg=`:
-
-```bash
-defbody go_exe {
-    mkdir -p "$(dirname "$target")"
-    v=${version:-$(git describe --tags --always --dirty 2>/dev/null)}
-    lf="${ldflags:-}${version_pkg:+ -X ${version_pkg}.Version=$v}"
-    CGO_ENABLED=${cgo:-0} go build ${lf:+-ldflags="$lf"} -o "$target" "${pkg:-.}"
-}
-```
-
-```bash
-go_exe bin/myapp pkg=./cmd/myapp version_pkg=main :
-```
-
-One option replaces the copy-pasted `git describe`/dirty-check/`-X` dance.
-
-### GOOS/GOARCH cross-compile matrices
-
-**Status: proposed.** Five of the thirteen surveyed projects cross-compiled
-via either a hand-written shell `for os/arch` loop or a Make static-pattern
-rule over `GOOS`×`GOARCH`. mmk already generalizes this with its `for ... in
-[...]` matrix clause — `go_exe` just needs to read `$goos`/`$arch` if the
-matrix sets them:
-
-```bash
-defbody go_exe {
-    mkdir -p "$(dirname "$target")"
-    CGO_ENABLED=${cgo:-0} GOOS=${goos:-} GOARCH=${arch:-} \
-        go build ${ldflags:+-ldflags="$ldflags"} -o "$target" "${pkg:-.}"
-}
-```
-
-```bash
-go_exe "bin/myapp-$goos-$arch" for goos in [darwin linux windows] for arch in [amd64 arm64] \
-    exclude [goos=windows arch=arm64] :
-```
-
-No loop-writing, no static-pattern-rule tricks — this is mmk's matrix
-feature doing what it already does; `go.mmk` just needs to plumb two more
-env vars through the existing body.
+Grounded in the same Makefile survey: the plain-build/test/vet/fmt wrapper
+above and the GOOS/GOARCH matrix are the cases nobody needs further help
+with. The remaining recurring pain point:
 
 ### Automatic `main`-package discovery
 

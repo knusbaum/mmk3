@@ -10,8 +10,8 @@ rot in a single monolithic doc.
   ones not yet built.
 - [tool-stdlib.md](tool-stdlib.md) — `tool`, a generic type for "ensure some
   versioned CLI is available," independent of any particular language.
-- [go-stdlib.md](go-stdlib.md) — `go.mmk`: wrapping the Go toolchain, plus
-  planned extensions (version injection, cross-compile matrices, automatic
+- [go-stdlib.md](go-stdlib.md) — `go.mmk`: wrapping the Go toolchain and
+  GOOS/GOARCH cross-compile matrices, plus a planned extension (automatic
   discovery of `main` packages).
 - [c-stdlib.md](c-stdlib.md) — `c.mmk`: types for C libraries, shared
   libraries, and executables.
