@@ -30,27 +30,37 @@
 
 # ---- cmake_project -----------------------------------------------------------
 
+## Wraps a cmake configure+build under a single mmk target. Always
+## reports "absent" — cmake's own incremental tracking decides what to
+## actually rebuild. Depend on a specific output file, not this target,
+## if you need a freshness signal.
 deftype cmake_project { return 1; }
 
-defbody cmake_project {
+defbody cmake_project build_dir= source= preset= {
     cmake -B "$build_dir" ${preset:+--preset "$preset"} "${source:-.}"
     cmake --build "$build_dir" -j
 }
 
-defbody cmake_project install {
+## Runs `cmake --install`.
+defbody cmake_project install build_dir= prefix= {
     cmake --install "$build_dir" --prefix "${prefix:-dist}"
 }
 
-defbody cmake_project test {
+## Runs `ctest`.
+defbody cmake_project test build_dir= ctest_args= {
     ctest --test-dir "$build_dir" ${ctest_args:-}
 }
 
-defbody cmake_project clean {
+## Removes the cmake build directory.
+defbody cmake_project clean build_dir= {
     rm -rf "$build_dir"
 }
 
 # ---- git_source --------------------------------------------------------------
 
+## Clones (or updates) a git repo to a specific tag. Freshness is keyed
+## on `tag=` — re-runs only when the tag changes or the working tree is
+## missing.
 deftype git_source {
     sentinel="$target/.mmk-git-tag"
     [ -f "$sentinel" ] || exit 1
@@ -58,7 +68,7 @@ deftype git_source {
     stat -c "%Y" "$sentinel" 2>/dev/null || stat -f "%m" "$sentinel" 2>/dev/null
 }
 
-defbody git_source {
+defbody git_source repo= tag= {
     if [ -d "$target/.git" ]; then
         git -C "$target" fetch --quiet
     else
@@ -69,6 +79,7 @@ defbody git_source {
     printf '%s' "$tag" > "$target/.mmk-git-tag"
 }
 
+## Removes the cloned working tree.
 defbody git_source clean {
     rm -rf "$target"
 }

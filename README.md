@@ -269,6 +269,35 @@ Pattern rules, image-runner aggregators, intermediate `.o` files, etc.
 are typically left undocumented; user-facing entry points get a
 docstring.
 
+### File-level description (`##!` comments)
+
+Lines starting with `##!` at the very top of the file — before any other
+directive or passthrough bash — attach as the file's description, printed
+as a header above `Targets:` by `mmk -list` (with or without `-all`):
+
+```bash
+##! Stand up demo environments for the widget service.
+##! Run `mmk -list -all` to see the underlying building blocks.
+
+all : demo
+```
+
+```
+$ mmk -list
+Stand up demo environments for the widget service.
+Run `mmk -list -all` to see the underlying building blocks.
+
+Targets:
+  all   → demo
+  demo  ...
+```
+
+`##!` is deliberately distinct from the per-rule `##` docstring, so a
+leading `##` block still attaches to the first target rule as it always
+has — the two markers never compete for the same comment block. Only the
+root mmkfile's `##!` block is honored: an `include`d file's own `##!`
+lines are not merged into the parent's description.
+
 ## Types and freshness
 
 A type tells `mmk` how to determine when an artifact was last built. Built-in:

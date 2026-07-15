@@ -248,7 +248,7 @@ disagreement with what `computeComboTargetNames` chose.
 **Status: done** (`cmd/mmk/gen/gen.go`, `ValidateDuplicates`). Built for
 [go-stdlib.md](go-stdlib.md#automatic-main-package-discovery): a hand-written
 `go_exe` rule needs to be able to override one spliced in by
-`include $(_mmk_go_mains)` with the same target name, the same way a project
+`include $(_mmk_go_exes)` with the same target name, the same way a project
 already overrides a built-in `deftype`/`defbody`/`defrunner` just by
 declaring its own.
 
@@ -283,7 +283,7 @@ detection already lives.
 ## Pitfall: a bare `{` on its own line is a target-rule body opener, even inside a passthrough bash function
 
 **Status: existing behavior, documented here because it bit
-`_mmk_go_mains`** (the discovery function backing
+`_mmk_go_exes`** (the discovery function backing
 [go-stdlib.md](go-stdlib.md#automatic-main-package-discovery)) **while
 writing it.** `parseDirectiveOrPassthrough` (`cmd/mmk/parse/parse.go`) scans
 every physical line independently, including lines inside an already-open
@@ -303,7 +303,7 @@ mmkfile passthrough bash. A subshell (`( cmds ) > file`) is safe instead —
 `firstWordFollowedByParen` catches the bare `(` and treats the whole line
 as passthrough — but simplest is usually to avoid multi-command grouping
 + redirection entirely and build output incrementally with `>`/`>>` per
-line, which is what `_mmk_go_mains` does.
+line, which is what `_mmk_go_exes` does.
 
 A related trap in the same function while it still used `local modpath
 frag` (declaring multiple locals on one line): a two-bare-word passthrough
@@ -340,43 +340,303 @@ failure mode is silence rather than an error. Worth revisiting whether
 word matches a known type name, since that's almost always a mistake
 rather than intentional bash.
 
-## Proposed, not yet implemented: type docstrings + a discoverability command
+## Implemented: file-level project description (`##!`), printed by `mmk -list`
 
-**Status: design only.** `mmk -list` already distinguishes user-facing
-targets from internal ones via a `##` docstring convention on target rules.
-Types (`deftype`/`defbody`) have no equivalent: there's no way to attach a
-docstring or a declared parameter list to a `deftype`, and no command that
-dumps "every type available in this build — including ones pulled in via
-`include` — its docstring, and the options it reads."
+**Status: done** (`cmd/mmk/parse/parse.go`, `parseLeadingFileDoc`;
+`cmd/mmk/runtime/runtime.go`, `Build.Description` / `PrintList`). Requested
+by a downstream project using `mmk -list` as its primary front door: a
+first-time user running `mmk -list` saw a bare list of target names with no
+orientation — what the project is, prerequisites, naming conventions — even
+though the project already maintained that text as a comment block at the
+top of its mmkfile. Nobody who ran `-list` instead of opening the file ever
+saw it.
 
-This matters most for the stdlib: a project that does `include go.mmk`
-today has no way to ask mmk what `go_exe` is, what options it takes, or
-what verbs it supports, short of reading `go.mmk`'s source (or this
-`docs/` directory). Sketch of the shape:
+The existing `##` docstring convention is per-rule (`TargetRule`,
+`Subproject`, `Group` only — see `parser.pendingDoc` /
+`consumePendingDoc`), and attaches to *whatever directive follows it*.
+Overloading `##` for a file-level description would have meant a leading
+`##` block either always steals the first target's docstring or never can
+become a project description — no way to have both. So this uses a
+separate marker, `##!`, recognized only in the run of comments/blank lines
+at the very start of the file (`parseLeadingFileDoc`, called once before
+`parseFile`'s main loop). A leading `##` block (no `!`) is completely
+unaffected and keeps attaching to the first directive exactly as before —
+the two markers never compete for the same comment block.
+
+```bash
+##! Stand up demo environments for the widget service.
+##! Run `mmk -list -all` to see the underlying building blocks.
+
+all : demo
+```
+
+`Build.Description` (populated from `parse.File.Description` in
+`newBuildFromAST`) is printed by `PrintList` as a header before
+`Targets:`, unconditionally — with or without `-all`, since project
+orientation is exactly as useful either way.
+
+Two scope decisions, both deliberately narrow for a first cut:
+
+- **`include`d files' own `##!` blocks are discarded.** `resolveIncludes`
+  only propagates `Description` from the root file it was called with
+  (the one returned to `ParseFile`); an included file's `File.Description`
+  is computed during its own recursive parse but never makes it into the
+  splice, since only `.Directives` is merged. A project description is a
+  property of "the mmkfile someone runs `mmk -list` against," not of every
+  file that happens to get spliced into it.
+- **Subproject descriptions are not surfaced.** `walkSubprojectTree`
+  already re-parses each subproject's mmkfile as a `*parse.File` for
+  `-list -all`'s target/verb harvesting, so a subproject's own `##!` block
+  is technically available at that point — but `PrintList`'s subproject
+  rows are single-line tabular entries, and a project description is
+  designed to be multi-line prose. Threading it through would mean
+  redesigning that part of the listing's layout, not just plumbing a
+  string. Left as future work if a nested-subproject use case shows up.
+
+## Implemented: type docstrings + a discoverability command
+
+**Status: implemented.** `deftype` and `defbody` now accept the same `##`
+docstring convention target rules already had. A `##` comment block
+immediately preceding a `deftype` documents the type itself; one preceding
+a `defbody TYPE` or `defbody TYPE VERB` documents that verb (a `defbody`
+with no verb documents the type's default build behavior):
 
 ```bash
 ## Builds a Go binary. The target name is the output path.
-## Options: pkg= (required), ldflags=, cgo= (default 0).
-deftype go_exe {
+deftype go_exe pkg= ldflags= cgo= {
+    ...
+}
+
+## Removes the built binary.
+defbody go_exe clean {
+    rm -f "$target"
+}
+```
+
+`mmk -types` lists every type reachable from the build — built-ins plus
+every `deftype` declared in the Mmkfile, flattened through `include` (same
+scope as `-list`) — with its docstring, declared options (sourced from the
+type's structured `Options`, per the option-declaration feature above),
+and its verbs with their own docstrings:
+
+```
+$ mmk -types
+go_exe  Builds a Go binary. The target name is the output path.
+        Options: cgo=, ldflags=, pkg=
+        Verbs:
+          build (default)
+          clean — Removes the built binary.
+          test — Runs `go test` on the exe's package.
+```
+
+Like `-list`, `-types` hides undocumented types by default; `-types -all`
+shows everything, documented or not. `lib/go.mmk`, `lib/c.mmk`, and
+`lib/cmake.mmk` now carry `##` docstrings on all their types and verbs, so
+`include`-ing any of them makes their types self-describing via `-types`
+without reading the source.
+
+## Pitfall: CLI combo target specifiers require alphabetically-sorted keys
+
+**Status: existing behavior, undocumented, worth fixing.** A dependency
+on a specific matrix combo (`consumer : [build @ os=linux go=1.21]`) is
+parsed structurally — the parser builds a `[]parse.Option` from the
+bracket contents, and `runtime.go`'s dep resolution matches it against
+each combo's `matrixCombo` map key-by-key (see the `constraints` map built
+from `dep.Combo` around `runtime.go:1132-1136`), so key order in the
+source is irrelevant.
+
+Invoking the same combo directly from the command line —
+`mmk '[build @ os=linux go=1.21]'` — takes a completely different path:
+`Resolve`/`findRule` do a **raw string lookup** against `b.concretes` /
+`b.nodes`, keyed by whatever `comboTargetName` produced when the combo was
+registered. `comboTargetName` sorts keys alphabetically for determinism
+(`runtime.go:2124-2151`), so the only string that will ever match is the
+one with keys in sorted order. `mmk '[build @ os=linux go=1.21]'` fails
+with `unknown verb "[build @ os=linux go=1.21]"` unless `go` happens to
+sort before `os`; the working form is `mmk '[build @ go=1.21 os=linux]'`.
+Nothing prints or hints at this — the error message looks identical to a
+genuinely unknown target.
+
+Fix: parse the CLI target argument the same way a dep-list combo
+specifier is parsed (reuse the bracket/option parsing already in
+`cmd/mmk/parse`), build a `matrixCombo` from it, and look up
+`comboTargetName(base, combo)` instead of matching the raw string. This
+makes CLI combo invocation key-order-independent for free, with no syntax
+change and no effect on any other invocation path — a self-contained fix,
+independent of whatever comes out of the proposal below.
+
+## Implemented: `deftype`/`defbody` option declaration, with strict unknown-key rejection
+
+**Status: implemented.** `deftype` now accepts the same trailing
+`key=value ...` header tokens `defbody` already did:
+
+```bash
+deftype go_exe pkg= cgo=0 goos= goarch= ldflags= {
     ...
 }
 ```
 
-```
-$ mmk -types
-go_exe       Builds a Go binary. The target name is the output path.
-             Options: pkg= (required), ldflags=, cgo= (default 0).
-             Verbs: build (default), clean, test
-tool         ...
+`DefType` gained an `Options []parse.Option` field, populated by the same
+parsing loop `defbody` already used (interleaved with `into GROUP`, same
+reserved-key check for `target`/`deps`/`MMK_*`). No new syntax — this is
+exactly the syntax `defbody` already had, just also legal on `deftype`.
+
+A type's full accepted-option vocabulary is the union of its
+`DefType.Options` and every verb's `DefBody.Options` for that type (across
+all verbs, not scoped per-verb) — plus the built-in `image` type's
+`skip_if=`/`user=`, now declared the same way via
+`gen.BuiltinDefBodyOptions`.
+
+**This declaration is metadata only.** Declaring `pkg=` does not inject a
+default or set `$pkg` for you — the body still reads `${pkg:-...}` itself,
+exactly as before. There is no `!`/required-marker syntax and no
+required-ness enforcement; that's out of scope for this change. The only
+behavioral effect is validation:
+
+- **Any `key=value` option set on a rule of a declared type, where `key`
+  isn't in that type's accepted vocabulary, is a hard parse/validate-time
+  error** — naming the unknown key and listing the type's known options.
+- **A type that declares zero options still only accepts zero options.**
+  There is no permissive fallback for types that haven't opted in to
+  declaring anything; every typed rule is checked.
+- Verb rules (`[verb target] key=value { ... }`) have no `Type` of their
+  own — validation resolves the base concrete rule's `Type` to find the
+  right vocabulary to check against.
+- Two option keys are engine-level and exempt from every type's vocabulary,
+  because they're genuinely type-agnostic rather than something any single
+  type "owns": `order=` (runner-scheduling hint, already special-cased) and
+  `tty=` (PTY allocation for `on <runner>` bodies). These are legal on any
+  rule of any type, or no type, without being declared anywhere.
+- Untyped rules (no `deftype` at all) are unaffected — this mechanism only
+  applies to `deftype`/`defbody`-typed rules.
+
+This is an intentional breaking change for any existing typed rule,
+stdlib or user-authored, that was setting an option its type never
+declared. The stdlib (`go.mmk`, `c.mmk`, `cmake.mmk`) has been updated to
+declare every option its bodies actually read.
+
+This closes the prerequisite gap the two proposals below were blocked on:
+there is now a real, structured, per-type source of truth for "what
+options does this type accept," recoverable from the AST without reading
+body source.
+
+## Proposed, not yet implemented: CLI-invocation option overrides for matrix dimensions and plain options
+
+**Status: design only.** This previously waited on a structured, per-type
+source of truth for "known option keys" — that groundwork has landed (see
+"Implemented: `deftype`/`defbody` option declaration" above): every typed
+rule's accepted vocabulary is now recoverable from the AST via
+`DefType.Options`/`DefBody.Options`, and unknown keys are already rejected
+at declaration time. What's proposed below is a separate, additive
+surface — overriding an already-declared option's value from argv at
+invocation time — not a new validation mechanism; the design is otherwise
+unchanged from the original sketch.
+
+Requested by a downstream project that stands up
+the same environment in a handful of intentional variants — e.g. a service
+brought up with caching on or off, with tracing on or off, or restricted
+to a subset of a plugin list — and wants to pick a variant at invocation
+time without it becoming a maintenance burden.
+
+### What exists today, and where it falls short
+
+- **Matrix targets** (`T for k in [...] for k2 in [...]`) are the correct
+  primitive for orthogonal on/off-style knobs, but two things make them
+  clunky for this use case once the sorted-key pitfall above is fixed:
+  cross-products generate combos that don't make sense together and have
+  to be pruned with `exclude`, and running the bare aggregator (`mmk T`)
+  builds *every surviving combo*, which is never what an interactive user
+  wants when they just meant "give me the default one."
+- **Plain `key=value` rule options** (`T cache=off : ... { ... }`) are
+  read inside the body as bash variables, but they're fixed at
+  declaration time — there is no mechanism, CLI or otherwise, to override
+  one at invocation (confirmed: no env-var convention, no flag, nothing in
+  `main.go`'s arg handling touches rule options).
+- **A knob whose value is "a subset of a list"** (e.g. which plugins are
+  active) doesn't fit a matrix dimension at all without an explosion of
+  combos for every subset a user might want — it's much more naturally a
+  single option whose value is a comma/space-separated list, read and
+  split inside the body.
+- Environment variables (`CACHE=off mmk webapp`) work today without any
+  mmk change, but are explicitly the thing being avoided: invisible in
+  `-list`, global and easy to leave set by accident, and undiscoverable
+  short of reading the mmkfile.
+
+### Sketch
+
+Extend CLI argument parsing to recognize trailing `KEY=VALUE` arguments
+after the verb/target. This is unambiguous and backward-compatible: `=` is
+already forbidden in target, verb, and runner names (see "Naming" in
+`CLAUDE.md`), so any argument containing `=` can never have been a valid
+target or verb — today it always falls into the `default: usage error`
+arm of `main.go`'s `flag.NArg()` switch, so no existing invocation can
+break.
+
+```bash
+mmk webapp cache=off tracing=on
 ```
 
-Open questions, not yet resolved:
+Resolution semantics, unifying two cases so callers don't need to know
+which one applies:
 
-- Docstring syntax: reuse `##` (parsed today only for target rules), or
-  something structured enough to extract an options table mechanically
-  rather than free text?
-- Whether `defbody TYPE VERB` needs its own docstring, or whether the verb
-  list is inferred from which `defbody`s exist (simpler, but loses
-  per-verb explanation).
-- How deeply to walk `include` — probably flatten to "every type reachable
-  from this Mmkfile," same scope as `-list`.
+- If `key` matches one of the target's matrix dimensions, treat it as
+  selecting (narrowing) a specific combo — sugar for
+  `mmk '[webapp @ cache=off tracing=on]'`, minus the brackets and minus
+  the sorted-key trap above once that's fixed. Under-specifying still
+  fans out exactly like today's `[T @ k=v]` dep syntax does when some
+  keys are unconstrained.
+- If `key` matches a plain declared option instead, override that
+  option's value for this invocation only — not cached, not a new named
+  target, just a one-off bash-variable override for the body about to
+  run. This is the mechanism a `plugins=` subset knob would use.
+- **Scope is strictly the top-level invoked target — no cascading into
+  dependencies.** An override is equivalent to writing that
+  `key=value` directly on the target's own rule header (or selecting
+  that combo directly), nothing more; it never reaches into a
+  dependency's rule even if that dependency happens to declare the same
+  key. Decided, not left open — see below.
+- An unrecognized key is a hard error naming the target's known
+  dimensions/options.
+  - Matrix dimension keys come from the rule's `ForClauses` — mechanical
+    today, no declaration mechanism needed.
+  - Plain option keys: now also mechanical, via the type's declared
+    vocabulary (`DefType.Options` ∪ every verb's `DefBody.Options`) — see
+    "Implemented: `deftype`/`defbody` option declaration" above. The CLI
+    override's own validation can reuse that same vocabulary rather than
+    inventing a second source of truth.
+
+### Why this satisfies the stated constraints
+
+- **Keeps `-list` clean.** Overrides are argv, not declarations — no new
+  target is registered, so `-list`'s menu doesn't grow with every
+  combination a user might type.
+- **Validity checking is mechanical for both key kinds.** Matrix
+  dimension keys come from `ForClauses`; plain option keys come from the
+  type's declared vocabulary (`DefType.Options`/`DefBody.Options`) — both
+  answerable from the AST with no body-source reading required.
+- **No env vars, no brackets** for the common interactive case, while the
+  bracket form still exists underneath for scripting/dep-list use where
+  precision matters more than brevity.
+
+### Decided, not open
+
+- **No multi-target invocation** (`mmk a b` meaning "build both"). This
+  isn't legal syntax today, it doesn't help this proposal's actual use
+  case, and a second argv-level way to do what a one-line aggregator
+  (`all2 : a b`) already does is more confusion than it's worth. Out of
+  scope, not a future addition.
+
+### Open questions, not yet resolved
+
+- Interaction with matrix `exclude`: if an override selects a combo that
+  `exclude` has pruned, should that be "no such combo" (consistent with
+  today's `[T @ k=v]` dep behavior) or a clearer override-specific error?
+  Leaning toward reusing the existing error for consistency, but flagging
+  it since the message would need to explain *why* the combo doesn't
+  exist, not just that it doesn't.
+- Once the type-docstring proposal above lands `mmk -types`, revisit this
+  proposal's error messages to make sure the two designs' "known options"
+  presentation actually compose (e.g. reuse whatever
+  key/description/legal-values shape `-types` ends up defining, rather
+  than inventing its own) — not blocking, since the underlying vocabulary
+  is now shared regardless of how each surfaces it.

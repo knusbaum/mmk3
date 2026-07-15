@@ -86,6 +86,15 @@ var BuiltinDefTypes = map[string]string{
 	"directory": "\n\t[ -d \"$target\" ] && echo 1 || return 1\n",
 }
 
+// BuiltinTypeDocs gives each built-in type a one-line docstring, used by
+// `mmk -types` the same way a `##` comment above a user deftype would be.
+var BuiltinTypeDocs = map[string]string{
+	"file":      "A file on disk. Freshness is the file's mtime.",
+	"image":     "Runs a target's body inside a container, on a runner backed by that image.",
+	"source":    "An existing file mmk doesn't build. Inferred automatically for deps with no rule of their own.",
+	"directory": "A directory on disk, created on demand.",
+}
+
 // BuiltinDefBodies contains the built-in default body for each built-in type.
 // A user defbody for the same type name overrides these.
 var BuiltinDefBodies = map[string]string{
@@ -121,6 +130,10 @@ type DefBodyOptionsKey struct {
 // the user needing to spell the ordering out per-mmkfile.
 var BuiltinDefBodyOptions = map[DefBodyOptionsKey][]parse.Option{
 	{Type: "image", Verb: "clean"}: {{Key: "order", Value: "after-consumers"}},
+	{Type: "image", Verb: ""}: {
+		{Key: "skip_if", Value: ""},
+		{Key: "user", Value: ""},
+	},
 }
 
 // RunnerDefInfo describes which optional phases are defined for a built-in runner type.

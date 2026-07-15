@@ -20,7 +20,8 @@ func main() {
 	dump := flag.Bool("dump", false, "print generated shell script and exit")
 	builtins := flag.Bool("builtins", false, "print built-in type definitions as mmk syntax and exit")
 	list := flag.Bool("list", false, "list available targets and verbs, then exit")
-	all := flag.Bool("all", false, "with -list, also include internal targets (no docstring); without -all only docstringed targets and 'all' are shown")
+	types := flag.Bool("types", false, "list available types (deftype), their docstrings, options, and verbs, then exit")
+	all := flag.Bool("all", false, "with -list or -types, also include undocumented entries")
 	graph := flag.Bool("graph", false, "print dependency tree for target and exit")
 	dagGraph := flag.Bool("dag", false, "print dependency DAG (boxes + arrows) for target and exit")
 	dagMGroup := flag.Bool("mgroup", false, "with -dag, collapse matrix combos sharing a base into one box")
@@ -28,7 +29,7 @@ func main() {
 	useTUI := flag.Bool("tui", false, "render the build as a live TUI tree with status updates")
 	installSkill := flag.Bool("install-skill", false, "install the mmk Claude Code skill via 'claude plugin' commands (Y/n prompt before running)")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: mmk [-j N] [-v] [-dump] [-builtins] [-list [-all]] [-graph [-full]] [[verb] target]\n")
+		fmt.Fprintf(os.Stderr, "usage: mmk [-j N] [-v] [-dump] [-builtins] [-list [-all]] [-types [-all]] [-graph [-full]] [[verb] target]\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -69,6 +70,11 @@ func main() {
 
 	if *list {
 		b.PrintList(os.Stdout, *all)
+		return
+	}
+
+	if *types {
+		b.PrintTypes(os.Stdout, *all)
 		return
 	}
 

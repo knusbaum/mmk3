@@ -30,6 +30,11 @@ import (
 
 type File struct {
 	Directives []Directive
+	// Description is the file-level docstring, if any: consecutive
+	// `##!`-prefixed comment lines at the very top of the file, before any
+	// other content. Distinct from the `##` docstring convention used on
+	// individual rules so the two never collide on the same comment block.
+	Description string
 }
 
 type Directive interface {
@@ -47,10 +52,21 @@ type Directive interface {
 // `into` clauses the rule itself declares — a type can make every instance
 // of itself a group member without each rule opting in individually. Each
 // named group must still be declared via a top-level `group` directive.
+//
+// Options is the optional list of `key=value` tokens on the deftype header,
+// declaring option keys the type's bodies (deftype, defbody, defrunner
+// phases) read. Same shape and role as DefBody.Options — see there for how
+// the two combine into a type's full accepted-option vocabulary.
+//
+// Description is the joined `##`-prefixed comment lines immediately
+// preceding the deftype — the same convention target rules use, marking
+// this type as a documented, user-facing entry point (e.g. for `mmk -types`).
 type DefType struct {
-	Name   string
-	Body   string
-	Groups []string
+	Name        string
+	Body        string
+	Groups      []string
+	Options     []Option
+	Description string
 }
 
 // DefRunner defines one phase of a runner type's execution.
@@ -147,6 +163,11 @@ type TargetRule struct {
 // as TargetRule.Options. The defbody's options apply to every verb-rule
 // node that uses this defbody (when no per-rule body is set).
 //
+// Options also declares this (type, verb)'s accepted option-key vocabulary:
+// a target rule of this Type may only set option keys that appear somewhere
+// in the union of its DefType.Options and every DefBody.Options for that
+// type across all verbs — see runtime's known-option-key validation.
+//
 // Deps is the optional dep list from a `defbody T : depexpr ... { ... }` form.
 // Each entry is a raw bash token (commonly a $(...) substitution) that is
 // evaluated at graph construction time, per target instance, with target
@@ -154,12 +175,18 @@ type TargetRule struct {
 // resulting names are appended to the target's DAG edges (augmenting the
 // rule's explicit deps). The dep clause fires for every target of the type,
 // regardless of whether the rule has a custom body.
+//
+// Description is the joined `##`-prefixed comment lines immediately
+// preceding this defbody — explains what this particular verb does for the
+// type (e.g. for `mmk -types`). A defbody with Verb == "" documents the
+// type's default build behavior.
 type DefBody struct {
-	Type    string
-	Verb    string
-	Body    string
-	Options []Option
-	Deps    []string
+	Type        string
+	Verb        string
+	Body        string
+	Options     []Option
+	Deps        []string
+	Description string
 }
 
 // Passthrough is a raw line of bash that is not an mmk directive.
@@ -515,6 +542,50 @@ func (p *parser) consumePendingDoc() string {
 	return doc
 }
 
+// parseLeadingFileDoc consumes a run of `##!`-prefixed comment lines (blank
+// lines interspersed are OK) at the current position and returns them
+// joined by newlines. It must be called before anything else has been
+// consumed from the file, and it stops — without consuming — at the first
+// line that isn't blank or `##!`-prefixed. This keeps the file-level
+// docstring marker (`##!`) unambiguous relative to the per-rule docstring
+// marker (`##`): a leading `##` block is left untouched here and attaches
+// to the first directive exactly as it always has.
+func (p *parser) parseLeadingFileDoc() string {
+	var sb strings.Builder
+	for {
+		p.s.skipHorizontalSpace()
+		switch p.s.peek() {
+		case '\n':
+			p.s.advance()
+		case '#':
+			if p.s.pos+2 < len(p.s.src) && p.s.src[p.s.pos+1] == '#' && p.s.src[p.s.pos+2] == '!' {
+				p.s.advance() // '#'
+				p.s.advance() // '#'
+				p.s.advance() // '!'
+				if p.s.peek() == ' ' {
+					p.s.advance()
+				}
+				var line strings.Builder
+				for {
+					b := p.s.peek()
+					if b == '\n' || b == 0 {
+						break
+					}
+					line.WriteByte(p.s.advance())
+				}
+				if sb.Len() > 0 {
+					sb.WriteByte('\n')
+				}
+				sb.WriteString(line.String())
+			} else {
+				return sb.String()
+			}
+		default:
+			return sb.String()
+		}
+	}
+}
+
 // parseName reads a word or double-quoted string.
 // Single-quoted patterns are not valid here; use parseHeaderToken for header positions.
 func (p *parser) parseName() (string, error) {
@@ -616,6 +687,7 @@ func (p *parser) parseHeaderToken() (headerToken, error) {
 
 func (p *parser) parseFile() (*File, error) {
 	var f File
+	f.Description = p.parseLeadingFileDoc()
 	for {
 		p.skipWhitespaceAndComments()
 		if p.s.peek() == 0 {
@@ -634,6 +706,10 @@ func (p *parser) parseFile() (*File, error) {
 			case *Subproject:
 				v.Description = doc
 			case *Group:
+				v.Description = doc
+			case *DefType:
+				v.Description = doc
+			case *DefBody:
 				v.Description = doc
 			}
 		}
@@ -840,8 +916,9 @@ func (p *parser) parseDirective() (Directive, error) {
 	}
 }
 
-// parseDefType handles 'deftype NAME [into GROUP ...] { body }'. Each named
-// group is propagated onto every non-verb rule of this type (see DefType.Groups).
+// parseDefType handles 'deftype NAME [into GROUP ...] [key=value ...] { body }'.
+// Each named group is propagated onto every non-verb rule of this type (see
+// DefType.Groups). `into` and `key=value` tokens may appear in any order.
 func (p *parser) parseDefType() (Directive, error) {
 	p.s.readWord() // consume "deftype"
 	name, err := p.parseName()
@@ -849,6 +926,7 @@ func (p *parser) parseDefType() (Directive, error) {
 		return nil, fmt.Errorf("deftype: %w", err)
 	}
 	var groups []string
+	var options []Option
 	for {
 		p.skipWhitespaceAndComments()
 		saved, savedLine := p.s.pos, p.s.line
@@ -860,6 +938,13 @@ func (p *parser) parseDefType() (Directive, error) {
 				return nil, fmt.Errorf("deftype %s: into: %w", name, gnErr)
 			}
 			groups = append(groups, groupName)
+			continue
+		}
+		if k, v, ok := parseOptionToken(word); ok {
+			if k == "target" || k == "deps" || strings.HasPrefix(k, "MMK_") {
+				return nil, fmt.Errorf("line %d: option key %q is reserved", p.s.line, k)
+			}
+			options = append(options, Option{Key: k, Value: v})
 			continue
 		}
 		p.s.pos, p.s.line = saved, savedLine
@@ -875,7 +960,7 @@ func (p *parser) parseDefType() (Directive, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &DefType{Name: name, Body: body, Groups: groups}, nil
+	return &DefType{Name: name, Body: body, Groups: groups, Options: options}, nil
 }
 
 // parseDefBody handles 'defbody type [verb]? [key=value...]? [: dep ...]? { body }'.
