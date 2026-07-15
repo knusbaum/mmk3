@@ -356,7 +356,7 @@ what verbs it supports, short of reading `go.mmk`'s source (or this
 
 ```bash
 ## Builds a Go binary. The target name is the output path.
-## Options: pkg= (default .), ldflags=, cgo= (default 0).
+## Options: pkg= (required), ldflags=, cgo= (default 0).
 deftype go_exe {
     ...
 }
@@ -365,7 +365,7 @@ deftype go_exe {
 ```
 $ mmk -types
 go_exe       Builds a Go binary. The target name is the output path.
-             Options: pkg= (default .), ldflags=, cgo= (default 0).
+             Options: pkg= (required), ldflags=, cgo= (default 0).
              Verbs: build (default), clean, test
 tool         ...
 ```

@@ -49,18 +49,24 @@ deftype go_exe {
 }
 
 defbody go_exe : pre_build {
+    if [ -z "$pkg" ]; then
+        echo "go_exe $target: pkg= is required (e.g. pkg=./cmd/myapp)" >&2
+        exit 1
+    fi
     mkdir -p "$(dirname "$target")"
     CGO_ENABLED=${cgo:-0} GOOS=${goos:-} GOARCH=${goarch:-} \
-        go build ${ldflags:+-ldflags="$ldflags"} -o "$target" "${pkg:-.}"
+        go build ${ldflags:+-ldflags="$ldflags"} -o "$target" "$pkg"
 }
 
 defbody go_exe clean { rm -f "$target"; }
-defbody go_exe test  { go test "${pkg:-.}"; }
+defbody go_exe test  { [ -n "$pkg" ] || { echo "..." >&2; exit 1; }; go test "$pkg"; }
 ```
 
-Options: `pkg=` (default `.`), `ldflags=`, `cgo=` (default `0`), `goos=`/`goarch=`
-(default: unset, i.e. host OS/arch — see [GOOS/GOARCH cross-compile
-matrices](#goosgoarch-cross-compile-matrices) below).
+Options: `pkg=` (**required** — no default; a target name alone doesn't
+reliably imply which package to build, so omitting it is a build-time error
+rather than a silent fallback to `.`), `ldflags=`, `cgo=` (default `0`),
+`goos=`/`goarch=` (default: unset, i.e. host OS/arch — see [GOOS/GOARCH
+cross-compile matrices](#goosgoarch-cross-compile-matrices) below).
 
 ```bash
 include go.mmk
@@ -177,6 +183,18 @@ one that needs custom `ldflags` or a GOOS/GOARCH matrix) simply wins — the
 later declaration in file order overrides the earlier, spliced-in one, no
 override syntax needed (see
 [language-extensions.md](language-extensions.md#implemented-later-target-rule-wins-on-duplicate-non-verb-target)).
+
+**When overriding a discovered target, set `pkg=` to the same import path
+discovery would have used.** The override replaces the generated rule
+entirely — mmk has no way to carry the original `pkg=` forward into a
+hand-written replacement. `go_exe` requires `pkg=` on every rule (see
+above) specifically to catch this: without the requirement, an override
+missing `pkg=` would silently build the module-root package (`.`) under
+whatever target name you chose, rather than erroring. This was caught in
+practice: a single-binary project's override happened to still work, purely
+because its `main` package lived at the module root, so `.` was accidentally
+correct — a multi-binary project overriding a subdirectory binary would have
+silently built the wrong source.
 
 Each discovered binary is registered `into go_mains`, so downstream targets
 can depend on "every discovered binary" without enumerating them:
